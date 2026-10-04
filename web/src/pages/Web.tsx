@@ -1,21 +1,30 @@
 // Web analytics: one screen, Plausible-grade. Every row filters the page.
 
 import { useMemo, useState } from "react";
-import type { PropertyFilter } from "../types/PropertyFilter";
-import type { WebDimension } from "../types/WebDimension";
-import type { WebMetric } from "../types/WebMetric";
-import type { WebQuery } from "../types/WebQuery";
-import { api } from "../lib/api";
-import { usePath, useProjectId } from "../lib/context";
-import { autoInterval, fmtBucket, fmtCompact, fmtDuration, fmtNumber, fmtPercent } from "../lib/format";
-import { useApi, useLocalStorage } from "../lib/hooks";
-import { describeFilter } from "../lib/properties";
-import { Link } from "../lib/router";
-import { TimeSeriesChart } from "../charts/TimeSeries";
-import { DateRangePicker, type RangeValue } from "../ui/DateRange";
-import { Icon } from "../ui/icons";
-import { Empty, ErrorState, LoadingBar, Modal, Skeleton } from "../ui/kit";
-import { PropertyFilters } from "../insight/pickers";
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { columnHelper, DataTable } from "@/components/data-table";
+import { DateRangePicker, type RangeValue } from "@/components/date-range";
+import { AppDialog } from "@/components/dialogs";
+import { Empty, ErrorState, LoadingBar, Skeleton } from "@/components/feedback";
+import { Icon } from "@/components/icons";
+import { CardBar, Page, PageHeader, Panel, SearchInput, StatLabel, Toolbar } from "@/components/page";
+import { TimeSeriesChart } from "@/charts/TimeSeries";
+import { PropertyFilters } from "@/insight/pickers";
+import { autoInterval, fmtBucket, fmtCompact, fmtDuration, fmtNumber, fmtPercent } from "@/lib/format";
+import { useLocalStorage } from "@/lib/hooks";
+import { useProjectId, usePath } from "@/lib/context";
+import { describeFilter } from "@/lib/properties";
+import { webBreakdownQuery, webOverviewQuery } from "@/lib/queries";
+import { cn } from "@/lib/utils";
+import type { PropertyFilter } from "@/types/PropertyFilter";
+import type { WebBreakdownRow } from "@/types/WebBreakdownRow";
+import type { WebDimension } from "@/types/WebDimension";
+import type { WebMetric } from "@/types/WebMetric";
+import type { WebQuery } from "@/types/WebQuery";
 import { LoadDemoButton } from "./Onboarding";
 
 const DIM_PROPERTY: Record<WebDimension, string> = {
@@ -32,7 +41,17 @@ const DIM_PROPERTY: Record<WebDimension, string> = {
   country: "$geoip_country_code",
 };
 
-const PANELS: { title: string; tabs: { dim: WebDimension; label: string; col: string }[] }[] = [
+interface PanelTab {
+  dim: WebDimension;
+  label: string;
+  col: string;
+}
+interface PanelDef {
+  title: string;
+  tabs: PanelTab[];
+}
+
+const PANELS: PanelDef[] = [
   {
     title: "Pages",
     tabs: [
@@ -61,6 +80,9 @@ const PANELS: { title: string; tabs: { dim: WebDimension; label: string; col: st
   { title: "Locations", tabs: [{ dim: "country", label: "Countries", col: "Country" }] },
 ];
 
+const PREVIEW_ROWS = 10;
+const ALL_ROWS = 200;
+
 let regionNames: Intl.DisplayNames | null = null;
 function countryName(code: string): string {
   try {
@@ -77,144 +99,213 @@ function displayValue(dim: WebDimension, value: string): string {
   return value;
 }
 
+const isPageLike = (dim: WebDimension) => dim === "page" || dim === "entry_page" || dim === "exit_page";
+
+// ── KPI delta ────────────────────────────────────────────────────────────
+
 function Delta({ metric, invert }: { metric: WebMetric; invert?: boolean }) {
-  if (metric.previous === null || metric.previous === 0) return <span className="delta flat">no prior data</span>;
+  const flat = "text-xs font-semibold text-muted-foreground";
+  if (metric.previous === null || metric.previous === 0) return <span className={flat}>no prior data</span>;
   const pct = ((metric.value - metric.previous) / Math.abs(metric.previous)) * 100;
-  if (Math.abs(pct) < 0.05) return <span className="delta flat">no change</span>;
+  if (Math.abs(pct) < 0.05) return <span className={flat}>no change</span>;
   const good = invert ? pct < 0 : pct > 0;
   return (
-    <span className={`delta ${good ? "up" : "down"}`} title={`Previous period: ${fmtNumber(metric.previous)}`}>
+    <span className={cn("num inline-flex items-center gap-0.5 text-xs font-semibold", good ? "text-good" : "text-destructive")} title={`Previous period: ${fmtNumber(metric.previous)}`}>
       <Icon name={pct > 0 ? "arrowUp" : "arrowDown"} size={11} strokeWidth={2.2} />
       {fmtPercent(Math.abs(pct))}
+      <span className="sr-only">{pct > 0 ? " up" : " down"} from {fmtNumber(metric.previous)} in the previous period</span>
     </span>
   );
 }
 
-function BreakdownPanel({
-  panel,
-  query,
-  onFilter,
-}: {
-  panel: (typeof PANELS)[number];
-  query: WebQuery;
-  onFilter: (dim: WebDimension, value: string) => void;
-}) {
+// ── Breakdowns ───────────────────────────────────────────────────────────
+
+type OnFilter = (dim: WebDimension, value: string) => void;
+
+function BreakdownList({ tab, query, onFilter }: { tab: PanelTab; query: WebQuery; onFilter: OnFilter }) {
   const projectId = useProjectId();
-  const [tab, setTab] = useState(0);
   const [all, setAll] = useState(false);
-  const t = panel.tabs[tab];
-  const json = JSON.stringify(query);
-  const { data, error, loading, reload } = useApi(`web-bd:${projectId}:${t.dim}:${json}`, (s) => api.webBreakdown(projectId, query, t.dim, 10, s), { keepPrevious: false });
+  const { data, error, isFetching, refetch } = useQuery(webBreakdownQuery(projectId, query, tab.dim, PREVIEW_ROWS));
   const rows = data?.rows ?? [];
   const max = Math.max(1, ...rows.map((r) => r.visitors));
-  const pageLike = t.dim === "page" || t.dim === "entry_page" || t.dim === "exit_page";
 
   return (
-    <div className="card" style={{ display: "flex", flexDirection: "column", minHeight: 420 }}>
-      <div className="card-head" style={{ paddingBottom: 0, borderBottom: 0, alignItems: "flex-end" }}>
-        <h3 style={{ flex: "none", marginBottom: 10 }}>{panel.title}</h3>
-        <span className="spacer" />
-        {panel.tabs.length > 1 && (
-          <div className="tabs" role="tablist" style={{ marginBottom: 0, borderBottom: 0 }}>
-            {panel.tabs.map((x, i) => (
-              <button key={x.dim} role="tab" aria-selected={i === tab} onClick={() => setTab(i)} style={{ height: 32, fontSize: 12.5 }}>
-                {x.label}
-              </button>
-            ))}
-          </div>
-        )}
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex border-t px-4 pt-2 pb-1.5 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">
+        <span className="flex-1">{tab.col}</span>
+        <span className="w-16 text-right">Visitors</span>
+        <span className="w-16 text-right">{isPageLike(tab.dim) ? "Views" : "Events"}</span>
       </div>
-      <div className="blist-head" style={{ borderTop: "1px solid var(--line)" }}>
-        <span style={{ flex: 1 }}>{t.col}</span>
-        <span style={{ width: 68, textAlign: "right" }}>Visitors</span>
-        <span style={{ width: 68, textAlign: "right" }}>{pageLike ? "Views" : "Events"}</span>
-      </div>
-      <div className="blist" style={{ flex: 1, position: "relative" }}>
-        <LoadingBar show={loading && !!data} />
-        {error ? (
-          <ErrorState error={error} retry={reload} compact />
+      <div className="relative flex-1">
+        <LoadingBar show={isFetching && !!data} />
+        {error && !data ? (
+          <ErrorState error={error} retry={() => void refetch()} compact />
         ) : !data ? (
-          <div className="col" style={{ padding: "4px 16px", gap: 12 }}>
+          <div className="flex flex-col gap-3 px-4 py-1" aria-busy="true" aria-label="Loading">
             {Array.from({ length: 8 }, (_, i) => (
-              <Skeleton key={i} height={18} width={`${90 - i * 9}%`} />
+              <Skeleton key={i} className="h-[18px]" style={{ width: `${90 - i * 9}%` }} />
             ))}
           </div>
         ) : rows.length === 0 ? (
-          <div className="muted small" style={{ padding: "24px 16px", textAlign: "center" }}>
-            No data for this range.
-          </div>
+          <div className="px-4 py-6 text-center text-muted-foreground">No data for this range.</div>
         ) : (
-          rows.map((r) => (
-            <button key={r.value} className="brow" onClick={() => onFilter(t.dim, r.value)} title={`Filter by ${displayValue(t.dim, r.value)}`}>
-              <span className="bar" style={{ width: `${(r.visitors / max) * 100}%` }} />
-              <span className="v">{displayValue(t.dim, r.value)}</span>
-              <span className="n strong" style={{ width: 60 }}>
-                {fmtCompact(r.visitors)}
-              </span>
-              <span className="n" style={{ width: 60 }}>
-                {fmtCompact(r.views)}
-              </span>
-            </button>
-          ))
+          <ul>
+            {rows.map((r) => {
+              const label = displayValue(tab.dim, r.value);
+              return (
+                <li key={r.value}>
+                  <button
+                    type="button"
+                    onClick={() => onFilter(tab.dim, r.value)}
+                    title={`Filter by ${label}`}
+                    className="relative mx-2 mb-0.5 flex h-8 w-[calc(100%-1rem)] items-center gap-3 rounded-md px-2 text-left outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <span aria-hidden="true" className="absolute inset-y-[3px] left-0 rounded bg-chart-1/15" style={{ width: `${(r.visitors / max) * 100}%` }} />
+                    <span className="relative min-w-0 flex-1 truncate">{label}</span>
+                    <span className="num relative w-14 text-right font-semibold">{fmtCompact(r.visitors)}</span>
+                    <span className="num relative w-14 text-right text-muted-foreground">{fmtCompact(r.views)}</span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
         )}
       </div>
-      {rows.length >= 10 && (
-        <div style={{ padding: "6px 8px 10px", textAlign: "center" }}>
-          <button className="btn ghost small" onClick={() => setAll(true)}>
+      {rows.length >= PREVIEW_ROWS && (
+        <div className="px-2 pt-1.5 pb-2.5 text-center">
+          <Button variant="ghost" size="sm" onClick={() => setAll(true)}>
             View all <Icon name="arrowRight" size={12} />
-          </button>
+          </Button>
         </div>
       )}
-      {all && <BreakdownAll dim={t.dim} title={t.label} query={query} onClose={() => setAll(false)} onFilter={onFilter} />}
+      {all && <BreakdownAll dim={tab.dim} title={tab.label} column={tab.col} query={query} onClose={() => setAll(false)} onFilter={onFilter} />}
     </div>
   );
 }
 
-function BreakdownAll({ dim, title, query, onClose, onFilter }: { dim: WebDimension; title: string; query: WebQuery; onClose: () => void; onFilter: (dim: WebDimension, value: string) => void }) {
+const rowCol = columnHelper<WebBreakdownRow>();
+
+function BreakdownAll({ dim, title, column, query, onClose, onFilter }: { dim: WebDimension; title: string; column: string; query: WebQuery; onClose: () => void; onFilter: OnFilter }) {
   const projectId = useProjectId();
   const [search, setSearch] = useState("");
-  const { data, error } = useApi(`web-bd:${projectId}:${dim}:all:${JSON.stringify(query)}`, (s) => api.webBreakdown(projectId, query, dim, 200, s));
-  const rows = (data?.rows ?? []).filter((r) => !search || displayValue(dim, r.value).toLowerCase().includes(search.toLowerCase()));
-  return (
-    <Modal title={title} onClose={onClose} wide>
-      <div className="col gap-12">
-        <div className="search">
-          <Icon name="search" size={14} />
-          <input className="input" placeholder="Search…" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search" />
-        </div>
-        {error ? <ErrorState error={error} compact /> : null}
-        <table className="table compact">
-          <thead>
-            <tr>
-              <th>{title}</th>
-              <th className="r">Visitors</th>
-              <th className="r">Views</th>
-              {rows.some((r) => r.bounce_rate !== null) && <th className="r">Bounce rate</th>}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr
-                key={r.value}
-                className="clickable"
-                onClick={() => {
-                  onFilter(dim, r.value);
-                  onClose();
-                }}
-              >
-                <td className="truncate" style={{ maxWidth: 420 }}>
-                  {displayValue(dim, r.value)}
-                </td>
-                <td className="r">{fmtNumber(r.visitors)}</td>
-                <td className="r">{fmtNumber(r.views)}</td>
-                {rows.some((x) => x.bounce_rate !== null) && <td className="r">{fmtPercent(r.bounce_rate)}</td>}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </Modal>
+  const { data, error, isPending, refetch } = useQuery(webBreakdownQuery(projectId, query, dim, ALL_ROWS));
+  const rows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (data?.rows ?? []).filter((r) => !q || displayValue(dim, r.value).toLowerCase().includes(q));
+  }, [data, dim, search]);
+  const hasBounce = (data?.rows ?? []).some((r) => r.bounce_rate !== null);
+
+  const columns = useMemo(
+    () => [
+      rowCol.accessor((r) => displayValue(dim, r.value), {
+        id: "value",
+        header: column,
+        cell: (c) => (
+          <span className="block max-w-[420px] truncate" title={c.getValue()}>
+            {c.getValue()}
+          </span>
+        ),
+      }),
+      rowCol.accessor("visitors", { header: "Visitors", cell: (c) => <span className="num">{fmtNumber(c.getValue())}</span>, meta: { align: "right" } }),
+      rowCol.accessor("views", { header: isPageLike(dim) ? "Views" : "Events", cell: (c) => <span className="num">{fmtNumber(c.getValue())}</span>, meta: { align: "right" } }),
+      ...(hasBounce
+        ? [rowCol.accessor("bounce_rate", { header: "Bounce rate", cell: (c) => <span className="num">{fmtPercent(c.getValue())}</span>, meta: { align: "right" as const } })]
+        : []),
+    ],
+    [dim, column, hasBounce],
   );
+
+  return (
+    <AppDialog title={title} description="Select a row to filter the whole page by it." onClose={onClose} wide>
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-3">
+          <SearchInput wrapperClassName="flex-1" placeholder="Search…" aria-label={`Search ${title.toLowerCase()}`} value={search} onChange={(e) => setSearch(e.target.value)} />
+          {data ? (
+            <span className="num text-xs text-muted-foreground">
+              {fmtNumber(rows.length)}
+              {data.rows.length >= ALL_ROWS ? "+" : ""} rows
+            </span>
+          ) : null}
+        </div>
+        {error && !data ? (
+          <ErrorState error={error} retry={() => void refetch()} compact />
+        ) : isPending ? (
+          <div className="flex flex-col gap-2.5" aria-busy="true" aria-label="Loading">
+            {Array.from({ length: 8 }, (_, i) => (
+              <Skeleton key={i} className="h-6" />
+            ))}
+          </div>
+        ) : rows.length === 0 ? (
+          <div className="px-4 py-8 text-center text-muted-foreground">{search ? "Nothing matches your search." : "No data for this range."}</div>
+        ) : (
+          <div className="overflow-hidden rounded-lg border">
+            <DataTable
+              label={title}
+              columns={columns}
+              data={rows}
+              getRowId={(r) => r.value}
+              onRowClick={(r) => {
+                onFilter(dim, r.value);
+                onClose();
+              }}
+              sortable
+              dense
+              initialSorting={[{ id: "visitors", desc: true }]}
+              virtualize={{ maxHeight: 420 }}
+            />
+          </div>
+        )}
+      </div>
+    </AppDialog>
+  );
+}
+
+function BreakdownPanel({ panel, query, onFilter }: { panel: PanelDef; query: WebQuery; onFilter: OnFilter }) {
+  const [dim, setDim] = useState<WebDimension>(panel.tabs[0].dim);
+  if (panel.tabs.length === 1) {
+    return (
+      <Panel className="min-h-[420px]">
+        <CardBar className="min-h-14 border-b-0">
+          <h3 className="flex-1">{panel.title}</h3>
+        </CardBar>
+        <BreakdownList tab={panel.tabs[0]} query={query} onFilter={onFilter} />
+      </Panel>
+    );
+  }
+  return (
+    <Panel className="min-h-[420px]">
+      <Tabs value={dim} onValueChange={(v) => setDim(v as WebDimension)} className="min-h-0 flex-1 gap-0">
+        <CardBar className="border-b-0">
+          <h3 className="flex-1">{panel.title}</h3>
+          <TabsList aria-label={`${panel.title} breakdown`} className="max-w-full overflow-x-auto">
+            {panel.tabs.map((t) => (
+              <TabsTrigger key={t.dim} value={t.dim} className="flex-none px-2.5 text-xs">
+                {t.label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </CardBar>
+        {panel.tabs.map((t) => (
+          <TabsContent key={t.dim} value={t.dim} className="flex min-h-0 flex-col">
+            <BreakdownList tab={t} query={query} onFilter={onFilter} />
+          </TabsContent>
+        ))}
+      </Tabs>
+    </Panel>
+  );
+}
+
+// ── Page ─────────────────────────────────────────────────────────────────
+
+type ChartMetric = "visitors" | "pageviews";
+
+interface Kpi {
+  key: string;
+  label: string;
+  value: string;
+  metric: WebMetric | undefined;
+  invert?: boolean;
+  chart?: ChartMetric;
 }
 
 export function WebPage() {
@@ -222,23 +313,22 @@ export function WebPage() {
   const path = usePath();
   const [range, setRange] = useLocalStorage<RangeValue>("hoglet.web.range", { date_from: "-7d", date_to: null });
   const [filters, setFilters] = useState<PropertyFilter[]>([]);
-  const [metric, setMetric] = useState<"visitors" | "pageviews">("visitors");
-  const complete = filters.filter((f) => f.key);
+  const [metric, setMetric] = useState<ChartMetric>("visitors");
+  const complete = useMemo(() => filters.filter((f) => f.key), [filters]);
   const query: WebQuery = useMemo(
     () => ({ date_from: range.date_from, date_to: range.date_to, interval: autoInterval(range.date_from, range.date_to), properties: complete }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [range.date_from, range.date_to, JSON.stringify(complete)],
+    [range.date_from, range.date_to, complete],
   );
-  const { data, error, loading, reload } = useApi(`web-ov:${projectId}:${JSON.stringify(query)}`, (s) => api.webOverview(projectId, query, s), { pollMs: 30_000 });
+  const { data, error, isFetching, refetch } = useQuery(webOverviewQuery(projectId, query));
 
-  const addFilter = (dim: WebDimension, value: string) => {
+  const addFilter: OnFilter = (dim, value) => {
     const key = DIM_PROPERTY[dim];
     const next = filters.filter((f) => f.key !== key);
     next.push(value === "" || value === "$$_none" ? { key, type: "event", operator: "is_not_set", value: null } : { key, type: "event", operator: "exact", value: [value] });
     setFilters(next);
   };
 
-  const tiles: { key: string; label: string; value: string; metric: WebMetric | undefined; invert?: boolean; chart?: "visitors" | "pageviews" }[] = [
+  const kpis: Kpi[] = [
     { key: "visitors", label: "Visitors", value: fmtCompact(data?.visitors.value), metric: data?.visitors, chart: "visitors" },
     { key: "pageviews", label: "Pageviews", value: fmtCompact(data?.pageviews.value), metric: data?.pageviews, chart: "pageviews" },
     { key: "sessions", label: "Sessions", value: fmtCompact(data?.sessions.value), metric: data?.sessions },
@@ -248,77 +338,89 @@ export function WebPage() {
   const noData = data && data.pageviews.value === 0 && data.pageviews.previous === null && complete.length === 0;
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="titles">
-          <h1>Web analytics</h1>
-          <div className="sub">Visitors, sources and pages from your pageviews.</div>
-        </div>
-        <div className="actions">
-          {data && (
-            <span className="badge good" style={{ height: 26, padding: "0 10px", fontSize: 12.5 }} title="Persons with a pageview in the last 5 minutes">
-              <span className="dot live" /> {fmtNumber(data.live_visitors)} live {data.live_visitors === 1 ? "visitor" : "visitors"}
-            </span>
-          )}
-          <DateRangePicker value={range} onChange={setRange} />
-        </div>
-      </div>
+    <Page>
+      <PageHeader
+        title="Web analytics"
+        sub="Visitors, sources and pages from your pageviews."
+        actions={
+          <>
+            {data && (
+              <Badge variant="outline" className="h-7 gap-1.5 px-2.5 text-[12.5px] text-good" title="Persons with a pageview in the last 5 minutes" aria-live="polite">
+                <span aria-hidden="true" className="size-2 rounded-full bg-good motion-safe:animate-pulse" />
+                {fmtNumber(data.live_visitors)} live {data.live_visitors === 1 ? "visitor" : "visitors"}
+              </Badge>
+            )}
+            <DateRangePicker value={range} onChange={setRange} />
+          </>
+        }
+      />
 
-      <div className="toolbar">
+      <Toolbar>
         <PropertyFilters value={filters} onChange={setFilters} sources={["event", "person"]} />
         {complete.length > 0 && (
-          <button className="btn ghost small" onClick={() => setFilters([])}>
+          <Button variant="ghost" size="sm" onClick={() => setFilters([])}>
             Clear filters
-          </button>
+          </Button>
         )}
-      </div>
+      </Toolbar>
 
       {error && !data ? (
-        <div className="card">
-          <ErrorState error={error} retry={reload} />
-        </div>
+        <Panel>
+          <ErrorState error={error} retry={() => void refetch()} />
+        </Panel>
       ) : noData ? (
-        <div className="card">
+        <Panel>
           <Empty
             icon="globe"
             title="No pageviews yet"
             action={
-              <div className="row">
+              <div className="flex flex-wrap justify-center gap-2">
                 <LoadDemoButton />
-                <Link className="btn primary" to={path("onboarding")}>
-                  Connect your site
-                </Link>
+                <Button nativeButton={false} render={<Link to={path("onboarding")} />}>Connect your site</Button>
               </div>
             }
           >
             Add posthog-js to your site with <code>api_host</code> pointing at this server. Pageviews are captured automatically and appear here within seconds.
           </Empty>
-        </div>
+        </Panel>
       ) : (
         <>
-          <div className="card" style={{ position: "relative", marginBottom: 16 }}>
-            <LoadingBar show={loading && !!data} />
-            <div className="kpis">
-              {tiles.map((t) => {
+          <Panel className="relative mb-4">
+            <LoadingBar show={isFetching && !!data} />
+            <div className="grid grid-cols-2 border-b sm:grid-cols-3 lg:grid-cols-5" role="group" aria-label="Key metrics">
+              {kpis.map((k) => {
                 const inner = (
                   <>
-                    <span className="k-label">{t.label}</span>
-                    {data ? <span className="k-value num">{t.value}</span> : <Skeleton height={30} width={90} style={{ margin: "1px 0" }} />}
-                    {t.metric ? <Delta metric={t.metric} invert={t.invert} /> : <Skeleton height={12} width={60} />}
+                    <StatLabel>{k.label}</StatLabel>
+                    {data ? <span className="num text-[26px] leading-tight font-semibold tracking-tight">{k.value}</span> : <Skeleton className="my-px h-[30px] w-[90px]" />}
+                    {k.metric ? <Delta metric={k.metric} invert={k.invert} /> : <Skeleton className="h-3 w-[60px]" />}
                   </>
                 );
-                return t.chart ? (
-                  <button key={t.key} className="kpi" aria-pressed={metric === t.chart} onClick={() => setMetric(t.chart!)}>
+                const cell = "relative flex flex-col items-start gap-1 px-[18px] py-3.5 text-left lg:border-r lg:last:border-r-0";
+                const chart = k.chart;
+                return chart ? (
+                  <button
+                    key={k.key}
+                    type="button"
+                    aria-pressed={metric === chart}
+                    onClick={() => setMetric(chart)}
+                    title={`Chart ${k.label.toLowerCase()}`}
+                    className={cn(
+                      cell,
+                      "cursor-pointer outline-none hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+                      "after:absolute after:inset-x-[18px] after:-bottom-px after:h-0.5 after:rounded-sm after:bg-chart-1 after:opacity-0 aria-pressed:after:opacity-100",
+                    )}
+                  >
                     {inner}
                   </button>
                 ) : (
-                  <div key={t.key} className="kpi">
+                  <div key={k.key} className={cell}>
                     {inner}
                   </div>
                 );
               })}
             </div>
-            <div style={{ padding: "18px 18px 12px" }}>
+            <div className="px-[18px] pt-[18px] pb-3">
               {data ? (
                 <TimeSeriesChart
                   kind="area"
@@ -335,23 +437,30 @@ export function WebPage() {
                   legend={false}
                 />
               ) : (
-                <Skeleton height={260} />
+                <Skeleton className="h-[260px]" />
               )}
             </div>
-          </div>
+          </Panel>
 
-          <div className="grid-2">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             {PANELS.map((p) => (
               <BreakdownPanel key={p.title} panel={p} query={query} onFilter={addFilter} />
             ))}
           </div>
           {complete.length > 0 && (
-            <p className="muted small mt-16">
-              Filtered by {complete.map((f) => { const d = describeFilter(f); return `${d.key} ${d.op} ${d.value}`; }).join(", ")}.
+            <p className="mt-4 text-xs text-muted-foreground">
+              Filtered by{" "}
+              {complete
+                .map((f) => {
+                  const d = describeFilter(f);
+                  return `${d.key} ${d.op} ${d.value}`;
+                })
+                .join(", ")}
+              .
             </p>
           )}
         </>
       )}
-    </div>
+    </Page>
   );
 }

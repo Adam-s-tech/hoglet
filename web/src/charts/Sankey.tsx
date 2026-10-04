@@ -1,9 +1,13 @@
 // Paths as a Sankey: step columns, nodes sized by persons, bands by flow.
 
 import { useMemo, useState } from "react";
-import type { PathLink } from "../types/PathLink";
-import { fmtDuration, fmtNumber } from "../lib/format";
-import { useSize } from "../lib/hooks";
+import type { PathLink } from "@/types/PathLink";
+import { fmtDuration, fmtNumber } from "@/lib/format";
+import { useSize } from "@/lib/hooks";
+import { Tip, TipRow, TipTitle } from "./parts";
+
+/** Flows listed for screen readers (the SVG itself is a picture); bounded. */
+const SR_FLOWS = 50;
 
 interface Node {
   id: string;
@@ -133,7 +137,7 @@ export function PathsSankey({ links, onNodeClick }: { links: PathLink[]; onNodeC
 
   return (
     <div className="chart" ref={ref}>
-      <svg width={width} height={height} role="img" aria-label="User paths">
+      <svg width={width} height={height} role="img" aria-label={`User paths across ${cols} steps, ${layout.nodes.size} nodes and ${links.length} flows. A list of the top flows follows.`}>
         {width > 0 && (
           <g transform="translate(4,0)">
             {layout.steps.map((s, ci) => (
@@ -199,24 +203,25 @@ export function PathsSankey({ links, onNodeClick }: { links: PathLink[]; onNodeC
         )}
       </svg>
       {tip && (
-        <div className="tip" style={{ left: Math.min(tip.x + 14, Math.max(0, width - 260)), top: tip.y + 10 }}>
-          <div className="tip-title">
+        <Tip style={{ left: Math.min(tip.x + 14, Math.max(0, width - 260)), top: tip.y + 10 }}>
+          <TipTitle>
             {short(tip.band.s.name, 40)} → {short(tip.band.t.name, 40)}
-          </div>
-          <div className="tip-row">
-            <span className="lab">Persons</span>
-            <span className="val">{fmtNumber(tip.band.link.value)}</span>
-          </div>
-          <div className="tip-row">
-            <span className="lab">Share of step {tip.band.s.step}</span>
-            <span className="val">{((tip.band.link.value / Math.max(1, tip.band.s.value)) * 100).toFixed(1)}%</span>
-          </div>
-          <div className="tip-row">
-            <span className="lab">Avg time between</span>
-            <span className="val">{fmtDuration(tip.band.link.average_conversion_time_s)}</span>
-          </div>
-        </div>
+          </TipTitle>
+          <TipRow label="Persons" value={fmtNumber(tip.band.link.value)} />
+          <TipRow label={`Share of step ${tip.band.s.step}`} value={`${((tip.band.link.value / Math.max(1, tip.band.s.value)) * 100).toFixed(1)}%`} />
+          <TipRow label="Avg time between" value={fmtDuration(tip.band.link.average_conversion_time_s)} />
+        </Tip>
       )}
+      <ul className="sr-only" aria-label="Top flows between steps">
+        {[...links]
+          .sort((a, b) => b.value - a.value)
+          .slice(0, SR_FLOWS)
+          .map((l) => (
+            <li key={`${l.source}>${l.target}`}>
+              {`${parse(l.source).name} to ${parse(l.target).name}: ${fmtNumber(l.value)} persons`}
+            </li>
+          ))}
+      </ul>
     </div>
   );
 }

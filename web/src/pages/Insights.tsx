@@ -1,106 +1,146 @@
-import { useState } from "react";
-import { api } from "../lib/api";
-import { usePath, useProjectId } from "../lib/context";
-import { fmtRelative } from "../lib/format";
-import { useApi } from "../lib/hooks";
-import { Link, navigate } from "../lib/router";
-import { Icon } from "../ui/icons";
-import { Empty, ErrorState, MenuButton, SkeletonRows } from "../ui/kit";
-import { KINDS, kindInfo, summarize } from "../insight/defaults";
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { useMemo, useState } from "react";
+import { columnHelper, DataTable } from "@/components/data-table";
+import { Empty, ErrorState, SkeletonRows } from "@/components/feedback";
+import { Icon } from "@/components/icons";
+import { CardBar, IconBadge, Page, PageHeader, Panel, SearchInput } from "@/components/page";
+import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { usePath, useProjectId } from "@/lib/context";
+import { fmtRelative } from "@/lib/format";
+import { navigate } from "@/lib/nav";
+import { insightsQuery } from "@/lib/queries";
+import type { SavedInsight } from "@/lib/api";
+import { KINDS, kindInfo, summarize } from "@/insight/defaults";
 
 export function NewInsightMenu({ primary = true }: { primary?: boolean }) {
   const path = usePath();
   return (
-    <MenuButton
-      className={`btn${primary ? " primary" : ""}`}
-      align="end"
-      label={
-        <>
-          <Icon name="plus" size={14} /> New insight
-        </>
-      }
-    >
-      {(close) =>
-        KINDS.map((k) => (
-          <button
-            key={k.kind}
-            className="menu-item"
-            onClick={() => {
-              close();
-              navigate(`${path("insights/new")}?kind=${k.slug}`);
-            }}
-          >
-            <span className="kind-icon">
+    <DropdownMenu>
+      <DropdownMenuTrigger render={<Button variant={primary ? "default" : "outline"} />}>
+        <Icon name="plus" size={14} /> New insight
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-72">
+        {KINDS.map((k) => (
+          <DropdownMenuItem key={k.kind} className="gap-2.5 py-1.5" onClick={() => navigate(`${path("insights/new")}?kind=${k.slug}`)}>
+            <IconBadge>
               <Icon name={k.icon} size={14} />
+            </IconBadge>
+            <span className="flex min-w-0 flex-col">
+              <span className="font-semibold">{k.label}</span>
+              <span className="truncate text-xs text-muted-foreground">{k.blurb}</span>
             </span>
-            <span className="col" style={{ gap: 0 }}>
-              <b style={{ fontWeight: 600 }}>{k.label}</b>
-              <span className="muted small">{k.blurb}</span>
-            </span>
-          </button>
-        ))
-      }
-    </MenuButton>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
+const col = columnHelper<SavedInsight>();
+
+const KIND_ITEMS = [{ value: "all", label: "All types" }, ...KINDS.map((k) => ({ value: k.kind as string, label: k.label }))];
+
 export function InsightsPage() {
-  const projectId = useProjectId();
+  const pid = useProjectId();
   const path = usePath();
-  const { data, error, loading, reload } = useApi(`insights:${projectId}`, (s) => api.insights(projectId, s));
+  const { data, error, isPending, refetch } = useQuery(insightsQuery(pid));
   const [search, setSearch] = useState("");
-  const [kind, setKind] = useState<string>("all");
-  const list = (data ?? [])
-    .filter((i) => kind === "all" || i.query?.kind === kind)
-    .filter((i) => !search || `${i.name} ${summarize(i.query)}`.toLowerCase().includes(search.toLowerCase()))
-    .sort((a, b) => b.updated_at - a.updated_at);
+  const [kind, setKind] = useState("all");
+
+  const list = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    return (data ?? [])
+      .filter((i) => kind === "all" || i.query?.kind === kind)
+      .filter((i) => !needle || `${i.name} ${summarize(i.query)}`.toLowerCase().includes(needle));
+  }, [data, search, kind]);
+
+  const columns = useMemo(
+    () => [
+      col.accessor("name", {
+        header: "Name",
+        cell: ({ row }) => {
+          const i = row.original;
+          const k = i.query ? kindInfo(i.query.kind) : null;
+          return (
+            <div className="flex items-center gap-3">
+              <IconBadge>
+                <Icon name={k?.icon ?? "alert"} size={14} />
+              </IconBadge>
+              <div className="flex min-w-0 flex-col">
+                <Link
+                  to={path(`insights/${i.id}`)}
+                  onClick={(e) => e.stopPropagation()}
+                  className="max-w-md truncate font-semibold hover:text-brand-foreground hover:underline"
+                >
+                  {i.name}
+                </Link>
+                <span className="max-w-[560px] truncate text-xs text-muted-foreground">{summarize(i.query)}</span>
+              </div>
+            </div>
+          );
+        },
+      }),
+      col.accessor((i) => (i.query ? kindInfo(i.query.kind).label : "Legacy"), {
+        id: "type",
+        header: "Type",
+        cell: (c) => <span className="text-muted-foreground">{c.getValue()}</span>,
+      }),
+      col.accessor("updated_at", {
+        header: "Last modified",
+        cell: (c) => <span className="whitespace-nowrap text-muted-foreground">{fmtRelative(c.getValue())}</span>,
+        meta: { align: "right" },
+      }),
+    ],
+    [path],
+  );
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="titles">
-          <h1>Insights</h1>
-          <div className="sub">Saved questions about your product, answered live from your events.</div>
-        </div>
-        <div className="actions">
-          <NewInsightMenu />
-        </div>
-      </div>
+    <Page>
+      <PageHeader title="Insights" sub="Saved questions about your product, answered live from your events." actions={<NewInsightMenu />} />
 
-      <div className="grid-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", marginBottom: 20 }}>
+      <div className="mb-5 grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
         {KINDS.map((k) => (
-          <Link key={k.kind} to={`${path("insights/new")}?kind=${k.slug}`} className="card card-pad row" style={{ gap: 12, padding: "12px 14px" }}>
-            <span className="kind-icon" style={{ background: "var(--accent-wash)", color: "var(--accent-ink)" }}>
+          <Link
+            key={k.kind}
+            to={path("insights/new")}
+            search={{ kind: k.slug }}
+            className="flex items-center gap-3 rounded-xl bg-card px-3.5 py-3 ring-1 ring-foreground/10 transition-colors outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <IconBadge tone="brand" className="size-8">
               <Icon name={k.icon} size={15} />
-            </span>
-            <span className="col" style={{ gap: 0, minWidth: 0 }}>
-              <b>{k.label}</b>
-              <span className="muted small truncate">{k.blurb}</span>
+            </IconBadge>
+            <span className="flex min-w-0 flex-col">
+              <span className="font-semibold">{k.label}</span>
+              <span className="truncate text-xs text-muted-foreground">{k.blurb}</span>
             </span>
           </Link>
         ))}
       </div>
 
-      <div className="card">
-        <div className="card-head">
-          <div className="search" style={{ width: 280 }}>
-            <Icon name="search" size={14} />
-            <input className="input" placeholder="Search insights…" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search insights" />
-          </div>
-          <select className="select" value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Insight type">
-            <option value="all">All types</option>
-            {KINDS.map((k) => (
-              <option key={k.kind} value={k.kind}>
-                {k.label}
-              </option>
-            ))}
-          </select>
-          <span className="spacer" />
-          <span className="muted small">{data ? `${list.length} of ${data.length}` : ""}</span>
-        </div>
-        {error ? (
-          <ErrorState error={error} retry={reload} />
-        ) : !data && loading ? (
+      <Panel>
+        <CardBar>
+          <SearchInput wrapperClassName="w-full sm:w-72" placeholder="Search insights…" aria-label="Search insights" value={search} onChange={(e) => setSearch(e.target.value)} />
+          <Select value={kind} onValueChange={(v) => setKind(v ?? "all")} items={KIND_ITEMS}>
+            <SelectTrigger aria-label="Insight type" className="w-40">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {KIND_ITEMS.map((k) => (
+                <SelectItem key={k.value} value={k.value}>
+                  {k.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="flex-1" />
+          <span className="num text-xs text-muted-foreground">{data ? `${list.length} of ${data.length}` : ""}</span>
+        </CardBar>
+        {error && !data ? (
+          <ErrorState error={error} retry={() => void refetch()} />
+        ) : isPending ? (
           <SkeletonRows rows={6} />
         ) : data && data.length === 0 ? (
           <Empty icon="trends" title="No saved insights yet" action={<NewInsightMenu />}>
@@ -109,43 +149,18 @@ export function InsightsPage() {
         ) : list.length === 0 ? (
           <Empty icon="search" title="Nothing matches" />
         ) : (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Type</th>
-                <th className="r">Last modified</th>
-              </tr>
-            </thead>
-            <tbody>
-              {list.map((i) => {
-                const k = i.query ? kindInfo(i.query.kind) : null;
-                return (
-                  <tr key={i.id} className="clickable" onClick={() => navigate(path(`insights/${i.id}`))}>
-                    <td>
-                      <div className="row gap-12">
-                        <span className="kind-icon">
-                          <Icon name={k?.icon ?? "alert"} size={14} />
-                        </span>
-                        <div className="col" style={{ gap: 0, minWidth: 0 }}>
-                          <Link to={path(`insights/${i.id}`)} onClick={(e) => e.stopPropagation()} style={{ fontWeight: 600 }}>
-                            {i.name}
-                          </Link>
-                          <span className="muted small truncate" style={{ maxWidth: 560 }}>
-                            {summarize(i.query)}
-                          </span>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="secondary">{k?.label ?? "Legacy"}</td>
-                    <td className="r muted">{fmtRelative(i.updated_at)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <DataTable
+            label="Saved insights"
+            columns={columns}
+            data={list}
+            getRowId={(i) => i.id}
+            onRowClick={(i) => navigate(path(`insights/${i.id}`))}
+            sortable
+            initialSorting={[{ id: "updated_at", desc: true }]}
+            virtualize={{ maxHeight: 640, estimateRowHeight: 61 }}
+          />
         )}
-      </div>
-    </div>
+      </Panel>
+    </Page>
   );
 }

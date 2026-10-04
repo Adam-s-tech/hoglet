@@ -1,159 +1,161 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { ApiError, api, onUnauthorized, type Workspace } from "./lib/api";
-import { AppContext, findProject, firstProject, lastProject, projectPath, rememberProject, type AppState } from "./lib/context";
-import { match, navigate, useLocation } from "./lib/router";
-import { Shell } from "./Shell";
-import { Icon, Logo } from "./ui/icons";
-import { Empty, ErrorState, Toasts } from "./ui/kit";
-import { LoginPage, SetupPage } from "./pages/Auth";
-import { ActivityPage } from "./pages/Activity";
-import { DashboardPage, DashboardsPage } from "./pages/Dashboards";
-import { FlagPage, FlagsPage } from "./pages/Flags";
-import { HomePage } from "./pages/Home";
-import { InsightPage } from "./pages/Insight";
-import { InsightsPage } from "./pages/Insights";
-import { OnboardingPage } from "./pages/Onboarding";
-import { PersonPage, PersonsPage } from "./pages/Persons";
-import { SettingsPage } from "./pages/Settings";
-import { SharePage } from "./pages/Share";
-import { WebPage } from "./pages/Web";
+// The root of the route tree: decides between boot screens (loading, setup,
+// login), the public share view, and the app shell.
 
-type Boot = { state: "loading" } | { state: "setup" } | { state: "login" } | { state: "ready"; workspace: Workspace } | { state: "error"; error: unknown };
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Navigate, Outlet, useParams, useRouterState } from "@tanstack/react-router";
+import { useEffect, useMemo, type ReactNode } from "react";
+import { Icon, Logo } from "@/components/icons";
+import { ErrorState, Skeleton } from "@/components/feedback";
+import { Page } from "@/components/page";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Toaster } from "@/components/ui/sonner";
+import { api, errorMessage, type Workspace } from "@/lib/api";
+import { AppContext, findProject, firstProject, lastProject, projectPath, rememberProject, type AppState } from "@/lib/context";
+import { clearSessionData } from "@/lib/query-client";
+import { bootKey, bootQuery } from "@/lib/queries";
+import { navigate } from "@/lib/nav";
+import { LoginPage, SetupPage } from "@/pages/Auth";
+import { Shell } from "@/Shell";
+import { Empty } from "@/components/feedback";
+import { Notice } from "@/components/feedback";
 
 function Splash() {
   return (
-    <div className="auth">
-      <div className="col" style={{ alignItems: "center", gap: 12, opacity: 0.7 }}>
+    <div className="grid min-h-screen place-items-center">
+      <div className="flex flex-col items-center gap-3 opacity-70">
         <Logo size={40} />
-        <span className="spinner" />
+        <div className="size-5 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-brand motion-reduce:animate-none" role="status" aria-label="Loading" />
       </div>
     </div>
   );
 }
 
-function NotFound({ home }: { home: string }) {
+export function PageFallback() {
   return (
-    <div className="page narrow">
+    <Page>
+      <div className="flex flex-col gap-4" aria-busy="true" aria-label="Loading">
+        <Skeleton className="h-7 w-48" />
+        <Skeleton className="h-4 w-80" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    </Page>
+  );
+}
+
+export function RouteError({ error, reset }: { error: unknown; reset: () => void }) {
+  return (
+    <Page narrow>
+      <ErrorState error={error} retry={reset} />
+    </Page>
+  );
+}
+
+export function NotFound() {
+  const { projectId } = useParams({ strict: false });
+  return (
+    <Page narrow>
       <Empty
         icon="search"
         title="Nothing lives here"
         action={
-          <button className="btn" onClick={() => navigate(home)}>
+          <Button variant="outline" onClick={() => navigate(projectId ? projectPath(projectId) : "/")}>
             <Icon name="home" size={14} /> Back home
-          </button>
+          </Button>
         }
       >
         The page you followed doesn't exist in this project.
       </Empty>
-    </div>
+    </Page>
   );
 }
 
-function ProjectRoutes({ sub, projectId }: { sub: string; projectId: string }): ReactNode {
-  const path = `/${sub}`;
-  let m: Record<string, string> | null;
-  if (path === "/" || path === "") return <HomePage />;
-  if (path === "/onboarding") return <OnboardingPage />;
-  if (path === "/web") return <WebPage />;
-  if (path === "/insights") return <InsightsPage />;
-  if (path === "/insights/new") return <InsightPage key="new" id={null} />;
-  if ((m = match("/insights/:id", path))) return <InsightPage key={m.id} id={m.id} />;
-  if (path === "/activity") return <ActivityPage />;
-  if (path === "/persons") return <PersonsPage />;
-  if ((m = match("/persons/:id", path))) return <PersonPage key={m.id} id={m.id} />;
-  if (path === "/flags") return <FlagsPage />;
-  if (path === "/flags/new") return <FlagPage key="new" id={null} />;
-  if ((m = match("/flags/:id", path)) && /^\d+$/.test(m.id)) return <FlagPage key={m.id} id={Number(m.id)} />;
-  if (path === "/dashboards") return <DashboardsPage />;
-  if ((m = match("/dashboards/:id", path))) return <DashboardPage key={m.id} id={m.id} />;
-  if (path === "/settings") return <SettingsPage />;
-  return <NotFound home={projectPath(projectId)} />;
-}
-
-function NoProjects({ workspace, onCreated }: { workspace: Workspace; onCreated: () => void }) {
+function NoProjects({ workspace }: { workspace: Workspace }) {
   const org = workspace.organizations[0];
-  const [name, setName] = useState("Default project");
-  const [error, setError] = useState<unknown>(null);
+  const qc = useQueryClient();
+  const create = useMutation({
+    mutationFn: (name: string) => api.createProject(org.id, name.trim() || "Default project"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: bootKey }),
+  });
   return (
-    <div className="auth">
-      <div className="auth-card col gap-16">
+    <div className="grid min-h-screen place-items-center p-6">
+      <form
+        className="flex w-full max-w-sm flex-col gap-4 rounded-xl bg-card p-7 ring-1 ring-foreground/10"
+        onSubmit={(e) => {
+          e.preventDefault();
+          create.mutate(String(new FormData(e.currentTarget).get("name") ?? ""));
+        }}
+      >
         <Logo size={32} />
         <h1>Create a project</h1>
-        <p className="secondary">You're signed in as {workspace.user.email}, but there are no projects you can open yet.</p>
+        <p className="text-muted-foreground">You're signed in as {workspace.user.email}, but there are no projects you can open yet.</p>
         {org ? (
           <>
-            <input className="input" value={name} onChange={(e) => setName(e.target.value)} aria-label="Project name" />
-            {error ? <ErrorState error={error} compact /> : null}
-            <button
-              className="btn primary"
-              onClick={async () => {
-                try {
-                  await api.createProject(org.id, name.trim() || "Default project");
-                  onCreated();
-                } catch (e) {
-                  setError(e);
-                }
-              }}
-            >
+            <Input name="name" defaultValue="Default project" aria-label="Project name" />
+            {create.error ? <Notice tone="bad">{errorMessage(create.error)}</Notice> : null}
+            <Button type="submit" disabled={create.isPending}>
               Create project in {org.name}
-            </button>
+            </Button>
           </>
         ) : (
-          <p className="muted">Ask an organization owner to invite you.</p>
+          <p className="text-muted-foreground">Ask an organization owner to invite you.</p>
         )}
-      </div>
+      </form>
     </div>
   );
 }
 
-export function App() {
-  const loc = useLocation();
-  const [boot, setBoot] = useState<Boot>({ state: "loading" });
+/** Where `/` and unknown paths go: the last project used, else the first. */
+export function Landing() {
+  const boot = useQuery(bootQuery);
+  if (boot.data?.state !== "ready") return null;
+  const target = findProject(boot.data.workspace, lastProject()) ?? firstProject(boot.data.workspace);
+  if (!target) return null;
+  return <Navigate to={projectPath(target.project.id)} replace />;
+}
 
-  const load = useCallback(async (): Promise<Workspace | null> => {
-    try {
-      const { setup_required } = await api.bootstrap();
-      if (setup_required) {
-        setBoot({ state: "setup" });
-        return null;
-      }
-      const workspace = await api.me();
-      setBoot({ state: "ready", workspace });
-      return workspace;
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) setBoot({ state: "login" });
-      else setBoot({ state: "error", error: e });
-      return null;
-    }
-  }, []);
+function Gate() {
+  const boot = useQuery(bootQuery);
+  if (boot.isPending) return <Splash />;
+  if (boot.isError)
+    return (
+      <div className="grid min-h-screen place-items-center p-6">
+        <div className="w-full max-w-md rounded-xl bg-card ring-1 ring-foreground/10">
+          <ErrorState error={boot.error} retry={() => void boot.refetch()} />
+        </div>
+      </div>
+    );
+  const state = boot.data;
+  if (state.state === "setup") return <SetupPage />;
+  if (state.state === "login") return <LoginPage />;
+  if (!firstProject(state.workspace)) return <NoProjects workspace={state.workspace} />;
+  return <Outlet />;
+}
 
-  useEffect(() => {
-    if (loc.path.startsWith("/share/")) return;
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [load]);
+export function Root() {
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const isShare = pathname.startsWith("/share/");
+  return (
+    <>
+      {isShare ? <Outlet /> : <Gate />}
+      <Toaster position="bottom-right" />
+    </>
+  );
+}
 
-  useEffect(() => {
-    onUnauthorized(() => setBoot({ state: "login" }));
-    return () => onUnauthorized(null);
-  }, []);
-
-  const workspace = boot.state === "ready" ? boot.workspace : null;
-  const projectMatch = match("/project/:pid/*", loc.path) ?? match("/project/:pid", loc.path);
-  const current = workspace ? findProject(workspace, projectMatch?.pid ?? null) : null;
-
-  // Land on a real project: the last one used, else the first.
-  useEffect(() => {
-    if (!workspace || current) return;
-    const target = findProject(workspace, lastProject()) ?? firstProject(workspace);
-    if (target) navigate(projectPath(target.project.id), { replace: true });
-  }, [workspace, current]);
+/** `/project/$projectId`: resolves the project from the session, provides it, renders the shell. */
+export function ProjectLayout(): ReactNode {
+  const { projectId } = useParams({ from: "/project/$projectId" });
+  const qc = useQueryClient();
+  const boot = useQuery(bootQuery);
+  const workspace = boot.data?.state === "ready" ? boot.data.workspace : null;
+  const current = workspace ? findProject(workspace, projectId) : null;
 
   useEffect(() => {
     if (current) rememberProject(current.project.id);
   }, [current]);
 
-  const appState: AppState | null = useMemo(() => {
+  const state: AppState | null = useMemo(() => {
     if (!workspace || !current) return null;
     return {
       workspace,
@@ -162,7 +164,7 @@ export function App() {
       refreshWorkspace: async () => {
         try {
           const w = await api.me();
-          setBoot({ state: "ready", workspace: w });
+          qc.setQueryData(bootKey, { state: "ready", workspace: w });
           return w;
         } catch {
           return null;
@@ -172,53 +174,24 @@ export function App() {
         try {
           await api.logout();
         } finally {
-          setBoot({ state: "login" });
+          clearSessionData();
+          qc.setQueryData(bootKey, { state: "login" });
           navigate("/", { replace: true });
         }
       },
     };
-  }, [workspace, current]);
+  }, [workspace, current, qc]);
 
-  const shareMatch = match("/share/:token", loc.path);
-  let content: ReactNode;
-  if (shareMatch) content = <SharePage token={shareMatch.token} />;
-  else if (boot.state === "loading") content = <Splash />;
-  else if (boot.state === "error")
-    content = (
-      <div className="auth">
-        <div className="auth-card">
-          <ErrorState error={boot.error} retry={() => void load()} />
-        </div>
-      </div>
-    );
-  else if (boot.state === "setup")
-    content = (
-      <SetupPage
-        onDone={(w) => {
-          setBoot({ state: "ready", workspace: w });
-          const first = firstProject(w);
-          if (first) navigate(projectPath(first.project.id, "onboarding"), { replace: true });
-        }}
-      />
-    );
-  else if (boot.state === "login") content = <LoginPage onDone={() => void load()} />;
-  else if (workspace && !firstProject(workspace)) content = <NoProjects workspace={workspace} onCreated={() => void load()} />;
-  else if (!appState) content = <Splash />;
-  else {
-    const sub = projectMatch?.["*"] ?? "";
-    content = (
-      <AppContext.Provider value={appState}>
-        <Shell>
-          <ProjectRoutes sub={sub} projectId={appState.project.id} />
-        </Shell>
-      </AppContext.Provider>
-    );
+  if (!workspace) return null;
+  if (!state) {
+    const target = findProject(workspace, lastProject()) ?? firstProject(workspace);
+    return target ? <Navigate to={projectPath(target.project.id)} replace /> : null;
   }
-
   return (
-    <>
-      {content}
-      <Toasts />
-    </>
+    <AppContext.Provider value={state}>
+      <Shell>
+        <Outlet />
+      </Shell>
+    </AppContext.Provider>
   );
 }

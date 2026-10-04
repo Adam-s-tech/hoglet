@@ -2,9 +2,8 @@ import type { EventNode } from "../types/EventNode";
 import type { InsightQuery } from "../types/InsightQuery";
 import type { Math as MathKind } from "../types/Math";
 import type { PropertyFilter } from "../types/PropertyFilter";
-import type { IconName } from "../ui/icons";
-import { eventLabel } from "../lib/properties";
-import { completeFilters } from "./pickers";
+import type { IconName } from "@/components/icons";
+import { completeFilters, eventLabel } from "../lib/properties";
 
 export type QueryKind = InsightQuery["kind"];
 

@@ -1,51 +1,116 @@
 // Renders any InsightResult; every number opens the persons behind it.
 
-import { useMemo, useRef, useState, type ReactNode } from "react";
-import type { ActorSelection } from "../types/ActorSelection";
-import type { InsightQuery } from "../types/InsightQuery";
-import type { InsightResult } from "../types/InsightResult";
-import type { PersonSummary } from "../types/PersonSummary";
-import type { QueryResponse } from "../types/QueryResponse";
-import type { TrendSeries } from "../types/TrendSeries";
-import { api, isAbort } from "../lib/api";
-import { usePath, useProjectId } from "../lib/context";
-import { fmtBucket, fmtCompact, fmtDuration, fmtNumber, fmtPercent, fmtRelative } from "../lib/format";
-import { useApi, useDebounced } from "../lib/hooks";
-import { eventLabel } from "../lib/properties";
-import { navigate } from "../lib/router";
-import { breakdownLabel, FunnelChart } from "../charts/Funnel";
-import { HBarList, PieChart } from "../charts/Pie";
-import { RetentionGrid } from "../charts/Retention";
-import { PathsSankey } from "../charts/Sankey";
-import { seriesColor } from "../charts/scale";
-import { TimeSeriesChart, type ChartSeries } from "../charts/TimeSeries";
-import { Icon } from "../ui/icons";
-import { Avatar, Empty, ErrorState, Modal, Seg, Skeleton } from "../ui/kit";
+import { infiniteQueryOptions, keepPreviousData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import type { ActorSelection } from "@/types/ActorSelection";
+import type { InsightQuery } from "@/types/InsightQuery";
+import type { InsightResult } from "@/types/InsightResult";
+import type { PersonSummary } from "@/types/PersonSummary";
+import type { QueryResponse } from "@/types/QueryResponse";
+import type { TrendSeries } from "@/types/TrendSeries";
+import { Avatar } from "@/components/avatar";
+import { AppDialog } from "@/components/dialogs";
+import { columnHelper, DataTable } from "@/components/data-table";
+import { Empty, ErrorState, Skeleton } from "@/components/feedback";
+import { Seg } from "@/components/controls";
+import { SearchInput } from "@/components/page";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { api, isAbort } from "@/lib/api";
+import { usePath, useProjectId } from "@/lib/context";
+import { fmtBucket, fmtCompact, fmtDuration, fmtNumber, fmtRelative } from "@/lib/format";
+import { useDebounced } from "@/lib/hooks";
+import { navigate } from "@/lib/nav";
+import { eventLabel } from "@/lib/properties";
+import { insightResultQuery, qk } from "@/lib/queries";
+import { breakdownLabel, FunnelChart } from "@/charts/Funnel";
+import { HBarList, PieChart } from "@/charts/Pie";
+import { Delta, Swatch } from "@/charts/parts";
+import { RetentionGrid } from "@/charts/Retention";
+import { PathsSankey } from "@/charts/Sankey";
+import { seriesColor } from "@/charts/scale";
+import { TimeSeriesChart, type ChartSeries } from "@/charts/TimeSeries";
 import { incomplete, sanitize } from "./defaults";
 
 // ── Running a query ─────────────────────────────────────────────────────
 
+/** Placeholder request for the disabled (nothing to run) state; never sent. */
+const IDLE: InsightQuery = { kind: "SqlQuery", query: "" };
+
+/**
+ * Runs an insight on TanStack Query. The query is sanitized, then debounced
+ * into the cache key, so typing never fires a request per keystroke and a
+ * superseded request is aborted. While the next result loads the previous one
+ * stays on screen (`pending` is true, `sent` is the query that produced `data`).
+ * `refresh` recomputes server-side (bypassing its cache) and writes the answer
+ * into the query cache; `reload` retries the current key (error state).
+ */
 export function useInsightQuery(query: InsightQuery | null, debounceMs = 350) {
   const projectId = useProjectId();
+  const queryClient = useQueryClient();
   const ready = query ? incomplete(query) === null : false;
   const clean = useMemo(() => (query && ready ? sanitize(query) : null), [query, ready]);
   const json = clean ? JSON.stringify(clean) : null;
   const key = useDebounced(json, debounceMs);
-  const refresh = useRef(false);
-  const res = useApi<QueryResponse>(key ? `query:${projectId}:${key}` : null, (signal) => {
-    const body = { query: JSON.parse(key as string) as InsightQuery, refresh: refresh.current };
-    refresh.current = false;
-    return api.query(projectId, body, signal);
-  });
+  const target = useMemo(() => (key ? (JSON.parse(key) as InsightQuery) : null), [key]);
+
+  const options = insightResultQuery(projectId, { query: target ?? IDLE, refresh: false });
+  const res = useQuery({ ...options, enabled: target !== null, placeholderData: keepPreviousData });
+
+  // The query that produced `res.data`: differs from `target` only while a new
+  // result is loading behind the previous one.
+  const shown = useRef<InsightQuery | null>(null);
+  if (res.data && !res.isPlaceholderData) shown.current = target;
+  const sent = res.data ? (res.isPlaceholderData ? shown.current : target) : target;
+
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<unknown>(null);
+  const abort = useRef<AbortController | null>(null);
+  useEffect(() => {
+    setRefreshError(null);
+    return () => abort.current?.abort();
+  }, [key]);
+
+  const queryKey = options.queryKey;
+  const refresh = useCallback(() => {
+    if (!target) return;
+    abort.current?.abort();
+    const ctl = new AbortController();
+    abort.current = ctl;
+    setRefreshing(true);
+    setRefreshError(null);
+    api
+      .query(projectId, { query: target, refresh: true }, ctl.signal)
+      .then((fresh: QueryResponse) => {
+        queryClient.setQueryData(queryKey, fresh);
+      })
+      .catch((e: unknown) => {
+        if (!isAbort(e)) setRefreshError(e);
+      })
+      .finally(() => {
+        if (abort.current === ctl) {
+          abort.current = null;
+          setRefreshing(false);
+        }
+      });
+  }, [projectId, queryClient, queryKey, target]);
+
+  const { refetch } = res;
+  const reload = useCallback(() => {
+    setRefreshError(null);
+    void refetch();
+  }, [refetch]);
+
   return {
-    ...res,
-    pending: res.loading || key !== json,
-    sent: key ? (JSON.parse(key) as InsightQuery) : null,
+    data: res.data,
+    error: refreshError ?? res.error,
+    loading: res.isFetching || refreshing,
+    pending: res.isFetching || refreshing || key !== json,
+    sent,
     hint: query ? incomplete(query) : null,
-    refresh: () => {
-      refresh.current = true;
-      res.reload();
-    },
+    refresh,
+    reload,
   };
 }
 
@@ -56,101 +121,138 @@ export interface ActorsTarget {
   title: string;
 }
 
+const ACTORS_PAGE = 100;
+/** Hard cap on persons loaded into the dialog: ACTORS_PAGE x ACTORS_MAX_PAGES. */
+const ACTORS_MAX_PAGES = 10;
+/** Past this many matching rows the table virtualizes. */
+const ACTORS_VIRTUALIZE_AT = 30;
+
+const actorsPagesQuery = (pid: string, query: InsightQuery, selection: ActorSelection) =>
+  infiniteQueryOptions({
+    queryKey: [...qk.query(pid), "actors-pages", JSON.stringify(query), JSON.stringify(selection)] as const,
+    queryFn: ({ signal, pageParam }) => api.actors(pid, { query, selection, offset: pageParam, limit: ACTORS_PAGE }, signal),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => (last.has_more && all.length < ACTORS_MAX_PAGES ? all.length * ACTORS_PAGE : undefined),
+    staleTime: 60_000,
+  });
+
+function PersonName({ p, onClose }: { p: PersonSummary; onClose: () => void }) {
+  const path = usePath();
+  return (
+    <div className="flex items-center gap-2">
+      <Avatar name={p.display_name} id={p.id} />
+      <Link
+        to={path(`persons/${encodeURIComponent(p.id)}`)}
+        className="max-w-65 truncate font-medium hover:text-brand-foreground hover:underline"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+      >
+        {p.display_name}
+      </Link>
+      {p.is_identified && <Badge variant="secondary">identified</Badge>}
+    </div>
+  );
+}
+
+const personCol = columnHelper<PersonSummary>();
+
 export function ActorsModal({ query, target, onClose }: { query: InsightQuery; target: ActorsTarget; onClose: () => void }) {
   const projectId = useProjectId();
-  const path = usePath();
-  const [extra, setExtra] = useState<PersonSummary[]>([]);
-  const [more, setMore] = useState<{ loading: boolean; hasMore: boolean | null; error: unknown }>({ loading: false, hasMore: null, error: null });
-  const { data, error, loading, reload } = useApi(`actors:${projectId}:${JSON.stringify(query)}:${JSON.stringify(target.selection)}`, (signal) =>
-    api.actors(projectId, { query: sanitize(query), selection: target.selection, offset: 0, limit: 100 }, signal),
-  );
-  const persons = [...(data?.persons ?? []), ...extra];
-  const hasMore = more.hasMore ?? data?.has_more ?? false;
+  const clean = useMemo(() => sanitize(query), [query]);
+  const q = useInfiniteQuery(actorsPagesQuery(projectId, clean, target.selection));
   const [filter, setFilter] = useState("");
-  const shown = filter ? persons.filter((p) => `${p.display_name} ${p.distinct_ids.join(" ")}`.toLowerCase().includes(filter.toLowerCase())) : persons;
+
+  const persons = useMemo(() => {
+    const seen = new Set<string>();
+    return (q.data?.pages.flatMap((pg) => pg.persons) ?? []).filter((p) => !seen.has(p.id) && seen.add(p.id));
+  }, [q.data]);
+  const needle = filter.trim().toLowerCase();
+  const shown = useMemo(
+    () => (needle ? persons.filter((p) => `${p.display_name} ${p.distinct_ids.join(" ")}`.toLowerCase().includes(needle)) : persons),
+    [persons, needle],
+  );
+  const lastPage = q.data?.pages[q.data.pages.length - 1];
+  const capped = !!lastPage?.has_more && !q.hasNextPage;
+
+  const columns = useMemo(
+    () => [
+      personCol.accessor("display_name", { header: "Person", cell: ({ row }) => <PersonName p={row.original} onClose={onClose} /> }),
+      personCol.accessor((p) => p.distinct_ids[0] ?? "", {
+        id: "distinct_id",
+        header: "Distinct ID",
+        cell: (c) => <span className="block max-w-55 truncate font-mono text-xs text-muted-foreground">{c.getValue()}</span>,
+      }),
+      personCol.accessor((p) => (p.last_seen ? Date.parse(p.last_seen) : 0), {
+        id: "last_seen",
+        header: "Last seen",
+        cell: ({ row }) => <span className="text-xs text-muted-foreground">{row.original.last_seen ? fmtRelative(row.original.last_seen) : "–"}</span>,
+        meta: { align: "right" },
+      }),
+    ],
+    [onClose],
+  );
 
   return (
-    <Modal title={target.title} onClose={onClose} wide>
-      <div className="col gap-12">
-        <div className="row">
-          <div className="search grow">
-            <Icon name="search" size={14} />
-            <input className="input" placeholder="Filter loaded persons…" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter persons" />
-          </div>
-          <span className="muted small num">{data ? `${fmtNumber(persons.length)}${hasMore ? "+" : ""} persons` : ""}</span>
+    <AppDialog title={target.title} onClose={onClose} wide>
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-3">
+          <SearchInput
+            wrapperClassName="flex-1"
+            placeholder="Filter loaded persons…"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            aria-label="Filter persons"
+          />
+          <span className="num text-xs text-muted-foreground" aria-live="polite">
+            {q.data ? `${fmtNumber(needle ? shown.length : persons.length)}${q.hasNextPage || capped ? "+" : ""} persons` : ""}
+          </span>
         </div>
-        {error ? (
-          <ErrorState error={error} retry={reload} />
-        ) : !data && loading ? (
-          <div className="col" style={{ gap: 10 }}>
+        {q.error && !q.data ? (
+          <ErrorState error={q.error} retry={() => void q.refetch()} />
+        ) : q.isPending ? (
+          <div className="flex flex-col gap-2.5" aria-busy="true" aria-label="Loading persons">
             {Array.from({ length: 6 }, (_, i) => (
-              <Skeleton key={i} height={30} />
+              <Skeleton key={i} className="h-7" />
             ))}
           </div>
         ) : persons.length === 0 ? (
           <Empty icon="users" title="No persons here">
             Nobody matches this data point.
           </Empty>
+        ) : shown.length === 0 ? (
+          <Empty icon="search" title="No loaded person matches">
+            {q.hasNextPage ? "Load more persons, or clear the filter." : "Clear the filter to see everyone."}
+          </Empty>
         ) : (
-          <div className="card" style={{ boxShadow: "none", border: "1px solid var(--line)" }}>
-            <table className="table compact">
-              <thead>
-                <tr>
-                  <th>Person</th>
-                  <th>Distinct ID</th>
-                  <th className="r">Last seen</th>
-                </tr>
-              </thead>
-              <tbody>
-                {shown.map((p) => (
-                  <tr
-                    key={p.id}
-                    className="clickable"
-                    onClick={() => {
-                      onClose();
-                      navigate(path(`persons/${encodeURIComponent(p.id)}`));
-                    }}
-                  >
-                    <td>
-                      <div className="row">
-                        <Avatar name={p.display_name} id={p.id} />
-                        <span className="truncate" style={{ maxWidth: 260 }}>
-                          {p.display_name}
-                        </span>
-                        {p.is_identified && <span className="badge accent">identified</span>}
-                      </div>
-                    </td>
-                    <td className="mono small muted truncate" style={{ maxWidth: 220 }}>
-                      {p.distinct_ids[0]}
-                    </td>
-                    <td className="r muted small">{p.last_seen ? fmtRelative(p.last_seen) : "–"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="overflow-hidden rounded-lg ring-1 ring-foreground/10">
+            <DataTable
+              label="Persons behind this data point"
+              columns={columns}
+              data={shown}
+              getRowId={(p) => p.id}
+              dense
+              sortable
+              virtualize={shown.length > ACTORS_VIRTUALIZE_AT ? { maxHeight: 380 } : undefined}
+              onRowClick={(p) => {
+                onClose();
+                navigate(`/project/${encodeURIComponent(projectId)}/persons/${encodeURIComponent(p.id)}`);
+              }}
+            />
           </div>
         )}
-        {more.error ? <ErrorState error={more.error} compact /> : null}
-        {hasMore && (
-          <button
-            className="btn"
-            disabled={more.loading}
-            onClick={async () => {
-              setMore((m) => ({ ...m, loading: true }));
-              try {
-                const r = await api.actors(projectId, { query: sanitize(query), selection: target.selection, offset: persons.length, limit: 100 });
-                setExtra((e) => [...e, ...r.persons]);
-                setMore({ loading: false, hasMore: r.has_more, error: null });
-              } catch (e) {
-                if (!isAbort(e)) setMore({ loading: false, hasMore: true, error: e });
-              }
-            }}
-          >
-            {more.loading ? "Loading…" : "Load more"}
-          </button>
+        {q.error && q.data ? <ErrorState error={q.error} compact /> : null}
+        {capped && <p className="text-xs text-muted-foreground">Showing the first {fmtNumber(ACTORS_PAGE * ACTORS_MAX_PAGES)} persons.</p>}
+        {q.hasNextPage && (
+          <div>
+            <Button variant="outline" disabled={q.isFetchingNextPage} onClick={() => void q.fetchNextPage()}>
+              {q.isFetchingNextPage ? "Loading…" : "Load more"}
+            </Button>
+          </div>
         )}
       </div>
-    </Modal>
+    </AppDialog>
   );
 }
 
@@ -181,7 +283,9 @@ const MATH_SHORT: Record<string, string> = {
   p99: "p99",
 };
 
-function trendLabel(s: TrendSeries, q?: Extract<InsightQuery, { kind: "TrendsQuery" }>): string {
+type TrendsQ = Extract<InsightQuery, { kind: "TrendsQuery" }>;
+
+function trendLabel(s: TrendSeries, q?: TrendsQ): string {
   let label = s.label;
   const node = q && s.series_index !== null ? q.series[s.series_index] : undefined;
   if (node && !node.custom_name) {
@@ -197,18 +301,84 @@ function interval(q: InsightQuery): string {
   return "interval" in q ? q.interval : "day";
 }
 
-function TrendsView({
+const seriesCol = columnHelper<{ s: TrendSeries; si: number }>();
+type SeriesRow = { s: TrendSeries; si: number };
+
+/** Trends as a table: one row per series, one column per bucket. Every cell opens its persons. */
+function TrendsTable({
   query,
   series,
-  compact,
+  slot,
   onSelect,
 }: {
-  query: Extract<InsightQuery, { kind: "TrendsQuery" }>;
+  query: TrendsQ;
   series: TrendSeries[];
-  compact?: boolean;
-  onSelect: (t: ActorsTarget) => void;
+  slot: (s: TrendSeries) => number;
+  onSelect: (s: TrendSeries, i: number) => void;
 }) {
+  const labels = series[0]?.labels ?? [];
+  const rows = useMemo<SeriesRow[]>(() => series.map((s, si) => ({ s, si })), [series]);
+  const columns = useMemo(
+    () => [
+      seriesCol.accessor((r) => trendLabel(r.s, query), {
+        id: "series",
+        header: "Series",
+        cell: ({ row }) => (
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <Swatch color={seriesColor(slot(row.original.s))} faded={!!row.original.s.compare} />
+            {trendLabel(row.original.s, query)}
+          </span>
+        ),
+      }),
+      seriesCol.accessor((r) => r.s.aggregated_value, {
+        id: "total",
+        header: "Total",
+        sortFn: "basic",
+        cell: (c) => <b className="num font-semibold">{fmtNumber(c.getValue())}</b>,
+        meta: { align: "right" },
+      }),
+      ...labels.map((l, i) =>
+        seriesCol.accessor((r) => r.s.data[i] ?? 0, {
+          id: `b${i}`,
+          header: l,
+          sortFn: "basic",
+          cell: ({ row, getValue }) => (
+            <button
+              type="button"
+              className="num rounded-sm hover:text-brand-foreground hover:underline focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none"
+              title="See persons"
+              onClick={() => onSelect(row.original.s, i)}
+            >
+              {fmtNumber(getValue())}
+            </button>
+          ),
+          meta: { align: "right" },
+        }),
+      ),
+    ],
+    [labels, query, slot, onSelect],
+  );
+  return (
+    <div className="overflow-hidden rounded-lg ring-1 ring-foreground/10">
+      <DataTable label="Trends by period" columns={columns} data={rows} getRowId={(r) => String(r.si)} dense sortable />
+    </div>
+  );
+}
+
+function TrendsView({ query, series, compact, onSelect }: { query: TrendsQ; series: TrendSeries[]; compact?: boolean; onSelect: (t: ActorsTarget) => void }) {
   const slot = trendIdentity(series);
+  const select = useCallback(
+    (s: TrendSeries, i: number | null) => {
+      if (s.series_index === null) return;
+      const day = i === null ? s.days[0] : s.days[i];
+      if (!day) return;
+      onSelect({
+        selection: { type: "TrendsPoint", series_index: s.series_index, day, breakdown_value: s.breakdown_value },
+        title: `${trendLabel(s, query)} · ${i === null ? "" : (s.labels[i] ?? fmtBucket(day, interval(query)))}`,
+      });
+    },
+    [onSelect, query],
+  );
   if (series.length === 0 || series.every((s) => s.data.length === 0)) {
     return (
       <Empty icon="trends" title="No matching events in this range">
@@ -216,15 +386,6 @@ function TrendsView({
       </Empty>
     );
   }
-  const select = (s: TrendSeries, i: number | null) => {
-    if (s.series_index === null) return;
-    const day = i === null ? s.days[0] : s.days[i];
-    if (!day) return;
-    onSelect({
-      selection: { type: "TrendsPoint", series_index: s.series_index, day, breakdown_value: s.breakdown_value },
-      title: `${trendLabel(s, query)} · ${i === null ? "" : s.labels[i] ?? fmtBucket(day, interval(query))}`,
-    });
-  };
   const display = query.display;
   const height = compact ? 220 : 340;
 
@@ -233,16 +394,18 @@ function TrendsView({
     const prev = series.find((s) => s.compare && s.series_index === main.series_index && s.breakdown_value === main.breakdown_value);
     const delta = prev && prev.aggregated_value ? ((main.aggregated_value - prev.aggregated_value) / Math.abs(prev.aggregated_value)) * 100 : null;
     return (
-      <div className="bold-number">
-        <div className="value num" title={fmtNumber(main.aggregated_value)} onClick={() => select(main, main.days.length - 1)}>
+      <div className="flex h-full flex-col items-center justify-center gap-1.5 p-6">
+        <button
+          type="button"
+          className="num rounded-md text-[clamp(40px,7vw,76px)] leading-none font-semibold tracking-tight focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none"
+          title={`${fmtNumber(main.aggregated_value)} · click to see persons`}
+          aria-label={`${fmtNumber(main.aggregated_value)} ${trendLabel(main, query)}. Show persons.`}
+          onClick={() => select(main, main.days.length - 1)}
+        >
           {fmtCompact(main.aggregated_value)}
-        </div>
-        <div className="label">{trendLabel(main, query)}</div>
-        {delta !== null && (
-          <span className={`delta ${delta > 0 ? "up" : delta < 0 ? "down" : "flat"}`}>
-            {delta > 0 ? "▲" : delta < 0 ? "▼" : ""} {fmtPercent(Math.abs(delta))} vs previous period
-          </span>
-        )}
+        </button>
+        <div className="text-muted-foreground">{trendLabel(main, query)}</div>
+        {delta !== null && <Delta value={delta} suffix="vs previous period" />}
       </div>
     );
   }
@@ -256,48 +419,7 @@ function TrendsView({
     return display === "ActionsPie" ? <PieChart slices={rows} size={compact ? 180 : 240} onSliceClick={click} /> : <HBarList rows={rows} onClick={click} />;
   }
 
-  if (display === "ActionsTable") {
-    const labels = series[0]?.labels ?? [];
-    return (
-      <div className="table-wrap">
-        <table className="table compact">
-          <thead>
-            <tr>
-              <th>Series</th>
-              <th className="r">Total</th>
-              {labels.map((l, i) => (
-                <th key={i} className="r">
-                  {l}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {series.map((s, si) => (
-              <tr key={si}>
-                <td>
-                  <div className="row nowrap">
-                    <span className="swatch" style={{ background: seriesColor(slot(s)), opacity: s.compare ? 0.5 : 1 }} />
-                    {trendLabel(s, query)}
-                  </div>
-                </td>
-                <td className="r">
-                  <b>{fmtNumber(s.aggregated_value)}</b>
-                </td>
-                {s.data.map((v, i) => (
-                  <td key={i} className="r">
-                    <button className="link" style={{ border: 0, background: "none", padding: 0, font: "inherit", color: "inherit" }} onClick={() => select(s, i)}>
-                      {fmtNumber(v)}
-                    </button>
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    );
-  }
+  if (display === "ActionsTable") return <TrendsTable query={query} series={series} slot={slot} onSelect={select} />;
 
   const kind = display === "ActionsAreaGraph" ? "area" : display === "ActionsBar" ? (query.breakdown ? "stacked" : "bar") : "line";
   const base = series.find((s) => !s.compare) ?? series[0];
@@ -315,24 +437,17 @@ function TrendsView({
       height={height}
       labels={labels}
       series={chartSeries}
-      tooltipTitle={(i) => (base.days[i] ? fmtBucket(base.days[i], interval(query)) + (interval(query) === "hour" ? "" : "") : labels[i])}
+      tooltipTitle={(i) => (base.days[i] ? fmtBucket(base.days[i], interval(query)) : labels[i])}
       onPointClick={(si, i) => select(series[si], i)}
       legend={!compact || series.length <= 6}
     />
   );
 }
 
-export function InsightResultView({
-  query,
-  result,
-  compact = false,
-}: {
-  query: InsightQuery;
-  result: InsightResult;
-  compact?: boolean;
-}) {
+export function InsightResultView({ query, result, compact = false }: { query: InsightQuery; result: InsightResult; compact?: boolean }) {
   const [target, setTarget] = useState<ActorsTarget | null>(null);
   const [funnelTab, setFunnelTab] = useState<"steps" | "time">("steps");
+  const closeActors = useCallback(() => setTarget(null), []);
   let body: ReactNode = null;
 
   if (result.kind === "Trends" && query.kind === "TrendsQuery") {
@@ -346,12 +461,13 @@ export function InsightResultView({
       );
     } else {
       body = (
-        <div className="col gap-16">
+        <div className="flex flex-col gap-4">
           {!compact && result.time_to_convert.length > 0 && (
             <Seg
               label="Funnel view"
               value={funnelTab}
               onChange={setFunnelTab}
+              className="self-start"
               options={[
                 { value: "steps", label: "Conversion steps" },
                 { value: "time", label: "Time to convert" },
@@ -448,10 +564,12 @@ export function InsightResultView({
   return (
     <>
       {body}
-      {target && <ActorsModal query={query} target={target} onClose={() => setTarget(null)} />}
+      {target && <ActorsModal query={query} target={target} onClose={closeActors} />}
     </>
   );
 }
+
+// ── SQL ─────────────────────────────────────────────────────────────────
 
 function cell(v: unknown): string {
   if (v === null || v === undefined) return "null";
@@ -464,17 +582,57 @@ function toCsv(columns: string[], rows: unknown[][]): string {
   return [columns.map(esc).join(","), ...rows.map((r) => r.map((v) => esc(cell(v))).join(","))].join("\n");
 }
 
+/** Rows rendered in the SQL table (virtualized). The server already caps results; CSV export is not limited by this. */
+const SQL_RENDER_CAP = 5000;
+const NUMERIC_TYPE = /int|float|double|decimal|number/i;
+
+interface SqlRow {
+  n: number;
+  cells: unknown[];
+}
+const sqlCol = columnHelper<SqlRow>();
+
 export function SqlTable({ columns, types, rows, truncated, compact }: { columns: string[]; types: string[]; rows: unknown[][]; truncated: boolean; compact?: boolean }) {
+  const data = useMemo<SqlRow[]>(() => rows.slice(0, SQL_RENDER_CAP).map((cells, n) => ({ n, cells })), [rows]);
+  const cols = useMemo(
+    () =>
+      columns.map((name, ci) => {
+        const numeric = NUMERIC_TYPE.test(types[ci] ?? "");
+        return sqlCol.accessor((r) => r.cells[ci] ?? null, {
+          id: `c${ci}`,
+          header: () => (
+            <>
+              {name}
+              <span className="ml-1.5 font-normal tracking-normal text-muted-foreground normal-case">{types[ci]}</span>
+            </>
+          ),
+          sortFn: numeric ? "basic" : "alphanumeric",
+          cell: ({ getValue }) => {
+            const v = getValue();
+            return (
+              <span className="block max-w-90 truncate font-mono text-xs" title={cell(v)}>
+                {v === null ? <span className="text-muted-foreground">null</span> : typeof v === "number" ? fmtNumber(v) : cell(v)}
+              </span>
+            );
+          },
+          meta: { align: numeric ? "right" : undefined },
+        });
+      }),
+    [columns, types],
+  );
   if (columns.length === 0) return <Empty icon="table" title="The query returned no columns" />;
   return (
-    <div className="col gap-12">
+    <div className="flex flex-col gap-3">
       {!compact && (
-        <div className="row">
-          <span className="muted small grow num">
-            {fmtNumber(rows.length)} rows{truncated && " · truncated at the row cap"}
+        <div className="flex items-center gap-2">
+          <span className="num flex-1 text-xs text-muted-foreground">
+            {fmtNumber(rows.length)} rows
+            {rows.length > SQL_RENDER_CAP && ` · showing the first ${fmtNumber(SQL_RENDER_CAP)}`}
+            {truncated && " · truncated at the row cap"}
           </span>
-          <button
-            className="btn small"
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => {
               const blob = new Blob([toCsv(columns, rows)], { type: "text/csv" });
               const a = document.createElement("a");
@@ -485,35 +643,19 @@ export function SqlTable({ columns, types, rows, truncated, compact }: { columns
             }}
           >
             Export CSV
-          </button>
+          </Button>
         </div>
       )}
-      <div className="table-wrap" style={{ maxHeight: compact ? 260 : 560, overflow: "auto", border: "1px solid var(--line)", borderRadius: 8 }}>
-        <table className="table compact">
-          <thead>
-            <tr>
-              {columns.map((c, i) => (
-                <th key={i} className={/int|float|double|decimal|number/i.test(types[i] ?? "") ? "r" : undefined}>
-                  {c}
-                  <span className="muted" style={{ textTransform: "none", fontWeight: 400, marginLeft: 6 }}>
-                    {types[i]}
-                  </span>
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r, ri) => (
-              <tr key={ri}>
-                {r.map((v, ci) => (
-                  <td key={ci} className={`${typeof v === "number" ? "r " : ""}mono small`} style={{ maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={cell(v)}>
-                    {v === null ? <span className="muted">null</span> : typeof v === "number" ? fmtNumber(v) : cell(v)}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="overflow-hidden rounded-lg ring-1 ring-foreground/10">
+        <DataTable
+          label="SQL result"
+          columns={cols}
+          data={data}
+          getRowId={(r) => String(r.n)}
+          dense
+          sortable
+          virtualize={{ maxHeight: compact ? 260 : 560 }}
+        />
       </div>
     </div>
   );
@@ -522,13 +664,13 @@ export function SqlTable({ columns, types, rows, truncated, compact }: { columns
 /** Skeleton sized like a chart so nothing shifts when results land. */
 export function ChartSkeleton({ height = 340 }: { height?: number }) {
   return (
-    <div className="col" style={{ height, justifyContent: "flex-end", gap: 8 }} aria-busy="true" aria-label="Loading result">
-      <div className="row" style={{ alignItems: "flex-end", gap: 6, height: height - 40 }}>
+    <div className="flex flex-col justify-end gap-2" style={{ height }} aria-busy="true" aria-label="Loading result">
+      <div className="flex items-end gap-1.5" style={{ height: height - 40 }}>
         {Array.from({ length: 18 }, (_, i) => (
-          <Skeleton key={i} height={`${30 + ((i * 37) % 60)}%`} style={{ flex: 1 }} />
+          <Skeleton key={i} className="flex-1" style={{ height: `${30 + ((i * 37) % 60)}%` }} />
         ))}
       </div>
-      <Skeleton height={10} width="100%" />
+      <Skeleton className="h-2.5 w-full" />
     </div>
   );
 }

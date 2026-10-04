@@ -1,55 +1,121 @@
-import { Fragment, useState } from "react";
-import type { EventRow } from "../types/EventRow";
-import type { PersonSummary } from "../types/PersonSummary";
-import { api, errorMessage } from "../lib/api";
-import { canEdit, useApp, usePath, useProjectId } from "../lib/context";
-import { fmtDateTime, fmtNumber, fmtRelative } from "../lib/format";
-import { invalidate, useApi, useDebounced } from "../lib/hooks";
-import { Link, navigate } from "../lib/router";
-import { Icon } from "../ui/icons";
-import { Avatar, CopyButton, Empty, ErrorState, Modal, Skeleton, SkeletonRows, Tabs, toast } from "../ui/kit";
-import { EventTable } from "./Activity";
-import { LoadDemoButton } from "./Onboarding";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { getRouteApi, Link } from "@tanstack/react-router";
+import { useMemo, useState } from "react";
+import { Avatar } from "@/components/avatar";
+import { TabsBar } from "@/components/controls";
+import { CopyButton } from "@/components/copy";
+import { columnHelper, DataTable } from "@/components/data-table";
+import { AppDialog } from "@/components/dialogs";
+import { Empty, ErrorState, Notice, Skeleton, SkeletonRows } from "@/components/feedback";
+import { Icon } from "@/components/icons";
+import { CardBar, CardPad, KV, Page, PageHeader, Panel, SearchInput, StatLabel } from "@/components/page";
+import { toast } from "@/components/toast";
+import { Badge } from "@/components/ui/badge";
+import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { api, errorMessage } from "@/lib/api";
+import { canEdit, useApp, usePath, useProjectId } from "@/lib/context";
+import { fmtDateTime, fmtNumber, fmtRelative } from "@/lib/format";
+import { useDebounced } from "@/lib/hooks";
+import { navigate } from "@/lib/nav";
+import { personEventsQuery, personQuery, personsQuery, qk } from "@/lib/queries";
+import type { PersonSummary } from "@/types/PersonSummary";
+import { AUTO_PAGES, EventTable, ScrollEnd } from "@/pages/Activity";
+import { LoadDemoButton } from "@/pages/Onboarding";
+
+const personRoute = getRouteApi("/project/$projectId/persons/$id");
+
+function IdentifiedBadge({ identified }: { identified: boolean }) {
+  return identified ? <Badge className="bg-brand-wash text-brand-foreground">identified</Badge> : <Badge variant="secondary">anonymous</Badge>;
+}
+
+const col = columnHelper<PersonSummary>();
 
 export function PersonsPage() {
-  const projectId = useProjectId();
+  const pid = useProjectId();
   const path = usePath();
   const [search, setSearch] = useState("");
   const q = useDebounced(search.trim(), 250);
-  const { data, error, loading, reload } = useApi(`persons:${projectId}:${q}`, (s) => api.persons(projectId, { search: q, limit: 50 }, s));
-  const [more, setMore] = useState<{ q: string; persons: PersonSummary[]; cursor: string | null } | null>(null);
-  const [moreError, setMoreError] = useState<string | null>(null);
-  const extra = more && more.q === q ? more : null;
-  const persons = [...(data?.persons ?? []), ...(extra?.persons ?? [])];
-  const cursor = extra ? extra.cursor : data?.next_cursor ?? null;
+  const { data, error, isPending, isPlaceholderData, refetch, fetchNextPage, hasNextPage, isFetchingNextPage, isFetchNextPageError } = useInfiniteQuery(personsQuery(pid, q));
+
+  const pages = data?.pages ?? [];
+  const persons = useMemo(() => {
+    const seen = new Set<string>();
+    return pages.flatMap((p) => p.persons).filter((p) => !seen.has(p.id) && seen.add(p.id));
+  }, [pages]);
+
+  const columns = useMemo(
+    () => [
+      col.accessor("display_name", {
+        header: "Person",
+        cell: ({ row }) => {
+          const p = row.original;
+          return (
+            <div className="flex items-center gap-2.5">
+              <Avatar name={p.display_name} id={p.id} />
+              <Link
+                to={path(`persons/${encodeURIComponent(p.id)}`)}
+                onClick={(e) => e.stopPropagation()}
+                className="max-w-72 truncate font-semibold hover:text-brand-foreground hover:underline"
+              >
+                {p.display_name}
+              </Link>
+              <IdentifiedBadge identified={p.is_identified} />
+            </div>
+          );
+        },
+      }),
+      col.accessor((p) => p.distinct_ids[0] ?? "", {
+        id: "distinct_id",
+        header: "Distinct ID",
+        cell: ({ row }) => {
+          const ids = row.original.distinct_ids;
+          return (
+            <span className="inline-flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+              <span className="max-w-64 truncate">{ids[0]}</span>
+              {ids.length > 1 && <Badge variant="secondary">+{ids.length - 1}</Badge>}
+            </span>
+          );
+        },
+      }),
+      col.accessor("created_at", {
+        header: "Created",
+        cell: (c) => <span className="whitespace-nowrap text-muted-foreground">{fmtRelative(c.getValue())}</span>,
+      }),
+      col.accessor((p) => p.last_seen ?? "", {
+        id: "last_seen",
+        header: "Last seen",
+        cell: ({ row }) => <span className="whitespace-nowrap text-muted-foreground">{row.original.last_seen ? fmtRelative(row.original.last_seen) : "–"}</span>,
+        meta: { align: "right" },
+      }),
+    ],
+    [path],
+  );
+
+  const loadMore = () => {
+    if (hasNextPage && !isFetchingNextPage) void fetchNextPage();
+  };
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="titles">
-          <h1>Persons</h1>
-          <div className="sub">Everyone who sent an event, merged across devices by identify and alias.</div>
-        </div>
-      </div>
-      <div className="card">
-        <div className="card-head">
-          <div className="search" style={{ width: 360 }}>
-            <Icon name="search" size={14} />
-            <input
-              className="input"
-              placeholder="Search by email, name or distinct ID…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              aria-label="Search persons"
-              autoFocus
-            />
-          </div>
-          <span className="spacer" />
-          {loading && data && <span className="muted small">Searching…</span>}
-        </div>
+    <Page>
+      <PageHeader title="Persons" sub="Everyone who sent an event, merged across devices by identify and alias." />
+      <Panel>
+        <CardBar>
+          <SearchInput
+            wrapperClassName="w-full sm:w-96"
+            placeholder="Search by email, name or distinct ID…"
+            aria-label="Search persons"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            autoFocus
+          />
+          <span className="flex-1" />
+          {isPlaceholderData && <span className="text-xs text-muted-foreground">Searching…</span>}
+        </CardBar>
         {error && !data ? (
-          <ErrorState error={error} retry={reload} />
-        ) : !data ? (
+          <ErrorState error={error} retry={() => void refetch()} />
+        ) : isPending ? (
           <SkeletonRows rows={10} />
         ) : persons.length === 0 ? (
           q ? (
@@ -60,61 +126,28 @@ export function PersonsPage() {
             </Empty>
           )
         ) : (
-          <div className="table-wrap">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Person</th>
-                  <th>Distinct ID</th>
-                  <th>Created</th>
-                  <th className="r">Last seen</th>
-                </tr>
-              </thead>
-              <tbody>
-                {persons.map((p) => (
-                  <tr key={p.id} className="clickable" onClick={() => navigate(path(`persons/${encodeURIComponent(p.id)}`))}>
-                    <td>
-                      <div className="row">
-                        <Avatar name={p.display_name} id={p.id} />
-                        <Link to={path(`persons/${encodeURIComponent(p.id)}`)} onClick={(e) => e.stopPropagation()} className="truncate" style={{ fontWeight: 600, maxWidth: 300 }}>
-                          {p.display_name}
-                        </Link>
-                        {p.is_identified ? <span className="badge accent">identified</span> : <span className="badge">anonymous</span>}
-                      </div>
-                    </td>
-                    <td className="mono small muted truncate" style={{ maxWidth: 260 }}>
-                      {p.distinct_ids[0]}
-                      {p.distinct_ids.length > 1 && <span className="badge" style={{ marginLeft: 6 }}>+{p.distinct_ids.length - 1}</span>}
-                    </td>
-                    <td className="muted nowrap">{fmtRelative(p.created_at)}</td>
-                    <td className="r muted nowrap">{p.last_seen ? fmtRelative(p.last_seen) : "–"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <ScrollEnd onEnd={() => pages.length < AUTO_PAGES && loadMore()}>
+            <DataTable
+              label="Persons"
+              columns={columns}
+              data={persons}
+              getRowId={(p) => p.id}
+              onRowClick={(p) => navigate(path(`persons/${encodeURIComponent(p.id)}`))}
+              sortable
+              virtualize={{ maxHeight: 640 }}
+            />
+          </ScrollEnd>
         )}
-      </div>
-      {cursor && persons.length > 0 && (
-        <div className="row mt-16" style={{ justifyContent: "center" }}>
-          <button
-            className="btn"
-            onClick={async () => {
-              setMoreError(null);
-              try {
-                const r = await api.persons(projectId, { search: q, cursor, limit: 50 });
-                setMore({ q, persons: [...(extra?.persons ?? []), ...r.persons], cursor: r.next_cursor });
-              } catch (e) {
-                setMoreError(errorMessage(e));
-              }
-            }}
-          >
-            Load more
-          </button>
-          {moreError && <span className="small" style={{ color: "var(--bad)" }}>{moreError}</span>}
+      </Panel>
+      {hasNextPage && persons.length > 0 && (
+        <div className="mt-4 flex flex-wrap items-center justify-center gap-3">
+          <Button variant="outline" onClick={loadMore} disabled={isFetchingNextPage}>
+            {isFetchingNextPage ? "Loading…" : "Load more"}
+          </Button>
         </div>
       )}
-    </div>
+      {isFetchNextPageError && <p className="mt-2 text-center text-sm text-destructive">{errorMessage(error)}</p>}
+    </Page>
   );
 }
 
@@ -124,32 +157,32 @@ function str(v: unknown): string {
 }
 
 function PersonEvents({ personId }: { personId: string }) {
-  const projectId = useProjectId();
-  const { data, error, reload } = useApi(`person-events:${projectId}:${personId}`, (s) => api.personEvents(projectId, personId, { limit: 100 }, s), { pollMs: 15_000 });
-  const [older, setOlder] = useState<EventRow[]>([]);
-  const [cursor, setCursor] = useState<string | null | undefined>(undefined);
-  if (error && !data) return <ErrorState error={error} retry={reload} />;
-  if (!data) return <SkeletonRows rows={8} />;
-  const events = [...data.events, ...older];
-  const next = cursor === undefined ? data.next_before : cursor;
+  const pid = useProjectId();
+  const { data, error, isPending, refetch, fetchNextPage, hasNextPage, isFetchingNextPage, isFetchNextPageError } = useInfiniteQuery(personEventsQuery(pid, personId));
+  const pages = data?.pages ?? [];
+  const events = useMemo(() => {
+    const seen = new Set<string>();
+    return pages.flatMap((p) => p.events).filter((e) => !seen.has(e.uuid) && seen.add(e.uuid));
+  }, [pages]);
+  const loadOlder = () => {
+    if (hasNextPage && !isFetchingNextPage) void fetchNextPage();
+  };
+  if (error && !data) return <ErrorState error={error} retry={() => void refetch()} />;
+  if (isPending) return <SkeletonRows rows={8} />;
   if (events.length === 0) return <Empty icon="activity" title="No events for this person in the stored range" />;
   return (
     <>
-      <div className="table-wrap">
+      <ScrollEnd onEnd={() => pages.length < AUTO_PAGES && loadOlder()}>
         <EventTable events={events} showPerson={false} />
-      </div>
-      {next && (
-        <div className="row" style={{ justifyContent: "center", padding: 12 }}>
-          <button
-            className="btn"
-            onClick={async () => {
-              const r = await api.personEvents(projectId, personId, { before: next, limit: 100 });
-              setOlder((o) => [...o, ...r.events]);
-              setCursor(r.next_before);
-            }}
-          >
-            Load older
-          </button>
+      </ScrollEnd>
+      {(hasNextPage || isFetchNextPageError) && (
+        <div className="flex flex-wrap items-center justify-center gap-3 border-t p-3">
+          {hasNextPage && (
+            <Button variant="outline" onClick={loadOlder} disabled={isFetchingNextPage}>
+              {isFetchingNextPage ? "Loading…" : "Load older"}
+            </Button>
+          )}
+          {isFetchNextPageError && <span className="text-sm text-destructive">{errorMessage(error)}</span>}
         </div>
       )}
     </>
@@ -157,130 +190,150 @@ function PersonEvents({ personId }: { personId: string }) {
 }
 
 function ErasePerson({ personId, name, onClose }: { personId: string; name: string; onClose: () => void }) {
-  const projectId = useProjectId();
+  const pid = useProjectId();
   const path = usePath();
+  const queryClient = useQueryClient();
   const [typed, setTyped] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const ok = typed.trim() === name.trim();
+  const erase = useMutation({
+    mutationFn: () => api.erasePerson(pid, personId),
+    onSuccess: async (r) => {
+      toast(`Erased ${fmtNumber(r.events)} events and ${fmtNumber(r.distinct_ids)} distinct IDs`);
+      // Leave the page first: dropping the person's queries while this page still observes them would refetch a 404.
+      onClose();
+      navigate(path("persons"));
+      window.setTimeout(() => queryClient.removeQueries({ queryKey: qk.person(pid, personId) }), 500);
+      // The persons list, the activity feed and the status counters all changed.
+      await Promise.all([qk.persons(pid), qk.events(pid), qk.status(pid)].map((queryKey) => queryClient.invalidateQueries({ queryKey })));
+    },
+  });
+  const close = () => {
+    if (!erase.isPending) onClose();
+  };
   return (
-    <Modal
+    <AppDialog
       title="Delete person and all their data"
-      onClose={onClose}
+      onClose={close}
       footer={
         <>
-          <button className="btn" onClick={onClose}>
+          <Button variant="outline" onClick={close} disabled={erase.isPending}>
             Cancel
-          </button>
-          <button
-            className="btn danger solid"
-            disabled={!ok || busy}
-            onClick={async () => {
-              setBusy(true);
-              setError(null);
-              try {
-                const r = await api.erasePerson(projectId, personId);
-                invalidate(`person`);
-                invalidate(`persons:${projectId}`);
-                invalidate(`events:${projectId}`);
-                toast(`Erased ${fmtNumber(r.events)} events and ${fmtNumber(r.distinct_ids)} distinct IDs`);
-                onClose();
-                navigate(path("persons"));
-              } catch (e) {
-                setError(errorMessage(e));
-                setBusy(false);
-              }
-            }}
-          >
-            {busy ? "Erasing…" : "Erase permanently"}
-          </button>
+          </Button>
+          <Button variant="destructive" form="erase-person-form" type="submit" disabled={!ok || erase.isPending}>
+            {erase.isPending ? "Erasing…" : "Erase permanently"}
+          </Button>
         </>
       }
     >
-      <div className="col gap-12">
-        <div className="notice bad">
-          <Icon name="alert" />
-          <div>
-            This erases <b>{name}</b>, every distinct ID merged into them, and every event they sent, from stored data. It can't be undone. Use it for
-            GDPR and similar deletion requests.
-          </div>
-        </div>
-        <label className="field">
-          <span>
+      <form
+        id="erase-person-form"
+        className="flex flex-col gap-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (ok && !erase.isPending) erase.mutate();
+        }}
+      >
+        <Notice tone="bad">
+          This erases <b>{name}</b>, every distinct ID merged into them, and every event they sent, from stored data. It can't be undone. Use it for GDPR and
+          similar deletion requests.
+        </Notice>
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor="erase-confirm" className="text-sm">
             Type <code>{name}</code> to confirm
-          </span>
-          <input className="input" value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" spellCheck={false} aria-label="Type the person's name to confirm" />
-        </label>
-        {error && <div className="notice bad">{error}</div>}
-      </div>
-    </Modal>
+          </label>
+          <Input
+            id="erase-confirm"
+            value={typed}
+            onChange={(e) => setTyped(e.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+            aria-label="Type the person's name to confirm"
+          />
+        </div>
+        {erase.isError && <Notice tone="bad">{errorMessage(erase.error)}</Notice>}
+      </form>
+    </AppDialog>
   );
 }
 
-export function PersonPage({ id }: { id: string }) {
-  const projectId = useProjectId();
+type Tab = "events" | "properties" | "ids";
+
+export function PersonPage() {
+  const { id } = personRoute.useParams();
+  const pid = useProjectId();
   const path = usePath();
-  const { data, error, reload } = useApi(`person:${projectId}:${id}`, (s) => api.person(projectId, id, s), { keepPrevious: false });
-  const [tab, setTab] = useState<"events" | "properties" | "ids">("events");
-  const [erasing, setErasing] = useState(false);
   const { organization } = useApp();
+  const { data, error, refetch } = useQuery(personQuery(pid, id));
+  const [tab, setTab] = useState<Tab>("events");
+  const [erasing, setErasing] = useState(false);
   const [propSearch, setPropSearch] = useState("");
 
-  if (error) {
+  const p = data?.person;
+  const props = useMemo(() => (p?.properties ?? {}) as Record<string, unknown>, [p]);
+  const keys = useMemo(() => {
+    const needle = propSearch.toLowerCase();
+    return Object.keys(props)
+      .filter((k) => !needle || k.toLowerCase().includes(needle) || str(props[k]).toLowerCase().includes(needle))
+      .sort((a, b) => Number(a.startsWith("$")) - Number(b.startsWith("$")) || a.localeCompare(b));
+  }, [props, propSearch]);
+
+  if (error && !data) {
     return (
-      <div className="page">
-        <ErrorState error={error} retry={reload} />
-      </div>
+      <Page>
+        <ErrorState error={error} retry={() => void refetch()} />
+      </Page>
     );
   }
-  const p = data?.person;
-  const props = (p?.properties ?? {}) as Record<string, unknown>;
-  const keys = Object.keys(props)
-    .filter((k) => !propSearch || k.toLowerCase().includes(propSearch.toLowerCase()) || str(props[k]).toLowerCase().includes(propSearch.toLowerCase()))
-    .sort((a, b) => Number(a.startsWith("$")) - Number(b.startsWith("$")) || a.localeCompare(b));
+
+  const stats = [
+    { label: "Events", value: data ? fmtNumber(data.event_count) : null },
+    { label: "Sessions", value: data ? fmtNumber(data.session_count) : null },
+    { label: "First seen", value: data ? fmtDateTime(data.first_seen ?? p?.created_at) : null },
+    { label: "Last seen", value: data ? fmtRelative(data.last_seen) : null },
+  ];
 
   return (
-    <div className="page">
-      <div className="row small muted" style={{ marginBottom: 10 }}>
-        <Link to={path("persons")} className="link">
-          Persons
-        </Link>
-        <Icon name="chevronRight" size={12} />
-      </div>
-      <div className="page-head" style={{ alignItems: "center" }}>
-        {p ? <Avatar name={p.display_name} id={p.id} large /> : <Skeleton width={52} height={52} style={{ borderRadius: "50%" }} />}
-        <div className="titles">
-          {p ? <h1 className="truncate">{p.display_name}</h1> : <Skeleton height={26} width={260} />}
-          <div className="sub row wrap">
-            {p && (p.is_identified ? <span className="badge accent">identified</span> : <span className="badge">anonymous</span>)}
-            <span className="mono small">{id}</span>
-            <CopyButton text={id} label="" className="btn ghost icon small" />
+    <Page>
+      <Breadcrumb className="mb-2.5">
+        <BreadcrumbList>
+          <BreadcrumbItem>
+            <BreadcrumbLink render={<Link to={path("persons")} />}>Persons</BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbPage className="max-w-64 truncate">{p?.display_name ?? "…"}</BreadcrumbPage>
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
+      <PageHeader
+        leading={p ? <Avatar name={p.display_name} id={p.id} large /> : <Skeleton className="size-[52px] rounded-full" />}
+        title={p ? p.display_name : <Skeleton className="h-7 w-64" />}
+        sub={
+          <div className="flex flex-wrap items-center gap-2">
+            {p && <IdentifiedBadge identified={p.is_identified} />}
+            <span className="font-mono text-xs">{id}</span>
+            <CopyButton text={id} label="" title="Copy person ID" />
           </div>
-        </div>
-        <div className="actions">
-          <Link className="btn" to={`${path("activity")}?person_id=${encodeURIComponent(id)}`}>
+        }
+        actions={
+          <Button variant="outline" nativeButton={false} render={<Link to={path("activity")} search={{ person_id: id }} />}>
             <Icon name="activity" size={14} /> Live activity
-          </Link>
-        </div>
-      </div>
+          </Button>
+        }
+      />
 
-      <div className="card" style={{ marginBottom: 16 }}>
-        <div className="stat-grid">
-          {[
-            { label: "Events", value: data ? fmtNumber(data.event_count) : null },
-            { label: "Sessions", value: data ? fmtNumber(data.session_count) : null },
-            { label: "First seen", value: data ? fmtDateTime(data.first_seen ?? p?.created_at) : null },
-            { label: "Last seen", value: data ? fmtRelative(data.last_seen) : null },
-          ].map((s) => (
+      <Panel className="mb-4">
+        <div className="grid grid-cols-2 gap-4 p-4 md:grid-cols-4">
+          {stats.map((s) => (
             <div key={s.label}>
-              <div className="k-label">{s.label}</div>
-              <div className="k-value num">{s.value ?? <Skeleton height={20} width={80} />}</div>
+              <StatLabel className="mb-1">{s.label}</StatLabel>
+              <div className="num text-lg font-semibold">{s.value ?? <Skeleton className="h-5 w-20" />}</div>
             </div>
           ))}
         </div>
-      </div>
+      </Panel>
 
-      <Tabs
+      <TabsBar
         value={tab}
         onChange={setTab}
         options={[
@@ -289,68 +342,67 @@ export function PersonPage({ id }: { id: string }) {
           { value: "ids", label: `Distinct IDs${data ? ` (${data.distinct_ids.length})` : ""}` },
         ]}
       />
-      <div className="card">
+      <Panel>
         {tab === "events" && <PersonEvents personId={id} />}
         {tab === "properties" && (
-          <div className="card-body col gap-12">
-            <div className="search" style={{ width: 320 }}>
-              <Icon name="search" size={14} />
-              <input className="input" placeholder="Search properties…" value={propSearch} onChange={(e) => setPropSearch(e.target.value)} aria-label="Search properties" />
-            </div>
+          <CardPad className="flex flex-col gap-3">
+            <SearchInput
+              wrapperClassName="w-full sm:w-80"
+              placeholder="Search properties…"
+              aria-label="Search properties"
+              value={propSearch}
+              onChange={(e) => setPropSearch(e.target.value)}
+            />
             {!data ? (
-              <SkeletonRows rows={6} />
+              <SkeletonRows rows={6} className="px-0" />
             ) : keys.length === 0 ? (
               <Empty icon="info" title={propSearch ? "No matching properties" : "No person properties set"}>
-                {!propSearch && <>Set them with <code>posthog.identify(id, {"{ email, plan }"})</code> or <code>$set</code>.</>}
+                {!propSearch && (
+                  <>
+                    Set them with <code>posthog.identify(id, {"{ email, plan }"})</code> or <code>$set</code>.
+                  </>
+                )}
               </Empty>
             ) : (
-              <div className="kv">
-                {keys.map((k) => (
-                  <Fragment key={k}>
-                    <div>{k}</div>
-                    <div>{str(props[k])}</div>
-                  </Fragment>
-                ))}
-              </div>
+              <KV items={keys.map((k) => [k, str(props[k])])} />
             )}
-          </div>
+          </CardPad>
         )}
         {tab === "ids" && (
           <div>
             {!data ? (
               <SkeletonRows rows={3} />
             ) : (
-              <table className="table compact">
-                <tbody>
-                  {data.distinct_ids.map((d) => (
-                    <tr key={d}>
-                      <td className="mono small">{d}</td>
-                      <td className="r">
-                        <CopyButton text={d} label="" className="btn ghost icon small" />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <ul className="m-0 list-none divide-y p-0">
+                {data.distinct_ids.map((d) => (
+                  <li key={d} className="flex items-center gap-2 px-4 py-1.5">
+                    <span className="min-w-0 flex-1 truncate font-mono text-xs">{d}</span>
+                    <CopyButton text={d} label="" title={`Copy ${d}`} />
+                  </li>
+                ))}
+              </ul>
             )}
-            <p className="muted small" style={{ padding: "10px 16px" }}>
+            <p className="border-t px-4 py-2.5 text-xs text-muted-foreground">
               Every distinct ID merged into this person by <code>$identify</code>, <code>$create_alias</code> or <code>$merge_dangerously</code>.
             </p>
           </div>
         )}
-      </div>
+      </Panel>
+
       {canEdit(organization) && p && (
-        <div className="card card-pad row mt-24" style={{ boxShadow: "0 0 0 1px var(--bad-wash)" }}>
-          <div className="grow">
-            <h3>Delete person and all their data</h3>
-            <p className="secondary small">Erases this person, their distinct IDs and every event they sent. For GDPR deletion requests.</p>
-          </div>
-          <button className="btn danger" onClick={() => setErasing(true)}>
-            <Icon name="trash" size={14} /> Delete person
-          </button>
-        </div>
+        <Panel className="mt-6 ring-destructive/30">
+          <CardPad className="flex flex-wrap items-center gap-4">
+            <div className="min-w-0 flex-1">
+              <h3>Delete person and all their data</h3>
+              <p className="text-sm text-muted-foreground">Erases this person, their distinct IDs and every event they sent. For GDPR deletion requests.</p>
+            </div>
+            <Button variant="destructive" onClick={() => setErasing(true)}>
+              <Icon name="trash" size={14} /> Delete person
+            </Button>
+          </CardPad>
+        </Panel>
       )}
       {erasing && p && <ErasePerson personId={p.id} name={p.display_name} onClose={() => setErasing(false)} />}
-    </div>
+    </Page>
   );
 }

@@ -1,5 +1,7 @@
-import { defineConfig } from "vite";
+import { resolve } from "node:path";
+import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
 
 // Build to web/dist, which rust-embed compiles into the binary.
 //
@@ -13,8 +15,11 @@ import react from "@vitejs/plugin-react";
 const origin = process.env.HOGLET_ORIGIN ?? "http://127.0.0.1:8124";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   base: "/",
+  resolve: {
+    alias: { "@": resolve(import.meta.dirname, "./src") },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

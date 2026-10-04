@@ -8,7 +8,7 @@ export const SERIES_COUNT = 8;
  * render in neutral ink (the legend still names them).
  */
 export function seriesColor(index: number): string {
-  return index >= 0 && index < SERIES_COUNT ? `var(--s${index + 1})` : "var(--ink-3)";
+  return index >= 0 && index < SERIES_COUNT ? `var(--s${index + 1})` : "var(--muted-foreground)";
 }
 
 export function niceStep(range: number, count: number): number {
