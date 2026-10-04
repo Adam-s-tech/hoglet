@@ -299,6 +299,8 @@ pub(crate) struct Ctx<'a> {
     pub sql_memory_limit_mb: u32,
     pub threads: u32,
     pub partition_rows: u64,
+    /// Absolute spill directory (`<data dir>/tmp/query`) for the SQL sandbox.
+    pub temp_directory: Option<&'a std::path::Path>,
 }
 
 impl Ctx<'_> {
@@ -616,11 +618,19 @@ impl QueryEngine {
              CREATE TABLE person_overrides (project_id VARCHAR NOT NULL, \
                  distinct_id VARCHAR NOT NULL, person_id VARCHAR NOT NULL);",
         );
+        // Absolute, so a relative data dir never becomes a spill directory
+        // relative to the working directory of whichever thread runs a query.
+        let mut config = config;
         if let Some(directory) = &config.temp_directory {
+            let absolute = std::path::absolute(directory)
+                .map_err(|error| QueryError::internal(format!("temp directory: {error}")))?;
+            std::fs::create_dir_all(&absolute)
+                .map_err(|error| QueryError::internal(format!("temp directory: {error}")))?;
             setup.push_str(&format!(
                 "SET temp_directory = {};",
-                sql::string_literal(&directory.to_string_lossy())?
+                sql::string_literal(&absolute.to_string_lossy())?
             ));
+            config.temp_directory = Some(absolute);
         }
         root.execute_batch(&setup)?;
         let mut idle = Vec::with_capacity(config.connections);
@@ -977,6 +987,7 @@ impl QueryEngine {
             sql_memory_limit_mb: self.config.sql_memory_limit_mb,
             threads: self.config.threads,
             partition_rows: self.config.partition_rows.max(1),
+            temp_directory: self.config.temp_directory.as_deref(),
         };
         let output = match work {
             Work::Result => Output::Result(run_kind(&ctx, query, &prepared)?),

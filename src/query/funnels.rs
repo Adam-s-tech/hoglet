@@ -130,7 +130,8 @@ fn tainted(events: &[Event], positions: &[usize], window: i64, exclusions: &[Exc
     })
 }
 
-/// Deepest step any ordered attempt can reach (ClickHouse `windowFunnel`).
+/// Deepest step any ordered attempt can reach, by chaining each step to the
+/// latest attempt start that still fits the window.
 fn ordered_max_depth(events: &[Event], steps: usize, window: i64) -> usize {
     let mut chain_start: Vec<Option<i64>> = vec![None; steps];
     for event in events {

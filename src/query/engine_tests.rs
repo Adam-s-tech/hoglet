@@ -790,3 +790,42 @@ fn paths_link_actors_reconcile_with_the_link_count() {
     );
     assert!(matches!(bad, Err(QueryError::Invalid(_))));
 }
+
+#[test]
+fn sql_hides_host_introspection_and_caps_cells() {
+    let fixture = Fixture::new(vec![event(
+        "$pageview",
+        "a",
+        "2026-03-10T10:00:00Z",
+        json!({}),
+    )]);
+    for hostile in [
+        "SELECT current_setting('allowed_paths')",
+        "SELECT current_setting('temp_directory')",
+        "SELECT getenv('HOME')",
+        "SELECT * FROM duckdb_settings()",
+        "SELECT * FROM duckdb_views()",
+        "SELECT * FROM duckdb_temporary_files()",
+        "SELECT * FROM glob('/*')",
+        "SELECT * FROM events WHERE (SELECT count(*) FROM duckdb_databases()) > 0",
+    ] {
+        assert!(sql(&fixture, hostile).is_err(), "{hostile} was allowed");
+    }
+    let InsightResult::Sql {
+        rows, truncated, ..
+    } = sql(&fixture, "SELECT repeat('x', 5000000) AS c").unwrap()
+    else {
+        panic!()
+    };
+    let cell = rows[0][0].as_str().unwrap();
+    assert!(cell.len() < 70 * 1024 && cell.ends_with("[truncated]"));
+    assert!(!truncated);
+    // Many large cells hit the response budget instead of growing it.
+    let InsightResult::Sql {
+        rows, truncated, ..
+    } = sql(&fixture, "SELECT repeat('y', 60000) AS c FROM range(1000)").unwrap()
+    else {
+        panic!()
+    };
+    assert!(truncated && rows.len() < 200, "{} rows", rows.len());
+}
