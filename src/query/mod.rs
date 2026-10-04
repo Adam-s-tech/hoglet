@@ -313,6 +313,8 @@ impl Ctx<'_> {
         params: &Params,
         mut map: impl FnMut(&duckdb::Row<'_>) -> duckdb::Result<T>,
     ) -> Result<Vec<T>, QueryError> {
+        #[cfg(test)]
+        self.profile(sql, params);
         let mut statement = self.conn.prepare(sql)?;
         let mut rows = statement.query(duckdb::params_from_iter(params.values()))?;
         let mut out = Vec::new();
@@ -327,6 +329,27 @@ impl Ctx<'_> {
         Ok(out)
     }
 
+    /// Test hook: with `HOGLET_QUERY_PROFILE` set, print the statement and
+    /// DuckDB's `EXPLAIN ANALYZE` of it (runs it once more, so only for
+    /// profiling sessions).
+    #[cfg(test)]
+    fn profile(&self, sql: &str, params: &Params) {
+        if std::env::var_os("HOGLET_QUERY_PROFILE").is_none() {
+            return;
+        }
+        println!("---- SQL ----\n{sql}");
+        let plan = (|| -> duckdb::Result<String> {
+            let mut statement = self.conn.prepare(&format!("EXPLAIN ANALYZE {sql}"))?;
+            let mut rows = statement.query(duckdb::params_from_iter(params.values()))?;
+            let mut out = String::new();
+            while let Some(row) = rows.next()? {
+                out.push_str(&row.get::<_, String>(1)?);
+            }
+            Ok(out)
+        })();
+        println!("---- PLAN ----\n{}", plan.unwrap_or_else(|e| e.to_string()));
+    }
+
     /// Stream a statement's result as Arrow batches.
     pub fn arrow(
         &self,
@@ -334,6 +357,8 @@ impl Ctx<'_> {
         params: &Params,
         mut each: impl FnMut(&RecordBatch) -> Result<(), QueryError>,
     ) -> Result<(), QueryError> {
+        #[cfg(test)]
+        self.profile(sql, params);
         let mut statement = self.conn.prepare(sql)?;
         let batches = statement.query_arrow(duckdb::params_from_iter(params.values()))?;
         let mut rows = 0_usize;
