@@ -388,19 +388,13 @@ export const api = {
   events: (projectId: string, q: { event?: string | null; person_id?: string | null; before?: string | null; limit?: number }, signal?: AbortSignal) =>
     request<EventListResponse>("GET", `${p(projectId)}/events`, { query: q, signal }),
 
-  // Catalog. `prefix`/`source` are sent alongside the contract's
-  // `search`/`type` so pre-contract servers answer too.
+  // Catalog (contract params: search, type, key, limit).
   catalogEvents: async (projectId: string, search: string, signal?: AbortSignal) =>
-    normalizeCatalogEvents(await request<unknown>("GET", `${p(projectId)}/catalog/events`, { query: { search, prefix: search, limit: 200 }, signal })),
+    normalizeCatalogEvents(await request<unknown>("GET", `${p(projectId)}/catalog/events`, { query: { search, limit: 200 }, signal })),
   catalogProperties: async (projectId: string, type: "event" | "person", search: string, signal?: AbortSignal) =>
-    normalizeCatalogProperties(
-      await request<unknown>("GET", `${p(projectId)}/catalog/properties`, { query: { type, source: type, search }, signal }),
-      type,
-    ),
+    normalizeCatalogProperties(await request<unknown>("GET", `${p(projectId)}/catalog/properties`, { query: { type, search }, signal }), type),
   catalogValues: async (projectId: string, key: string, type: "event" | "person", search: string, signal?: AbortSignal) =>
-    normalizeCatalogValues(
-      await request<unknown>("GET", `${p(projectId)}/catalog/values`, { query: { key, type, source: type, search, prefix: search, limit: 50 }, signal }),
-    ),
+    normalizeCatalogValues(await request<unknown>("GET", `${p(projectId)}/catalog/values`, { query: { key, type, search, limit: 50 }, signal })),
 
   // Feature flags
   flags: (projectId: string, signal?: AbortSignal) => request<FeatureFlag[]>("GET", `${p(projectId)}/feature_flags`, { signal }),

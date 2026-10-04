@@ -72,7 +72,7 @@ function countryName(code: string): string {
 }
 
 function displayValue(dim: WebDimension, value: string): string {
-  if (value === "" || value === "$$_none") return dim === "referring_domain" ? "Direct / none" : "(none)";
+  if (value === "" || value === "$$_none" || (dim === "referring_domain" && value === "$direct")) return dim === "referring_domain" ? "Direct / none" : "(none)";
   if (dim === "country") return countryName(value);
   return value;
 }

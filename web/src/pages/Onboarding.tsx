@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { ApiError, api, errorMessage } from "../lib/api";
-import { useApp, usePath, useProjectId } from "../lib/context";
+import { projectPath, useApp, usePath, useProjectId } from "../lib/context";
 import { fmtNumber, fmtRelative } from "../lib/format";
 import { invalidate, useApi } from "../lib/hooks";
 import { SNIPPETS, hostOrigin } from "../lib/snippets";
-import { Link } from "../lib/router";
+import { Link, navigate } from "../lib/router";
 import { Icon } from "../ui/icons";
 import { CopyButton, Snippet, Tabs, toast } from "../ui/kit";
 
@@ -40,6 +40,7 @@ export function TokenBox({ token }: { token: string }) {
 export function LoadDemoButton({ primary = false, small = false, onLoaded }: { primary?: boolean; small?: boolean; onLoaded?: () => void }) {
   const projectId = useProjectId();
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
   return (
     <button
       className={`btn${primary ? " accent" : ""}${small ? " small" : ""}`}
@@ -48,22 +49,38 @@ export function LoadDemoButton({ primary = false, small = false, onLoaded }: { p
       onClick={async () => {
         setBusy(true);
         try {
+          setProgress("Generating…");
           const { events } = await api.loadDemo(projectId);
-          // Give publication a moment, then drop every cached answer for this project.
-          await new Promise((r) => window.setTimeout(r, 2500));
+          // Events are acknowledged once durable; wait until they are queryable
+          // (the status endpoint reports the publication lag), at most a minute.
+          const deadline = Date.now() + 60_000;
+          while (Date.now() < deadline) {
+            await new Promise((r) => window.setTimeout(r, 1000));
+            try {
+              const s = await api.status(projectId);
+              setProgress(`Publishing… ${fmtNumber(s.stored_events)} stored`);
+              if (s.has_events && s.ingestion_lag_seconds < 2) break;
+            } catch {
+              // Status unavailable: fall back to a fixed pause.
+              await new Promise((r) => window.setTimeout(r, 2500));
+              break;
+            }
+          }
           invalidate("");
           toast(`Loaded ${fmtNumber(events)} demo events`);
           onLoaded?.();
           window.dispatchEvent(new Event("hoglet:data-changed"));
+          navigate(projectPath(projectId, "web"));
         } catch (e) {
           toast(errorMessage(e), true);
         } finally {
           setBusy(false);
+          setProgress(null);
         }
       }}
     >
       {busy ? <span className="spinner" style={{ width: 14, height: 14 }} /> : <Icon name="sparkle" size={14} />}
-      {busy ? "Loading demo data…" : "Load demo data"}
+      {busy ? (progress ?? "Loading demo data…") : "Load demo data"}
     </button>
   );
 }

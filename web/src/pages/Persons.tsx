@@ -87,7 +87,7 @@ export function PersonsPage() {
                       {p.distinct_ids.length > 1 && <span className="badge" style={{ marginLeft: 6 }}>+{p.distinct_ids.length - 1}</span>}
                     </td>
                     <td className="muted nowrap">{fmtRelative(p.created_at)}</td>
-                    <td className="r muted nowrap">{fmtRelative(p.last_seen)}</td>
+                    <td className="r muted nowrap">{p.last_seen ? fmtRelative(p.last_seen) : "–"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -162,7 +162,7 @@ function ErasePerson({ personId, name, onClose }: { personId: string; name: stri
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const ok = typed.trim().toLowerCase() === "delete";
+  const ok = typed.trim() === name.trim();
   return (
     <Modal
       title="Delete person and all their data"
@@ -207,9 +207,9 @@ function ErasePerson({ personId, name, onClose }: { personId: string; name: stri
         </div>
         <label className="field">
           <span>
-            Type <code>delete</code> to confirm
+            Type <code>{name}</code> to confirm
           </span>
-          <input className="input" value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" aria-label="Type delete to confirm" />
+          <input className="input" value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" spellCheck={false} aria-label="Type the person's name to confirm" />
         </label>
         {error && <div className="notice bad">{error}</div>}
       </div>
