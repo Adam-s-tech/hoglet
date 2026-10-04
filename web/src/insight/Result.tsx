@@ -557,7 +557,16 @@ export function InsightResultView({ query, result, compact = false }: { query: I
           No sequences of {query.kind === "PathsQuery" && query.paths_type === "custom_events" ? "custom events" : "pageviews"} in this range.
         </Empty>
       ) : (
-        <PathsSankey links={result.links} compact={compact} />
+        <PathsSankey
+          links={result.links}
+          compact={compact}
+          onOpenLink={(link) =>
+            setTarget({
+              selection: { type: "PathsLink", source: link.source, target: link.target },
+              title: `${link.source.replace(/^\d+_/, "")} → ${link.target.replace(/^\d+_/, "")}`,
+            })
+          }
+        />
       );
   } else if (result.kind === "Sql") {
     body = <SqlTable columns={result.columns} types={result.types} rows={result.rows} truncated={result.truncated} compact={compact} />;

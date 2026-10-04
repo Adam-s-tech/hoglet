@@ -16,13 +16,9 @@ use super::sql::Params;
 use super::{Ctx, QueryError, i64_column, string_column};
 use crate::contract::insight::{InsightResult, PathLink, PathsQuery, PathsType};
 
-/// Collapse, cut and link one person's nodes. `links` maps
-/// `(step, source, target)` to `(persons, total µs)`.
-pub(crate) fn add_path(
-    q: &PathsQuery,
-    nodes: &[(String, i64)],
-    links: &mut HashMap<(usize, String, String), (u64, i64)>,
-) {
+/// One person's links `(step, source, target)` after collapsing repeats,
+/// applying the start/end points and cutting to `step_limit`.
+pub(crate) fn path_links(q: &PathsQuery, nodes: &[(String, i64)]) -> Vec<(usize, String, String, i64)> {
     let mut path: Vec<(&str, i64)> = Vec::new();
     for (node, ts) in nodes {
         if path.last().map(|(last, _)| *last) != Some(node.as_str()) {
@@ -34,22 +30,33 @@ pub(crate) fn add_path(
             Some(index) => {
                 path.drain(..index);
             }
-            None => return,
+            None => return Vec::new(),
         }
     }
     if let Some(end) = &q.end_point {
         match path.iter().position(|(node, _)| node == end) {
             Some(index) => path.truncate(index + 1),
-            None => return,
+            None => return Vec::new(),
         }
     }
     path.truncate(q.step_limit as usize);
-    for (step, pair) in path.windows(2).enumerate() {
-        let entry = links
-            .entry((step, pair[0].0.to_owned(), pair[1].0.to_owned()))
-            .or_insert((0, 0));
+    path.windows(2)
+        .enumerate()
+        .map(|(step, pair)| (step, pair[0].0.to_owned(), pair[1].0.to_owned(), pair[1].1 - pair[0].1))
+        .collect()
+}
+
+/// Collapse, cut and link one person's nodes. `links` maps
+/// `(step, source, target)` to `(persons, total µs)`.
+pub(crate) fn add_path(
+    q: &PathsQuery,
+    nodes: &[(String, i64)],
+    links: &mut HashMap<(usize, String, String), (u64, i64)>,
+) {
+    for (step, source, target, micros) in path_links(q, nodes) {
+        let entry = links.entry((step, source, target)).or_insert((0, 0));
         entry.0 += 1;
-        entry.1 += pair[1].1 - pair[0].1;
+        entry.1 += micros;
     }
 }
 
@@ -76,11 +83,13 @@ pub(crate) fn finish(
     out
 }
 
-pub(crate) fn run(
+/// Stream every person's ordered nodes to `each`.
+fn scan(
     ctx: &Ctx<'_>,
     q: &PathsQuery,
     range: &ResolvedRange,
-) -> Result<InsightResult, QueryError> {
+    mut each: impl FnMut(&str, &[(String, i64)]),
+) -> Result<(), QueryError> {
     let mut params = Params::new();
     let relation = ctx
         .source
@@ -95,7 +104,6 @@ pub(crate) fn run(
         }
     };
     let partitions = ctx.person_partitions()?;
-    let mut links = HashMap::new();
     let mut current: Option<String> = None;
     let mut nodes: Vec<(String, i64)> = Vec::new();
     for partition in 0..partitions {
@@ -114,7 +122,9 @@ pub(crate) fn run(
             for row in 0..batch.num_rows() {
                 let person = persons.value(row);
                 if current.as_deref() != Some(person) {
-                    add_path(q, &nodes, &mut links);
+                    if let Some(previous) = &current {
+                        each(previous, &nodes);
+                    }
                     nodes.clear();
                     current = Some(person.to_owned());
                 }
@@ -122,11 +132,57 @@ pub(crate) fn run(
             }
             Ok(())
         })?;
-        add_path(q, &nodes, &mut links);
+        if let Some(previous) = &current {
+            each(previous, &nodes);
+        }
         nodes.clear();
         current = None;
     }
+    Ok(())
+}
+
+pub(crate) fn run(
+    ctx: &Ctx<'_>,
+    q: &PathsQuery,
+    range: &ResolvedRange,
+) -> Result<InsightResult, QueryError> {
+    let mut links = HashMap::new();
+    scan(ctx, q, range, |_, nodes| add_path(q, nodes, &mut links))?;
     Ok(InsightResult::Paths {
         links: finish(q, links),
     })
+}
+
+/// Split `"3_/pricing"` into `(step index 2, "/pricing")`.
+fn parse_node(node: &str) -> Option<(usize, &str)> {
+    let (step, name) = node.split_once('_')?;
+    let step: usize = step.parse().ok()?;
+    (step >= 1).then(|| (step - 1, name))
+}
+
+/// Persons whose path contains the link `source → target` (step-prefixed
+/// names as in `PathLink`).
+pub(crate) fn actors(
+    ctx: &Ctx<'_>,
+    q: &PathsQuery,
+    range: &ResolvedRange,
+    source: &str,
+    target: &str,
+) -> Result<Vec<String>, QueryError> {
+    let (Some((step, from)), Some((next, to))) = (parse_node(source), parse_node(target)) else {
+        return Err(QueryError::invalid("a path link names two step-prefixed nodes"));
+    };
+    if next != step + 1 {
+        return Err(QueryError::invalid("a path link joins consecutive steps"));
+    }
+    let mut people = Vec::new();
+    scan(ctx, q, range, |person, nodes| {
+        if path_links(q, nodes)
+            .iter()
+            .any(|(s, a, b, _)| *s == step && a == from && b == to)
+        {
+            people.push(person.to_owned());
+        }
+    })?;
+    Ok(people)
 }

@@ -17,4 +17,4 @@ step: number,
  * `true`: persons who reached `step`. `false`: persons who reached
  * `step - 1` but not `step`.
  */
-converted: boolean, breakdown_value: string | null, } | { "type": "RetentionCell", cohort_date: string, interval: number, } | { "type": "LifecycleCell", status: LifecycleStatus, day: string, } | { "type": "StickinessBar", series_index: number, intervals: number, };
+converted: boolean, breakdown_value: string | null, } | { "type": "RetentionCell", cohort_date: string, interval: number, } | { "type": "LifecycleCell", status: LifecycleStatus, day: string, } | { "type": "StickinessBar", series_index: number, intervals: number, } | { "type": "PathsLink", source: string, target: string, };

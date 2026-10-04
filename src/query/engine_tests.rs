@@ -710,3 +710,83 @@ fn refresh_bypasses_the_cache() {
             .cached
     );
 }
+
+#[test]
+fn paths_link_actors_reconcile_with_the_link_count() {
+    let page = |path: &str, who: &str, time: &str| {
+        event("$pageview", who, time, json!({"$pathname": path}))
+    };
+    let fixture = Fixture::new(vec![
+        // a and b: /pricing -> /signup; c: /pricing -> /docs; d: /docs only.
+        page("/pricing", "a", "2026-03-10T10:00:00Z"),
+        page("/signup", "a", "2026-03-10T10:01:00Z"),
+        page("/pricing", "b", "2026-03-10T11:00:00Z"),
+        page("/signup", "b", "2026-03-10T11:02:00Z"),
+        page("/pricing", "c", "2026-03-10T12:00:00Z"),
+        page("/docs", "c", "2026-03-10T12:01:00Z"),
+        page("/docs", "d", "2026-03-10T13:00:00Z"),
+    ]);
+    let query = InsightQuery::PathsQuery(PathsQuery {
+        paths_type: PathsType::Pageviews,
+        start_point: None,
+        end_point: None,
+        step_limit: 5,
+        edge_limit: 50,
+        date_range: DateRange {
+            date_from: "2026-03-10".into(),
+            date_to: Some("2026-03-10".into()),
+        },
+        properties: Vec::new(),
+    });
+    let InsightResult::Paths { links } = run(&fixture, query.clone()).unwrap() else {
+        panic!()
+    };
+    let link = links
+        .iter()
+        .find(|link| link.source == "1_/pricing" && link.target == "2_/signup")
+        .expect("the strongest link is listed");
+    assert_eq!(link.value, 2);
+
+    let people = |source: &str, target: &str| {
+        fixture
+            .engine
+            .actors_at(
+                PROJECT,
+                &ActorsRequest {
+                    query: query.clone(),
+                    selection: ActorSelection::PathsLink {
+                        source: source.into(),
+                        target: target.into(),
+                    },
+                    offset: 0,
+                    limit: 100,
+                },
+                now(),
+            )
+            .unwrap()
+            .persons
+            .into_iter()
+            .map(|person| person.id)
+            .collect::<Vec<_>>()
+    };
+    let mut signup = people("1_/pricing", "2_/signup");
+    signup.sort();
+    assert_eq!(signup, vec!["a", "b"], "the persons behind a link reconcile with its count");
+    assert_eq!(people("1_/pricing", "2_/docs"), vec!["c"]);
+    assert!(people("1_/docs", "2_/pricing").is_empty());
+
+    let bad = fixture.engine.actors_at(
+        PROJECT,
+        &ActorsRequest {
+            query: query.clone(),
+            selection: ActorSelection::PathsLink {
+                source: "1_/pricing".into(),
+                target: "3_/signup".into(),
+            },
+            offset: 0,
+            limit: 10,
+        },
+        now(),
+    );
+    assert!(matches!(bad, Err(QueryError::Invalid(_))));
+}

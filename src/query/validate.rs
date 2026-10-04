@@ -200,7 +200,7 @@ pub fn selection(query: &InsightQuery, selection: &ActorSelection) -> Result<(),
         ) | (
             InsightQuery::StickinessQuery(_),
             ActorSelection::StickinessBar { .. }
-        )
+        ) | (InsightQuery::PathsQuery(_), ActorSelection::PathsLink { .. })
     );
     if !matches {
         return Err(QueryError::invalid(

@@ -531,6 +531,9 @@ pub enum ActorSelection {
         series_index: usize,
         intervals: u32,
     },
+    /// The persons on a Paths link; `source` and `target` are the
+    /// step-prefixed node names of a `PathLink`.
+    PathsLink { source: String, target: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

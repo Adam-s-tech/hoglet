@@ -1035,6 +1035,11 @@ fn actors_kind(
                 intervals,
             },
         ) => stickiness::actors(ctx, q, range, *series_index, *intervals),
+        (
+            InsightQuery::PathsQuery(q),
+            Prepared::Paths(range),
+            ActorSelection::PathsLink { source, target },
+        ) => paths::actors(ctx, q, range, source, target),
         _ => Err(QueryError::invalid(
             "the actor selection does not match the query kind",
         )),

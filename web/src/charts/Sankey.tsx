@@ -26,7 +26,7 @@ interface Band {
   w: number;
 }
 
-function FlowList({ title, flows, pick }: { title: string; flows: PathLink[]; pick: (l: PathLink) => string }) {
+function FlowList({ title, flows, pick, onOpen }: { title: string; flows: PathLink[]; pick: (l: PathLink) => string; onOpen?: (l: PathLink) => void }) {
   return (
     <div className="min-w-0">
       <div className="mb-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">{title}</div>
@@ -36,8 +36,22 @@ function FlowList({ title, flows, pick }: { title: string; flows: PathLink[]; pi
         <ul>
           {flows.slice(0, 12).map((l) => (
             <li key={linkId(l)} className="flex gap-2 py-px">
-              <span className="min-w-0 flex-1 truncate">{pick(l)}</span>
-              <span className="num font-semibold">{fmtNumber(l.value)}</span>
+              {onOpen ? (
+                <button
+                  type="button"
+                  className="flex min-w-0 flex-1 gap-2 rounded text-left hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none"
+                  onClick={() => onOpen(l)}
+                  aria-label={`${pick(l)}: ${fmtNumber(l.value)} persons. Show the people.`}
+                >
+                  <span className="min-w-0 flex-1 truncate">{pick(l)}</span>
+                  <span className="num font-semibold">{fmtNumber(l.value)}</span>
+                </button>
+              ) : (
+                <>
+                  <span className="min-w-0 flex-1 truncate">{pick(l)}</span>
+                  <span className="num font-semibold">{fmtNumber(l.value)}</span>
+                </>
+              )}
             </li>
           ))}
         </ul>
@@ -60,7 +74,7 @@ const MIN_STEP_W = 150;
 
 const linkId = (l: PathLink) => `${l.source}>${l.target}`;
 
-export function PathsSankey({ links, compact = false }: { links: PathLink[]; compact?: boolean }) {
+export function PathsSankey({ links, compact = false, onOpenLink }: { links: PathLink[]; compact?: boolean; onOpenLink?: (link: PathLink) => void }) {
   const [ref, size] = useSize<HTMLDivElement>();
   const [hot, setHot] = useState<{ kind: "node" | "link"; id: string } | null>(null);
   const [tip, setTip] = useState<{ x: number; y: number; band: Band } | null>(null);
@@ -185,7 +199,13 @@ export function PathsSankey({ links, compact = false }: { links: PathLink[]; com
     else if (e.key === "End") to = items.length - 1;
     else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      // A flow opens the step it leads to; a node opens itself.
+      // A flow opens the people on it (or, without a handler, the step it leads
+      // to); a node opens its own flows.
+      if (kind === "link" && onOpenLink) {
+        const link = links.find((l) => linkId(l) === id);
+        if (link) onOpenLink(link);
+        return;
+      }
       setSelected(kind === "node" ? id : (layout.nodes.get(id.slice(id.indexOf(">") + 1))?.id ?? null));
       return;
     } else if (e.key === "Escape") {
@@ -198,7 +218,7 @@ export function PathsSankey({ links, compact = false }: { links: PathLink[]; com
     }
   };
   const nodeLabel = (n: Node) => `Step ${n.step}, ${n.name}: ${fmtNumber(n.value)} persons. Press Enter for its flows.`;
-  const flowLabel = (l: PathLink) => `${parse(l.source).name} to ${parse(l.target).name}: ${fmtNumber(l.value)} persons. Press Enter for the step it leads to.`;
+  const flowLabel = (l: PathLink) => `${parse(l.source).name} to ${parse(l.target).name}: ${fmtNumber(l.value)} persons. Press Enter ${onOpenLink ? "to see the people" : "for the step it leads to"}.`;
   const focusTip = (b: Band, el: SVGElement) => {
     const box = svgRef.current?.getBoundingClientRect();
     const r = el.getBoundingClientRect();
@@ -245,6 +265,8 @@ export function PathsSankey({ links, compact = false }: { links: PathLink[]; com
                   stroke="var(--s1)"
                   strokeWidth={b.w}
                   onKeyDown={(e) => onItemKey(e, "link", id)}
+                  onClick={onOpenLink ? () => onOpenLink(b.link) : undefined}
+                  style={onOpenLink ? { cursor: "pointer" } : undefined}
                   onFocus={(e) => {
                     setActive(id);
                     setHot({ kind: "link", id });
@@ -338,8 +360,8 @@ export function PathsSankey({ links, compact = false }: { links: PathLink[]; com
               </button>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
-              <FlowList title="Came from" flows={selIn} pick={(l) => parse(l.source).name} />
-              <FlowList title="Went to" flows={selOut} pick={(l) => parse(l.target).name} />
+              <FlowList title="Came from" flows={selIn} pick={(l) => parse(l.source).name} onOpen={onOpenLink} />
+              <FlowList title="Went to" flows={selOut} pick={(l) => parse(l.target).name} onOpen={onOpenLink} />
             </div>
           </section>
         )}
