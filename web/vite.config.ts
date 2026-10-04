@@ -24,6 +24,8 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     target: "es2022",
+    minify: "terser",
+    terserOptions: { compress: { passes: 2, pure_getters: true }, format: { comments: false } },
   },
   server: {
     proxy: {

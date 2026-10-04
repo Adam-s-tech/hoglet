@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Kbd } from "@/components/ui/kbd";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
 import { ApiError } from "@/lib/api";
 import { projectPath, useApp, useProjectId } from "@/lib/context";
@@ -381,7 +382,7 @@ export function Shell({ children }: { children: ReactNode }) {
         </SheetContent>
       </Sheet>
       <main id="main" tabIndex={-1} className="flex min-w-0 flex-col outline-none">
-        {children}
+        <TooltipProvider delay={300}>{children}</TooltipProvider>
       </main>
       {help && <Shortcuts onClose={() => setHelp(false)} />}
     </div>

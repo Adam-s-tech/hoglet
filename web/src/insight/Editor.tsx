@@ -14,7 +14,7 @@ import { Icon, type IconName } from "@/components/icons";
 import { StatLabel } from "@/components/page";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Slider as SliderPrimitive } from "@base-ui/react/slider";
+import { Slider } from "@/components/ui/slider";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { eventLabel } from "@/lib/properties";
 import { MATHS, PROPERTY_MATHS, eventNode, letter } from "./defaults";
@@ -153,37 +153,6 @@ function SeriesList({ series, onChange, mode, max = 12, addLabel }: { series: Ev
         </Button>
       )}
     </div>
-  );
-}
-
-/**
- * Single-thumb slider with an accessible name on the thumb. (components/ui/slider
- * renders the same markup but cannot forward aria-label to the thumb input.)
- */
-function StepSlider({ label, value, min, max, onChange }: { label: string; value: number; min: number; max: number; onChange: (n: number) => void }) {
-  return (
-    <SliderPrimitive.Root
-      value={[value]}
-      min={min}
-      max={max}
-      step={1}
-      thumbAlignment="edge"
-      onValueChange={(v) => {
-        const n = Array.isArray(v) ? v[0] : v;
-        if (typeof n === "number") onChange(n);
-      }}
-      className="w-full"
-    >
-      <SliderPrimitive.Control className="relative flex w-full touch-none items-center py-1.5 select-none">
-        <SliderPrimitive.Track className="relative h-1 w-full grow overflow-hidden rounded-full bg-muted">
-          <SliderPrimitive.Indicator className="h-full bg-primary" />
-        </SliderPrimitive.Track>
-        <SliderPrimitive.Thumb
-          aria-label={label}
-          className="relative block size-3.5 shrink-0 rounded-full border border-ring bg-white ring-ring/50 transition-shadow select-none after:absolute after:-inset-2 hover:ring-3 focus-within:ring-3 has-focus-visible:ring-3"
-        />
-      </SliderPrimitive.Control>
-    </SliderPrimitive.Root>
   );
 }
 
@@ -341,7 +310,7 @@ function PathsEditor({ q, set }: { q: PathsQuery; set: (q: PathsQuery) => void }
         <Input placeholder={pointPlaceholder} value={q.end_point ?? ""} onChange={(e) => set({ ...q, end_point: e.target.value || null })} aria-label="End point" />
       </Section>
       <Section label="Steps" aside={<span className="num text-muted-foreground">{q.step_limit}</span>}>
-        <StepSlider label="Maximum steps" min={2} max={10} value={q.step_limit} onChange={(step_limit) => set({ ...q, step_limit })} />
+        <Slider label="Maximum steps" min={2} max={10} value={q.step_limit} onValueChange={(step_limit) => set({ ...q, step_limit })} />
       </Section>
       <Section label="Links shown">
         <OptionSelect

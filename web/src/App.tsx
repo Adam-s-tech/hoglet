@@ -3,22 +3,24 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Navigate, Outlet, useParams, useRouterState } from "@tanstack/react-router";
-import { useEffect, useMemo, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useMemo, type ReactNode } from "react";
 import { Icon, Logo } from "@/components/icons";
 import { ErrorState, Skeleton } from "@/components/feedback";
 import { Page } from "@/components/page";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Toaster } from "@/components/ui/sonner";
 import { api, errorMessage, type Workspace } from "@/lib/api";
 import { AppContext, findProject, firstProject, lastProject, projectPath, rememberProject, type AppState } from "@/lib/context";
 import { clearSessionData } from "@/lib/query-client";
 import { bootKey, bootQuery } from "@/lib/queries";
 import { navigate } from "@/lib/nav";
 import { LoginPage, SetupPage } from "@/pages/Auth";
-import { Shell } from "@/Shell";
 import { Empty } from "@/components/feedback";
 import { Notice } from "@/components/feedback";
+
+// Heavy shell pieces load after the first (login/boot) paint.
+const Shell = lazy(() => import("@/Shell").then((m) => ({ default: m.Shell })));
+const Toaster = lazy(() => import("@/components/ui/sonner").then((m) => ({ default: m.Toaster })));
 
 function Splash() {
   return (
@@ -138,7 +140,9 @@ export function Root() {
   return (
     <>
       {isShare ? <Outlet /> : <Gate />}
-      <Toaster position="bottom-right" />
+      <Suspense fallback={null}>
+        <Toaster position="bottom-right" />
+      </Suspense>
     </>
   );
 }
@@ -189,9 +193,11 @@ export function ProjectLayout(): ReactNode {
   }
   return (
     <AppContext.Provider value={state}>
-      <Shell>
-        <Outlet />
-      </Shell>
+      <Suspense fallback={<Splash />}>
+        <Shell>
+          <Outlet />
+        </Shell>
+      </Suspense>
     </AppContext.Provider>
   );
 }

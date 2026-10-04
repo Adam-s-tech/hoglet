@@ -1,7 +1,7 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, getRouteApi, useBlocker } from "@tanstack/react-router";
-import { Slider as SliderPrimitive } from "@base-ui/react/slider";
+import { Slider } from "@/components/ui/slider";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Icon } from "@/components/icons";
 import { AppDialog, Confirm } from "@/components/dialogs";
@@ -240,30 +240,8 @@ function Pct({ value, onChange, label, disabled, className }: { value: number; o
   );
 }
 
-/** shadcn's Slider doesn't expose the thumb's accessible name, so this composes the same primitive. */
 function RolloutSlider({ value, onChange, label, disabled }: { value: number; onChange: (v: number) => void; label: string; disabled?: boolean }) {
-  return (
-    <SliderPrimitive.Root
-      value={value}
-      min={0}
-      max={100}
-      step={1}
-      disabled={disabled}
-      thumbAlignment="edge"
-      onValueChange={(v) => onChange(Array.isArray(v) ? v[0] : v)}
-      className="min-w-24 flex-1"
-    >
-      <SliderPrimitive.Control className="relative flex h-6 w-full touch-none items-center select-none data-disabled:opacity-50">
-        <SliderPrimitive.Track className="relative h-1.5 w-full grow overflow-hidden rounded-full bg-muted">
-          <SliderPrimitive.Indicator className="h-full bg-primary" />
-        </SliderPrimitive.Track>
-        <SliderPrimitive.Thumb
-          getAriaLabel={() => label}
-          className="relative block size-4 shrink-0 rounded-full border border-ring bg-background ring-ring/50 transition-[color,box-shadow] select-none after:absolute after:-inset-2 hover:ring-3 has-focus-visible:ring-3 active:ring-3 data-disabled:pointer-events-none"
-        />
-      </SliderPrimitive.Control>
-    </SliderPrimitive.Root>
-  );
+  return <Slider value={value} onValueChange={onChange} label={label} disabled={disabled} className="min-w-24 flex-1" />;
 }
 
 const SPLIT = "__split__";
