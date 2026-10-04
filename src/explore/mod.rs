@@ -107,6 +107,17 @@ impl Explorer {
         source: Arc<dyn EventSource>,
         persons: Arc<PersonStore>,
     ) -> Result<Self, ExploreError> {
+        Self::with_spill_dir(source, persons, None)
+    }
+
+    /// `spill_dir` is where oversized aggregations spill; production passes a
+    /// directory under the data dir (the system temp dir may be tmpfs that
+    /// counts against the process's memory cgroup).
+    pub fn with_spill_dir(
+        source: Arc<dyn EventSource>,
+        persons: Arc<PersonStore>,
+        spill_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self, ExploreError> {
         // A static binary cannot load extensions; everything needed is
         // compiled in, so never try to fetch or load one.
         let root = duckdb::Connection::open_in_memory_with_flags(
@@ -117,7 +128,10 @@ impl Explorer {
         let _ = root.execute_batch("SET GLOBAL TimeZone='UTC';");
         // Large web-analytics ranges may exceed the memory limit; they spill
         // to a bounded scratch directory instead of failing.
-        let spill = std::env::temp_dir().join(format!("hoglet-explore-{}", std::process::id()));
+        let spill = spill_dir.unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("hoglet-explore-{}", std::process::id()))
+        });
+        let _ = std::fs::create_dir_all(&spill);
         let spill = spill
             .to_string_lossy()
             .replace('\'', "''")

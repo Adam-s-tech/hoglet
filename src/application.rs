@@ -210,7 +210,11 @@ impl Application {
         let projection_catalog = Arc::new(ProjectionCatalog::open(&paths.projections())?);
         let event_source: Arc<dyn crate::source::EventSource> = lake.clone();
         let explorer = Arc::new(
-            crate::explore::Explorer::new(event_source, persons.clone())
+            crate::explore::Explorer::with_spill_dir(
+                event_source,
+                persons.clone(),
+                Some(config.data_dir.join("tmp").join("explore")),
+            )
                 .map_err(|error| ApplicationError::Query(error.to_string()))?,
         );
 
