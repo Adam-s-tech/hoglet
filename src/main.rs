@@ -144,6 +144,7 @@ async fn healthcheck() -> Result<(), Box<dyn Error>> {
             .get(&url)
             .call()
             .map(|response| response.status())
+            .map_err(|error| error.to_string())
     })
     .await?;
     match status {
