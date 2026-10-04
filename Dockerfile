@@ -13,8 +13,8 @@
 # already smoke-tested binaries at dist/docker/<amd64|arm64>/hoglet instead.
 #
 # Shutdown: Hoglet drains and publishes the WAL on SIGTERM or SIGINT.
-# Health: the image has no shell or curl. Probe HTTP GET /ready (readiness)
-# or /health (liveness) from the orchestrator instead of a HEALTHCHECK.
+# Health: the image has no shell or curl; the binary checks itself
+# (`hoglet healthcheck` calls GET /ready on HOGLET_ADDR).
 
 ARG RUST_VERSION=1.97
 ARG ZIG_VERSION=0.17.0
@@ -62,4 +62,5 @@ ENV HOGLET_ADDR=0.0.0.0:8000 \
     HOGLET_DATA=/data
 VOLUME ["/data"]
 EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/hoglet", "healthcheck"]
 ENTRYPOINT ["/hoglet"]

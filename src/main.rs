@@ -13,6 +13,7 @@ USAGE:
     hoglet reconcile posthog
                             Compare Hoglet's numbers with PostHog's
                             (see `hoglet reconcile posthog --help`)
+    hoglet healthcheck      Exit 0 if the local server is ready (for Docker HEALTHCHECK)
     hoglet --version        Print the version
 
 ENVIRONMENT:
@@ -56,6 +57,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("import") => return run_import().await,
         Some("reconcile") => return run_reconcile().await,
+        Some("healthcheck") => return healthcheck().await,
         Some("serve") | None => {}
         Some(other) => return Err(format!("unknown command {other:?}; see `hoglet --help`").into()),
     }
@@ -120,6 +122,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     server_result?;
     shutdown_result?;
     Ok(())
+}
+
+/// `GET /ready` on this server's own address; exit status 0 when it answers 200.
+async fn healthcheck() -> Result<(), Box<dyn Error>> {
+    let addr = std::env::var("HOGLET_ADDR").unwrap_or_else(|_| "127.0.0.1:8000".into());
+    let addr: SocketAddr = addr
+        .parse()
+        .map_err(|error| format!("HOGLET_ADDR must be a socket address: {error}"))?;
+    // A wildcard listen address is reachable through loopback.
+    let host = if addr.ip().is_unspecified() {
+        format!("127.0.0.1:{}", addr.port())
+    } else {
+        addr.to_string()
+    };
+    let url = format!("http://{host}/ready");
+    let status = tokio::task::spawn_blocking(move || {
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .get(&url)
+            .call()
+            .map(|response| response.status())
+    })
+    .await?;
+    match status {
+        Ok(200) => Ok(()),
+        Ok(code) => Err(format!("not ready: HTTP {code}").into()),
+        Err(error) => Err(format!("not ready: {error}").into()),
+    }
 }
 
 async fn run_import() -> Result<(), Box<dyn Error>> {

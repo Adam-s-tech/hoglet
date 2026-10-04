@@ -106,8 +106,9 @@ docker run -d --name hoglet --restart unless-stopped --stop-timeout 30 \
 - `--stop-timeout 30` gives Hoglet time to drain and publish the write-ahead
   log on `docker stop` (Docker's default is 10 seconds). A hard stop is still
   safe.
-- The image has no shell or `curl`. Use `/ready` (readiness) and `/health`
-  (liveness) from the outside.
+- The image has no shell or `curl`, so it carries a built-in `HEALTHCHECK`
+  (`hoglet healthcheck`, which calls `/ready`). From the outside use `/ready`
+  (readiness) and `/health` (liveness).
 - Memory: add `--memory 768m` to mirror the systemd limits.
 - Upgrade: pull the new tag, remove the container, run it again with the same
   volume. Back up first.

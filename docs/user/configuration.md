@@ -123,3 +123,8 @@ operators run into.
 | Flags | 2,000 per project, 50 condition groups per flag, 50 variants |
 
 Per-endpoint behavior and status codes: [API](api.md).
+
+## `hoglet healthcheck`
+
+Exits 0 when the server at `HOGLET_ADDR` answers `GET /ready` with 200, and
+non-zero otherwise. The Docker image uses it as its `HEALTHCHECK`.
