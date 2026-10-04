@@ -36,7 +36,7 @@ while [ $# -gt 0 ]; do
         --version) [ $# -ge 2 ] || die "--version needs a value"; version="$2"; shift 2 ;;
         --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix="$2"; shift 2 ;;
         --systemd) systemd=1; shift ;;
-        -h|--help) sed -n '2,25p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,24p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done

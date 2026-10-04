@@ -31,7 +31,7 @@ TimeoutStopSec=30
 Restart=on-failure
 RestartSec=2
 
-# Memory: DuckDB queries are capped at 128 MB inside the process; ingest and
+# Memory: DuckDB is memory-capped inside the process (queries, web analytics, compaction); ingest and
 # SQLite live outside that cap. 768M leaves ~250 MB for the OS + reverse proxy
 # on a 1 GB box. MemoryHigh throttles before the hard kill.
 MemoryHigh=640M

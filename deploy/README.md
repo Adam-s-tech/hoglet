@@ -29,8 +29,9 @@ Configuration is environment only:
 | `HOGLET_RETENTION_DAYS` | keep all | delete events older than N days |
 | `RUST_LOG` | `hoglet=info` | log filter |
 
-Health: `GET /health` is liveness, `GET /ready` turns 200 only after WAL
-recovery and the stores are open. Point load balancers at `/ready`.
+Health: `GET /health` is liveness; `GET /ready` is 200 while serving and 503
+during shutdown. The port opens only after WAL recovery finishes, so during a
+slow start connections are refused. Point load balancers at `/ready`.
 
 SIGTERM and SIGINT both drain in-flight requests, fsync and publish the WAL,
 then exit. A hard kill is also safe: acknowledged events are in the WAL and
@@ -53,7 +54,7 @@ carry whatever `$ip` the SDK sends.
 ## Sizing (1 vCPU / 1 GB)
 
 The unit sets `MemoryHigh=640M` / `MemoryMax=768M`, leaving room for the OS
-and the proxy. DuckDB queries are capped at 128 MB and one at a time inside
+and the proxy. DuckDB is memory-capped inside
 the process; ingest is never starved by queries.
 
 ## Data directory and backups

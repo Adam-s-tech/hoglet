@@ -302,7 +302,13 @@ async fn capture(
         let historical_migration = false;
         let events = batch.events;
         let n = events.len() as u64;
-        let forwarded = state.forwarder.as_ref().map(|_| events.clone());
+        // Imports (and PostHog's own migration tooling) mark batches as
+        // historical; replaying history into PostHog again would duplicate it.
+        let forwarded = state
+            .forwarder
+            .as_ref()
+            .filter(|_| !batch.historical_migration)
+            .map(|_| events.clone());
         let bindings = project_ids_by_token.clone();
         state.metrics.inc_captured(n);
         match state

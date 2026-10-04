@@ -59,7 +59,8 @@ A running instance serves its API reference at `/docs`.
   plain SQL over your events. Click any number to see the people behind it.
 - **Web analytics.** Visitors, pageviews, sessions, bounce rate and session
   duration with period-over-period change, pages, entry/exit pages, referrers,
-  UTMs, browsers, devices and countries on one screen.
+  UTMs, browsers, devices and countries (when events carry
+  `$geoip_country_code`) on one screen.
 - **Honest person counts.** `identify`, `alias` and `merge_dangerously` follow
   PostHog's merge rules and every person count goes through them — an
   anonymous visitor who logs in is one person, not two.
@@ -76,8 +77,7 @@ A running instance serves its API reference at `/docs`.
 
 ## Switching from PostHog
 
-1. **Shadow mode.** Point SDKs at Hoglet and turn on forwarding (project
-   settings): every event still reaches PostHog, so both see identical data.
+1. **Shadow mode.** Point SDKs at Hoglet and turn on forwarding (`PUT /api/projects/{id}/forwarding`): every event still reaches PostHog, so both see identical data.
 2. **Bring your history.**
    `hoglet import posthog --posthog-project 12345 --posthog-key phx_… --token phc_…`
    copies events, identity merges, person properties and feature flags.
@@ -112,7 +112,7 @@ and identity live in SQLite. Details: [`spec/README.md`](spec/README.md).
 ```
 data/
   control.db      accounts, projects, flags, insights, dashboards
-  projections.db  persons, identity, catalog, file catalog (rebuildable)
+  projections.db  persons, identity, catalog, file catalog (back it up with the rest)
   events/         <project>/<YYYY-MM-DD>/*.parquet — query them with anything
   wal/            acknowledged events not yet in Parquet
 ```

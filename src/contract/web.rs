@@ -1,8 +1,8 @@
 //! Web analytics: the one-screen Plausible-grade view over `$pageview`s.
 //!
 //! Visitors are persons; sessions are `$session_id`s (events without one are
-//! sessionized by 30 minutes of inactivity per person). A bounce is a session
-//! with exactly one pageview and no other event.
+//! sessionized by 30 minutes of inactivity per person). A bounce is PostHog's:
+//! one pageview, no `$autocapture`, lasting under 10 seconds.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;

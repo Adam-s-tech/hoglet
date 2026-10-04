@@ -399,6 +399,31 @@ fn sql(fixture: &Fixture, text: &str) -> Result<InsightResult, QueryError> {
     )
 }
 
+/// The static binary has no ICU: ordinary time functions must still work on
+/// `events.timestamp`, and `now_utc()` must exist.
+#[test]
+fn sql_time_functions_work_without_icu() {
+    let fixture = Fixture::new(vec![
+        event("a", "u1", "2026-03-10T10:30:00Z", json!({})),
+        event("a", "u1", "2026-03-11T23:59:59Z", json!({})),
+    ]);
+    let InsightResult::Sql { rows, .. } = sql(
+        &fixture,
+        "SELECT CAST(date_trunc('day', timestamp) AS VARCHAR), extract(hour FROM timestamp), \
+                CAST(timestamp::DATE AS VARCHAR), \
+                timestamp > now_utc() - INTERVAL 7 DAY, now_utc() > TIMESTAMP '2020-01-01' \
+         FROM events ORDER BY timestamp",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(rows[0][0], json!("2026-03-10 00:00:00"));
+    assert_eq!(rows[0][1], json!(10));
+    assert_eq!(rows[1][2], json!("2026-03-11"));
+    assert_eq!(rows[0][3], json!(false), "March 2026 is not within 7 days of now");
+    assert_eq!(rows[0][4], json!(true));
+}
+
 #[test]
 fn sql_is_a_read_only_single_select_sandbox() {
     let fixture = Fixture::new(vec![

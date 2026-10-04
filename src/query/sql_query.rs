@@ -4,7 +4,10 @@
 //! limits. The sandbox exposes one relation, `events`, over exactly this
 //! project's files (person ids resolved), then disables external access —
 //! `allowed_paths` keeps only those files readable — and locks its
-//! configuration. The statement must parse as a single SELECT (DuckDB's own
+//! configuration. `events.timestamp` is a UTC `TIMESTAMP` (no time zone) and
+//! `now_utc()` is the current UTC time, so `date_trunc`, `extract`, casts and
+//! interval arithmetic work without DuckDB's ICU extension, which the static
+//! binary does not ship. The statement must parse as a single SELECT (DuckDB's own
 //! parser via `json_serialize_sql`); results are capped at
 //! [`MAX_SQL_ROWS`] rows and the engine watchdog interrupts it at the
 //! deadline.
@@ -33,7 +36,8 @@ fn sandbox(ctx: &Ctx<'_>) -> Result<Connection, QueryError> {
     super::set_utc(&conn);
     conn.execute_batch(
         "SET autoinstall_known_extensions = false; \
-         CREATE TEMP TABLE person_overrides (distinct_id VARCHAR, person_id VARCHAR);",
+         CREATE TEMP TABLE person_overrides (distinct_id VARCHAR, person_id VARCHAR); \
+         CREATE TEMP MACRO now_utc() AS make_timestamp(epoch_us(now()));",
     )?;
     // This project's overrides, copied from the engine's synced table.
     let mut params = Params::new();
@@ -57,7 +61,7 @@ fn sandbox(ctx: &Ctx<'_>) -> Result<Connection, QueryError> {
         "e.event AS event".to_owned(),
         "e.distinct_id AS distinct_id".to_owned(),
         "coalesce(o.person_id, e.distinct_id) AS person_id".to_owned(),
-        "e.timestamp AS timestamp".to_owned(),
+        "make_timestamp(epoch_us(e.timestamp)) AS timestamp".to_owned(),
         "e.properties AS properties".to_owned(),
     ];
     let files = ctx.source.files;
@@ -67,7 +71,7 @@ fn sandbox(ctx: &Ctx<'_>) -> Result<Connection, QueryError> {
             "NULL::VARCHAR AS event".to_owned(),
             "NULL::VARCHAR AS distinct_id".to_owned(),
             "NULL::VARCHAR AS person_id".to_owned(),
-            "NULL::TIMESTAMPTZ AS timestamp".to_owned(),
+            "NULL::TIMESTAMP AS timestamp".to_owned(),
             "NULL::VARCHAR AS properties".to_owned(),
         ];
         for (column, _) in PROMOTED {

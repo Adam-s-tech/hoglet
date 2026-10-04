@@ -206,32 +206,29 @@ Rules and limits:
   `properties->>'$.plan'`. For a key with a `$` in it, quote it:
   `json_extract_string(properties, '$."$browser"')`.
 
-**Time functions.** The static binary has no DuckDB ICU extension, so
-functions that need time zone support fail on `timestamp`: `date_trunc`,
-`extract` and `date_part`, `hour()`, `CAST(timestamp AS DATE)`,
-`timestamp - INTERVAL ...` and `now() - INTERVAL ...`. These work:
+**Time.** `timestamp` is a UTC `TIMESTAMP` (no time zone) and `now_utc()` is
+the current UTC time, so the usual functions work:
 
 ```sql
 -- events per UTC day
-SELECT strftime(timestamp, '%Y-%m-%d') AS day, count(*) AS events
+SELECT date_trunc('day', timestamp) AS day, count(*) AS events
 FROM events GROUP BY 1 ORDER BY 1;
 
 -- per hour of day
-SELECT strftime(timestamp, '%H') AS hour, count(*) FROM events GROUP BY 1 ORDER BY 1;
+SELECT extract(hour FROM timestamp) AS hour, count(*) FROM events GROUP BY 1 ORDER BY 1;
 
--- last 7 days (keep the ::BIGINT: 30 * 86400000 overflows a 32-bit integer)
+-- last 7 days
 SELECT event, count(*) AS events, count(DISTINCT person_id) AS people
 FROM events
-WHERE epoch_ms(timestamp) > epoch_ms(now()) - 7 * 86400000::BIGINT
+WHERE timestamp > now_utc() - INTERVAL 7 DAY
 GROUP BY event ORDER BY events DESC LIMIT 50;
 
 -- from a fixed instant
-SELECT count(*) FROM events WHERE timestamp >= TIMESTAMPTZ '2026-10-01 00:00:00+00';
+SELECT count(*) FROM events WHERE timestamp >= TIMESTAMP '2026-10-01 00:00:00';
 ```
 
-The query that the SQL editor starts with uses
-`timestamp > now() - INTERVAL 7 DAY`, which fails for this reason. Replace it
-with the `epoch_ms` form above.
+Use `now_utc()`, not `now()`: `now()` is a time-zone-aware value and arithmetic
+on it needs DuckDB's ICU extension, which the single binary does not ship.
 
 Errors come back as `400 invalid_query` with DuckDB's message; a timeout is
 `504`; too many concurrent queries is `503` (retry).

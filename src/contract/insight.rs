@@ -302,7 +302,8 @@ fn default_edge_limit() -> u32 {
 
 /// Read-only SQL over the project's events. The only relation is `events`
 /// (columns: uuid, event, distinct_id, person_id, timestamp, properties, and
-/// the promoted columns). Capped in rows, time and memory.
+/// the promoted columns). `timestamp` is a UTC `TIMESTAMP`; `now_utc()` is the
+/// current UTC time. Capped in rows, time and memory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 pub struct SqlQuery {

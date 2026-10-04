@@ -82,7 +82,7 @@ export function defaultQuery(kind: QueryKind): InsightQuery {
     case "SqlQuery":
       return {
         kind,
-        query: "SELECT event, count() AS events, count(DISTINCT person_id) AS persons\nFROM events\nWHERE timestamp > now() - INTERVAL 7 DAY\nGROUP BY event\nORDER BY events DESC\nLIMIT 50",
+        query: "SELECT event, count() AS events, count(DISTINCT person_id) AS persons\nFROM events\nWHERE timestamp > now_utc() - INTERVAL 7 DAY\nGROUP BY event\nORDER BY events DESC\nLIMIT 50",
       };
   }
 }

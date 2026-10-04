@@ -211,11 +211,10 @@ HOGLET_DATA=/var/lib/hoglet HOGLET_ADDR=127.0.0.1:8000 /usr/local/bin/hoglet
 Hoglet is down). "N behind" is ingestion lag: acknowledged events not yet
 published; see step 4 above.
 
-## SQL tab errors about ICU or INTERVAL
+## SQL tab errors about ICU or time zones
 
-`date_trunc`, `extract`, casting `timestamp` to a date, and
-`timestamp - INTERVAL ...` are not available in the SQL tab. Use `strftime` and
-`epoch_ms`; examples are in
+Use `now_utc()` instead of `now()`, and `TIMESTAMP '...'` (no zone) instead of
+`TIMESTAMPTZ '...'`. The `timestamp` column is a UTC `TIMESTAMP`; see
 [Insights and queries](insights-and-queries.md#sql-tab).
 
 ## Feature flag looks wrong
