@@ -50,6 +50,14 @@ uuid = { version = "1", features = ["v7", "v4", "serde"] }
 #   opt-level = "s" for Rust code        47.6 MB (-7%)
 #   opt-level = "s" for DuckDB (C++)     46.8 MB (-8%)
 # Neither saving is worth slower ingest or slower funnels; keep opt-level 3.
+# Debug builds link DuckDB's C++ into every test binary; full debug info made
+# target/ grow by tens of GB. Line tables keep backtraces readable.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 lto = true
