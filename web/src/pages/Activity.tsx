@@ -2,7 +2,7 @@
 
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Combobox, ComboboxContent, ComboboxEmpty, ComboboxInput, ComboboxItem, ComboboxList } from "@/components/ui/combobox";
 import { Switch } from "@/components/ui/switch";
@@ -15,7 +15,7 @@ import { Page, PageHeader, Panel, SearchInput, Toolbar } from "@/components/page
 import { errorMessage } from "@/lib/api";
 import { usePath, useProjectId } from "@/lib/context";
 import { fmtDateTime, fmtRelative } from "@/lib/format";
-import { useDebounced, useNow } from "@/lib/hooks";
+import { useDebounced, useSharedNow } from "@/lib/hooks";
 import { eventLabel } from "@/lib/properties";
 import { catalogEventsQuery, eventsQuery } from "@/lib/queries";
 import { cn } from "@/lib/utils";
@@ -91,7 +91,17 @@ export function ScrollEnd({ onEnd, children, className }: { onEnd: () => void; c
 
 const col = columnHelper<EventRow>();
 
-export function EventTable({
+/** "5s ago" that keeps itself fresh from the shared clock; the table around it never re-renders for it. */
+function RelativeTime({ iso }: { iso: string }) {
+  const now = useSharedNow();
+  return (
+    <time dateTime={iso} className="whitespace-nowrap text-muted-foreground" title={fmtDateTime(iso)}>
+      {fmtRelative(iso, now)}
+    </time>
+  );
+}
+
+export const EventTable = memo(function EventTable({
   events,
   showPerson = true,
   fresh,
@@ -104,7 +114,6 @@ export function EventTable({
 }) {
   const path = usePath();
   const [open, setOpen] = useState<string | null>(null);
-  const now = useNow(5000);
 
   const columns = useMemo(
     () => [
@@ -172,14 +181,12 @@ export function EventTable({
       col.accessor("timestamp", {
         header: "Time",
         cell: (c) => (
-          <time dateTime={c.getValue()} className="whitespace-nowrap text-muted-foreground" title={fmtDateTime(c.getValue())}>
-            {fmtRelative(c.getValue(), now)}
-          </time>
+          <RelativeTime iso={c.getValue()} />
         ),
         meta: { align: "right" },
       }),
     ],
-    [showPerson, open, path, now],
+    [showPerson, open, path],
   );
 
   return (
@@ -196,7 +203,7 @@ export function EventTable({
       dense
     />
   );
-}
+});
 
 /** Event-name filter: a Base UI combobox over the catalog (plus the active value, even if the catalog doesn't list it). */
 function EventFilter({ value, onChange }: { value: string | null; onChange: (v: string | null) => void }) {

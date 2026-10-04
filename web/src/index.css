@@ -331,6 +331,52 @@
   font-size: 10.5px;
 }
 
+/* Native range input (components/ui/slider.tsx): a filled track and a round thumb. */
+.hoglet-range {
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.hoglet-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.hoglet-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, var(--primary) var(--fill), var(--muted) var(--fill));
+}
+.hoglet-range::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, var(--primary) var(--fill), var(--muted) var(--fill));
+}
+.hoglet-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -5px;
+  border-radius: 9999px;
+  border: 1px solid var(--ring);
+  background: var(--background);
+}
+.hoglet-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  border: 1px solid var(--ring);
+  background: var(--background);
+}
+.hoglet-range:focus-visible {
+  outline: none;
+}
+.hoglet-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent);
+}
+.hoglet-range:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .chart .sankey-link {
     transition: none;

@@ -17,7 +17,7 @@ import { clearSessionData } from "@/lib/query-client";
 
 function AuthCard({ title, lede, foot, onSubmit, children }: { title: string; lede: string; foot: string; onSubmit: () => void; children: ReactNode }) {
   return (
-    <div className="grid min-h-screen place-items-center p-6">
+    <main className="grid min-h-screen place-items-center p-6">
       <form
         noValidate
         className="flex w-full max-w-[420px] flex-col gap-1 rounded-xl bg-card p-8 shadow-sm ring-1 ring-foreground/10"
@@ -36,7 +36,7 @@ function AuthCard({ title, lede, foot, onSubmit, children }: { title: string; le
         <div className="flex flex-col gap-4">{children}</div>
         <p className="mt-5 text-center text-xs text-muted-foreground">{foot}</p>
       </form>
-    </div>
+    </main>
   );
 }
 
