@@ -2,74 +2,111 @@
 
 **PostHog-compatible product analytics. One binary. One $5 server.**
 
-Point your existing PostHog SDK at Hoglet — change `api_host`, nothing else — and
-it just works. No ClickHouse, no Kafka, no Redis, no Zookeeper. One static Rust
-binary that runs on a 1 vCPU / 1 GB box.
+Point your existing PostHog SDKs at Hoglet — change `api_host`, nothing else —
+and get product analytics, web analytics and feature flags from a single Rust
+binary. No ClickHouse, Kafka, Redis, Zookeeper or Postgres. Your data stays on
+your server, as plain Parquet files you own.
 
-> Status: pre-release, built in the open. The ingest spine, query layer, data
-> model, auth, and dashboards are built and tested; see
-> [`spec/README.md`](spec/README.md) for exactly what's built (✅), partial (◐),
-> and planned (○), phase by phase.
-
-## Why
-
-Product analytics today makes you choose: the depth of PostHog/Mixpanel with the
-operational weight of a cluster, or the simplicity of Plausible without funnels
-and identity. Hoglet is the missing corner — real product analytics (funnels,
-retention, identity, flags) that runs as a single process you can operate
-yourself. See [`why-hoglet.md`](why-hoglet.md).
+```sh
+HOGLET_DEMO=1 ./hoglet        # 90 days of realistic data, ready in a second
+# open http://localhost:8000  — demo@hoglet.dev / hoglet-demo-1
+```
 
 ## Quick start
 
 ```sh
-cargo build --release
-./target/release/hoglet          # listens on 0.0.0.0:8000
+./hoglet                                     # listens on 127.0.0.1:8000
+docker run -p 8000:8000 -v hoglet:/data ghcr.io/debpalash/hoglet   # or the container
 ```
 
-Point any PostHog SDK at it:
+Open the dashboard, create your account and project, then point any PostHog
+SDK at it:
 
 ```js
-posthog.init('phc_yourtoken', { api_host: 'http://localhost:8000' })
+posthog.init('phc_your_project_token', { api_host: 'https://analytics.example.com' })
 ```
 
-Open `http://localhost:8000/` for the live dashboard.
+```python
+posthog = Posthog('phc_your_project_token', host='https://analytics.example.com')
+```
 
-## What works
+Put Hoglet behind any TLS reverse proxy (Caddy, nginx) — see [`deploy/`](deploy/).
 
-- **Capture** — every PostHog endpoint (`/e`, `/batch`, `/capture`, …), gzip/base64
-  decompression, the full body union, PostHog's timestamp/identity resolution.
-- **Durability** — write-ahead log with ack-after-fsync; a `kill -9` mid-stream
-  loses zero acknowledged events (there's a test that proves it).
-- **Identity** — `$identify` / `$create_alias` / `$merge_dangerously` with PostHog's
-  merge precedence. No ghost profiles; merge order doesn't change the result.
-- **Flags** — `/flags` and `/decide` with real evaluation, bucketed per user with
-  PostHog's exact SHA1 hash (a 30% rollout selects the same users PostHog would).
-- **Queries** — DuckDB over Parquet: stats, trends, top events, funnels.
-- **Dashboard** — a live view served from the binary itself.
+## What you get
+
+- **Every PostHog SDK, unchanged.** Capture on every PostHog endpoint, gzip and
+  base64 bodies, `sendBeacon`, retries with PostHog's exact response codes.
+  Proven nightly against posthog-js, posthog-node and posthog-python `latest`.
+- **Insights.** Trends (every PostHog math, breakdowns, formulas, period
+  comparison), funnels (sequential, strict, any order, conversion windows,
+  exclusions, time to convert), retention, lifecycle, stickiness, paths, and
+  plain SQL over your events. Click any number to see the people behind it.
+- **Web analytics.** Visitors, pageviews, sessions, bounce rate and session
+  duration with period-over-period change, pages, entry/exit pages, referrers,
+  UTMs, browsers, devices and countries on one screen.
+- **Honest person counts.** `identify`, `alias` and `merge_dangerously` follow
+  PostHog's merge rules and every person count goes through them — an
+  anonymous visitor who logs in is one person, not two.
+- **Feature flags that can't go down with your dashboard.** PostHog's exact
+  bucketing (same users in the same rollout as PostHog would pick), release
+  conditions, multivariate variants, payloads, experience continuity, and
+  local evaluation for server SDKs. Evaluated in-process, isolated from
+  analytics queries.
+- **Data you can trust.** An event acknowledged with a 2xx is on disk; a
+  `kill -9` at any moment loses nothing acknowledged. The dashboard always
+  shows how fresh the numbers are.
+- **Persons, activity, dashboards, sharing, API keys,** and physical GDPR
+  erasure of a person and all their events.
+
+## Switching from PostHog
+
+1. **Shadow mode.** Point SDKs at Hoglet and turn on forwarding (project
+   settings): every event still reaches PostHog, so both see identical data.
+2. **Bring your history.**
+   `hoglet import posthog --posthog-project 12345 --posthog-key phx_… --token phc_…`
+   copies events, identity merges, person properties and feature flags.
+   Re-running resumes and never duplicates.
+3. **Check the numbers.**
+   `hoglet reconcile posthog …` compares events and unique people per event
+   per day on both systems and flags any difference.
+4. Turn forwarding off. Done.
 
 ## Configuration
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `HOGLET_ADDR` | `0.0.0.0:8000` | listen address |
-| `HOGLET_DATA` | `hoglet-data` | data directory (WAL, Parquet, SQLite) |
-| `HOGLET_RETENTION_DAYS` | none | drop events older than N days |
-| `HOGLET_MAX_EVENTS_PER_SEC` | 10000 | per-token rate limit |
-| `HOGLET_ADMIN_TOKEN` | none | enables the admin API (create projects/flags) |
+| `HOGLET_ADDR` | `127.0.0.1:8000` | listen address |
+| `HOGLET_DATA` | `./hoglet-data` | data directory |
+| `HOGLET_RETENTION_DAYS` | keep all | delete events older than N days |
+| `HOGLET_MAX_EVENTS_PER_SEC` | `10000` | per-project capture limit |
+| `HOGLET_COOKIELESS_SALT` | off | cookieless device ids with this secret salt |
+| `HOGLET_DEMO` | off | `1` on a fresh data dir: demo account + data |
 
-## Architecture
+`hoglet --help` lists everything.
 
-One binary, two lanes: a hot ingest path (capture → WAL → Parquet) that must
-never lose data, and a query lane (DuckDB, memory-capped) that can't starve it.
-Persons/identity/flags live in SQLite. Full map in [`spec/README.md`](spec/README.md);
-compatibility contract in [`spec/wire-compat.md`](spec/wire-compat.md).
+## How it works
+
+One process, two lanes. Ingest writes each batch to a write-ahead log and
+acknowledges after one group fsync; a separate publisher turns the log into
+day-partitioned Parquet files and applies identity, while a compactor keeps
+partitions few and duplicate-free. Queries run DuckDB over exactly the files a
+query needs, on a capped pool that can never starve ingest. Accounts, flags
+and identity live in SQLite. Details: [`spec/README.md`](spec/README.md).
+
+```
+data/
+  control.db      accounts, projects, flags, insights, dashboards
+  projections.db  persons, identity, catalog, file catalog (rebuildable)
+  events/         <project>/<YYYY-MM-DD>/*.parquet — query them with anything
+  wal/            acknowledged events not yet in Parquet
+```
 
 ## Testing
 
 ```sh
-cargo test                       # unit + integration, incl. the SIGKILL crash test
-cd contract-tests && npm test    # real PostHog SDKs against a real Hoglet
-scripts/loadtest.sh              # throughput + RSS under concurrent load
+cargo test                          # unit, integration, crash and oracle tests
+scripts/contract-test.sh all        # real PostHog SDKs against a real Hoglet
+scripts/loadtest.sh                 # sustained ingest with a racing query
 ```
 
 ## License
