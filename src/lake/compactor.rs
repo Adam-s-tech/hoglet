@@ -120,11 +120,13 @@ impl Compactor {
                 [],
             )
             .map_err(duck_error)?;
+        crate::fault::hit("compact.after_tmp");
         let file = std::fs::File::open(&temporary).map_err(super::io_error(&temporary))?;
         file.sync_all().map_err(super::io_error(&temporary))?;
         let bytes = file.metadata().map_err(super::io_error(&temporary))?.len();
         std::fs::rename(&temporary, &path).map_err(super::io_error(&path))?;
         sync_dir(&dir)?;
+        crate::fault::hit("compact.after_rename");
 
         let input_rows = inputs.iter().map(|file| file.rows).sum();
         let retired: HashSet<i64> = inputs.iter().map(|file| file.id).collect();
@@ -156,6 +158,7 @@ impl Compactor {
             retire(&transaction, &retired, generation)?;
             advance_state(&transaction, &state, None, now)?;
             transaction.commit()?;
+            crate::fault::hit("compact.after_commit");
             Ok(added)
         })();
         let added = match committed {
@@ -166,6 +169,7 @@ impl Compactor {
             }
         };
         self.lake.activate(generation, vec![added], &retired);
+        crate::fault::hit("compact.before_sweep");
         Ok(Compacted {
             project_id: partition.project_id.clone(),
             day: partition.day,
@@ -262,11 +266,13 @@ impl Compactor {
                     [],
                 )
                 .map_err(duck_error)? as u64;
+            crate::fault::hit("erase.after_tmp");
             let file = std::fs::File::open(&temporary).map_err(super::io_error(&temporary))?;
             file.sync_all().map_err(super::io_error(&temporary))?;
             let bytes = file.metadata().map_err(super::io_error(&temporary))?.len();
             std::fs::rename(&temporary, &path).map_err(super::io_error(&path))?;
             sync_dir(&dir)?;
+            crate::fault::hit("erase.after_rename");
 
             let retired: HashSet<i64> = partition.files.iter().map(|file| file.id).collect();
             let now = Utc::now().timestamp();
@@ -300,6 +306,7 @@ impl Compactor {
             retire(&transaction, &retired, generation)?;
             advance_state(&transaction, &state, None, now)?;
             transaction.commit()?;
+            crate::fault::hit("erase.after_commit");
             drop(connection);
             if added.is_none() {
                 let _ = std::fs::remove_file(&path);

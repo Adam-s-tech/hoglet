@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -278,6 +278,7 @@ impl WriteAheadLog {
                 let scan = scan_segment(path, *sequence, config.max_record_bytes, true)?;
                 let mut file = OpenOptions::new().read(true).write(true).open(path)?;
                 file.seek(SeekFrom::Start(scan.valid_bytes))?;
+                crate::fault::wal_synced(scan.valid_bytes);
                 (
                     ActiveSegment {
                         sequence: *sequence,
@@ -343,7 +344,7 @@ impl WriteAheadLog {
 
         let start = WalCursor::new(self.active.sequence, self.active.bytes);
         let frame = encode_frame(&payload);
-        if let Err(error) = self.active.file.write_all(&frame) {
+        if let Err(error) = crate::fault::wal_write(&mut self.active.file, &frame) {
             self.poisoned = true;
             return Err(error.into());
         }
@@ -364,10 +365,16 @@ impl WriteAheadLog {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
-        if let Err(error) = self.active.file.sync_data() {
+        crate::fault::wal_before_sync(&self.active.file);
+        if crate::fault::mutant("skip_fsync") {
+            return Ok(());
+        }
+        if let Err(error) = crate::fault::io("wal.sync").and_then(|()| self.active.file.sync_data())
+        {
             self.poisoned = true;
             return Err(error.into());
         }
+        crate::fault::wal_synced(self.active.bytes);
         Ok(())
     }
 
@@ -430,24 +437,29 @@ impl WriteAheadLog {
     }
 
     fn seal_nonempty(&mut self) -> Result<(), WalError> {
-        if let Err(error) = self.active.file.sync_all() {
+        if let Err(error) = crate::fault::io("wal.seal.sync").and_then(|()| self.active.file.sync_all())
+        {
             self.poisoned = true;
             return Err(error.into());
         }
+        crate::fault::hit("wal.seal.before_rename");
         let sealed = sealed_path(&self.directory, self.active.sequence);
-        if let Err(error) = std::fs::rename(&self.active.path, sealed) {
+        if let Err(error) = std::fs::rename(&self.active.path, &sealed) {
             self.poisoned = true;
             return Err(error.into());
         }
+        crate::fault::after_rename("wal.seal.after_rename", &self.active.path, &sealed);
         if let Err(error) = sync_directory(&self.directory) {
             self.poisoned = true;
             return Err(error);
         }
+        crate::fault::hit("wal.seal.after_dirsync");
         let next = self
             .active
             .sequence
             .checked_add(1)
             .ok_or(WalError::InvalidConfig)?;
+        crate::fault::wal_synced(0);
         self.active = match open_new_active(&self.directory, next) {
             Ok(active) => active,
             Err(error) => {
@@ -714,6 +726,7 @@ fn reclaim_through(
     }
     for (_, path) in &reclaim {
         std::fs::remove_file(path)?;
+        crate::fault::hit("wal.reclaim.after_remove");
     }
     if !reclaim.is_empty() {
         sync_directory(directory)?;

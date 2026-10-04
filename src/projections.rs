@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS identity_state (
 );
 INSERT OR IGNORE INTO identity_state (singleton, seq, epoch) VALUES (1, 0, 0);
 
+-- Erasure is two steps that cannot share one transaction: identity (SQLite)
+-- and event files (Parquet). The distinct ids of a person being erased are
+-- recorded here in the same transaction that deletes the person, and removed
+-- only after their events are gone from every file. A crash in between leaves
+-- the rows here; startup finishes the job before anything else is published.
+CREATE TABLE IF NOT EXISTS pending_erasures (
+    project_id TEXT NOT NULL,
+    distinct_id TEXT NOT NULL,
+    PRIMARY KEY (project_id, distinct_id)
+);
+
 CREATE TABLE IF NOT EXISTS groups (
     project_id TEXT NOT NULL,
     group_type TEXT NOT NULL,
@@ -538,6 +549,12 @@ pub fn erase_person(
         .prepare("SELECT distinct_id FROM distinct_ids WHERE project_id = ?1 AND person_id = ?2")?
         .query_map(params![project_id, person_id], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
+    for distinct_id in &distinct_ids {
+        transaction.execute(
+            "INSERT OR IGNORE INTO pending_erasures(project_id, distinct_id) VALUES (?1, ?2)",
+            params![project_id, distinct_id],
+        )?;
+    }
     transaction.execute(
         "DELETE FROM distinct_ids WHERE project_id = ?1 AND person_id = ?2",
         params![project_id, person_id],
@@ -551,6 +568,42 @@ pub fn erase_person(
         [],
     )?;
     Ok(distinct_ids)
+}
+
+/// Most distinct ids resumed per project in one erasure-recovery step.
+pub const MAX_PENDING_ERASURES_PER_PROJECT: usize = 10_000;
+
+/// Distinct ids whose person is gone but whose events may still be stored,
+/// grouped by project (bounded per project).
+pub fn pending_erasures(
+    connection: &Connection,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, ProjectionError> {
+    let mut grouped: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut statement = connection
+        .prepare("SELECT project_id, distinct_id FROM pending_erasures ORDER BY project_id, distinct_id")?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (project_id, distinct_id) = row?;
+        let ids = grouped.entry(project_id).or_default();
+        if ids.len() < MAX_PENDING_ERASURES_PER_PROJECT {
+            ids.push(distinct_id);
+        }
+    }
+    Ok(grouped)
+}
+
+/// Mark erasures complete: their events are gone from every event file.
+pub fn clear_pending_erasures(
+    connection: &Connection,
+    project_id: &str,
+    distinct_ids: &[String],
+) -> Result<(), ProjectionError> {
+    let mut statement = connection
+        .prepare_cached("DELETE FROM pending_erasures WHERE project_id = ?1 AND distinct_id = ?2")?;
+    for distinct_id in distinct_ids {
+        statement.execute(params![project_id, distinct_id])?;
+    }
+    Ok(())
 }
 
 fn decode_properties(encoded: &str) -> Result<Map<String, Value>, ProjectionError> {

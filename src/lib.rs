@@ -13,6 +13,7 @@ pub mod control_resources;
 pub mod demo;
 pub mod enrichment;
 pub mod explore;
+pub mod fault;
 pub mod flags;
 pub mod forward;
 pub mod import;

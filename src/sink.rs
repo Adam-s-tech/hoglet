@@ -292,9 +292,15 @@ impl DurableWalSink {
         config: PipelineConfig,
         lake: Arc<Lake>,
     ) -> Result<(Arc<Self>, DurableWalRuntime, Recovery), DurablePipelineError> {
-        let (mut wal, recovery) = WriteAheadLog::open(&config.wal_dir, WalConfig::default())?;
+        let mut wal_config = WalConfig::default();
+        wal_config.segment_target_bytes = crate::fault::wal_segment_bytes(wal_config.segment_target_bytes);
+        let (mut wal, recovery) = WriteAheadLog::open(&config.wal_dir, wal_config)?;
         wal.seal()?;
         let publisher = Publisher::new(lake.clone(), wal.reader());
+        let compactor = Compactor::new(lake, &config.tmp_dir, config.retention_days)?;
+        // Finish an erasure a crash interrupted *before* publishing anything:
+        // the lake then holds only events acknowledged before the erasure.
+        resume_pending_erasures(&publisher, &compactor)?;
         let recovered = publisher.publish_all()?;
         if !recovered.is_empty() {
             tracing::info!(
@@ -303,7 +309,6 @@ impl DurableWalSink {
                 "published recovered WAL records"
             );
         }
-        let compactor = Compactor::new(lake, &config.tmp_dir, config.retention_days)?;
         let stats = Arc::new(PipelineStats::default());
         stats.sealed_bytes.store(
             wal.reader().sealed_bytes().unwrap_or(0),
@@ -527,6 +532,7 @@ fn writer_loop(
         if !group.is_empty() {
             // One fsync makes the whole group durable; nobody is acked before.
             let synced = wal.sync().map_err(map_wal_error);
+            crate::fault::hit("sink.after_fsync_before_ack");
             for pending in group {
                 let result = pending.result.and(synced);
                 if result.is_ok() {
@@ -607,7 +613,10 @@ fn publisher_loop(
                 person_id,
                 ack,
             }) => {
-                let result = publish_and_account(&publisher, &stats)
+                // An earlier erasure that failed part-way is finished first,
+                // before anything newer is published.
+                let result = resume_pending_erasures(&publisher, &compactor)
+                    .and_then(|()| publish_and_account(&publisher, &stats))
                     .and_then(|()| erase(&publisher, &compactor, &project_id, &person_id));
                 let _ = ack.send(result);
                 continue;
@@ -651,6 +660,39 @@ fn publisher_loop(
     }
 }
 
+/// Remove the events of every person whose identity was erased but whose
+/// event files were not rewritten yet (a crash, or a failure, in between).
+fn resume_pending_erasures(
+    publisher: &Publisher,
+    compactor: &Compactor,
+) -> Result<(), DurablePipelineError> {
+    let pending = {
+        let connection = publisher.lake().lock_connection()?;
+        crate::projections::pending_erasures(&connection)
+            .map_err(|error| DurablePipelineError::Publish(error.into()))?
+    };
+    for (project_id, distinct_ids) in pending {
+        let events = compactor.erase(&project_id, &distinct_ids)?;
+        clear_pending(publisher, &project_id, &distinct_ids)?;
+        tracing::warn!(
+            distinct_ids = distinct_ids.len(),
+            events,
+            "completed an erasure that was interrupted"
+        );
+    }
+    Ok(())
+}
+
+fn clear_pending(
+    publisher: &Publisher,
+    project_id: &str,
+    distinct_ids: &[String],
+) -> Result<(), DurablePipelineError> {
+    let connection = publisher.lake().lock_connection()?;
+    crate::projections::clear_pending_erasures(&connection, project_id, distinct_ids)
+        .map_err(|error| DurablePipelineError::Publish(error.into()))
+}
+
 fn erase(
     publisher: &Publisher,
     compactor: &Compactor,
@@ -664,12 +706,15 @@ fn erase(
             .map_err(|error| DurablePipelineError::Lake(error.into()))?;
         let ids = crate::projections::erase_person(&transaction, project_id, person_id)
             .map_err(|error| DurablePipelineError::Publish(error.into()))?;
+        crate::fault::hit("erase.before_sqlite_commit");
         transaction
             .commit()
             .map_err(|error| DurablePipelineError::Lake(error.into()))?;
         ids
     };
+    crate::fault::hit("erase.after_sqlite_commit");
     let events = compactor.erase(project_id, &distinct_ids)?;
+    clear_pending(publisher, project_id, &distinct_ids)?;
     tracing::info!(
         distinct_ids = distinct_ids.len(),
         events,
