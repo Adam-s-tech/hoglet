@@ -56,13 +56,16 @@ The secret is shown once; Hoglet stores only a hash. Revoke with
 | Read project data (queries, persons, events, flags, status, insights, dashboards) | A session or any personal key, and membership in the project's organization. |
 | Change project data or settings (flags, insights, dashboards, shares, forwarding, erase a person, demo data) | A session or a `write`-scoped key, **and** the `owner` or `admin` role. |
 | Account management (keys, organizations, projects, logout) | A session. Keys cannot do this (`403`). |
+| List members | Any member of the organization, with a session or any personal key. |
+| Invite, revoke invites, change roles, remove members | A session, and the `owner` or `admin` role (admins cannot touch owners). Keys cannot do this (`403`). |
 | Local flag evaluation (`/flags/definitions`) | A personal key (`read` is enough) whose user can access the project named by `token=phc_...`. |
 
 A key's scope is `read` (default) or `write`. A project you cannot access, or
 that does not exist, gets `403`. A project id that is not a UUID gets `404`.
 
-Hoglet currently has one account created at setup, who owns the organization.
-There is no invite or user-management endpoint yet.
+Roles are per organization: `owner`, `admin` and `member` (read-only).
+Managing people (members, invites) needs a session, never a key; see
+[Team](team.md) for the rules and the invite flow.
 
 ## Endpoints at a glance
 
@@ -83,6 +86,7 @@ Dashboard API, session cookie or personal key. `{p}` is the project id:
 |---|---|
 | Account | `GET /api/auth/bootstrap` (is setup needed), `POST /api/auth/setup`, `login`, `logout`, `GET /api/auth/me`, `GET`/`POST /api/auth/keys`, `DELETE /api/auth/keys/{id}` |
 | Organizations and projects | `GET`/`POST /api/organizations`, `POST /api/organizations/{id}/projects` |
+| Team ([Team](team.md)) | `GET /api/organizations/{id}/members`, `PATCH`/`DELETE /api/organizations/{id}/members/{user_id}`, `GET`/`POST /api/organizations/{id}/invites`, `DELETE /api/organizations/{id}/invites/{invite_id}`. Without a session (the invite token is the credential): `POST /api/invites/preview`, `POST /api/invites/accept` |
 | Queries | `POST /api/projects/{p}/query`, `POST /api/projects/{p}/query/actors` ([Insights and queries](insights-and-queries.md)) |
 | Web analytics | `GET /api/projects/{p}/web/overview`, `GET /api/projects/{p}/web/breakdown` |
 | Persons and events | `GET /persons`, `GET /persons/{id}`, `GET /persons/{id}/events`, `POST /persons/{id}/erase`, `GET /events` (all under `/api/projects/{p}`) |
@@ -119,7 +123,9 @@ characters.
 | 401 | `unauthorized` | No or bad credentials. |
 | 403 | `forbidden` | Authenticated but not allowed (role, scope, or project). |
 | 404 | `not_found` | No such project, person, flag or resource. |
-| 409 | `conflict` | Already exists (a flag key), or setup already done. |
+| 409 | `conflict`, `last_owner`, `already_member`, `too_many_invites`, `email_in_use` | Already exists (a flag key), setup already done, or a team rule (the last owner cannot go). |
+| 404 | `invite_invalid` | An invite link that is unknown, expired, used or revoked. All four look the same on purpose. |
+| 429 | `too_many_attempts` | Too many failed sign-ins or invite-token guesses. `Retry-After` says how long. |
 | 503 | `unavailable`, `query_busy` | Temporary. Retry. `query_busy` carries `Retry-After: 1`. |
 | 504 | `query_timeout` | The query hit its deadline. Narrow the range or the query. |
 | 500 | `internal_error` | A bug or storage fault. Check the logs for the `request_id`. |

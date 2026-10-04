@@ -202,7 +202,10 @@ function ProjectSwitcher({ onNavigate }: { onNavigate?: () => void }) {
         <ProjectMark name={project.name} />
         <span className="flex min-w-0 flex-1 flex-col leading-tight">
           <b className="truncate text-[13px]">{project.name}</b>
-          <span className="truncate text-[11.5px] text-muted-foreground">{organization.name}</span>
+          <span className="truncate text-[11.5px] text-muted-foreground">
+            {organization.name}
+            {organization.role === "member" ? " · read-only" : ""}
+          </span>
         </span>
         <Icon name="chevronUpDown" size={14} className="text-muted-foreground" />
       </DropdownMenuTrigger>

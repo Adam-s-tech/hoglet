@@ -13,6 +13,11 @@ USAGE:
     hoglet reconcile posthog
                             Compare Hoglet's numbers with PostHog's
                             (see `hoglet reconcile posthog --help`)
+    hoglet user list        List accounts, organizations and roles (read-only)
+    hoglet user reset-password --email <email>
+                            Set a new password for an account while the server is
+                            stopped. Reads HOGLET_NEW_PASSWORD, else prompts (or reads
+                            one line from a pipe). Ends that account's sessions.
     hoglet healthcheck      Exit 0 if the local server is ready (for Docker HEALTHCHECK)
     hoglet --version        Print the version
 
@@ -67,6 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("import") => return run_import().await,
         Some("reconcile") => return run_reconcile().await,
+        Some("user") => return run_user(),
         Some("healthcheck") => return healthcheck().await,
         Some("serve") | None => {}
         Some(other) => return Err(format!("unknown command {other:?}; see `hoglet --help`").into()),
@@ -226,6 +232,92 @@ async fn run_reconcile() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `hoglet user list` and `hoglet user reset-password --email <email>`:
+/// offline account recovery against `HOGLET_DATA`.
+fn run_user() -> Result<(), Box<dyn Error>> {
+    // Plain message and exit status 1, not a Debug-printed error.
+    if let Err(error) = user_command() {
+        eprintln!("hoglet user: {error}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn user_command() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("HOGLET_DATA").unwrap_or_else(|_| "hoglet-data".into()),
+    );
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            let users = hoglet::user_admin::list_users(&data_dir)?;
+            for user in users {
+                let organizations = user
+                    .memberships
+                    .iter()
+                    .map(|(name, role)| format!("{name} ({role})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("{}\t{}\t{}", user.email, user.name, organizations);
+            }
+            Ok(())
+        }
+        Some("reset-password") => {
+            let mut email = None;
+            let mut rest = args[1..].iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--email" => email = rest.next().cloned(),
+                    other => return Err(format!("unexpected argument {other:?}; see `hoglet --help`").into()),
+                }
+            }
+            let email = email.ok_or("usage: hoglet user reset-password --email <email>")?;
+            let password = match std::env::var("HOGLET_NEW_PASSWORD") {
+                Ok(password) if !password.is_empty() => password,
+                _ => prompt_new_password()?,
+            };
+            let ended = hoglet::user_admin::reset_password(&data_dir, &email, &password)?;
+            eprintln!(
+                "password changed for {}; {ended} session(s) ended. Start the server and sign in.",
+                email.trim().to_ascii_lowercase()
+            );
+            Ok(())
+        }
+        _ => Err("usage: hoglet user list | hoglet user reset-password --email <email>".into()),
+    }
+}
+
+/// Ask for a password twice on a terminal (echo off), or read one line from a pipe.
+fn prompt_new_password() -> Result<String, Box<dyn Error>> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_owned());
+    }
+    let read = |prompt: &str| -> Result<String, Box<dyn Error>> {
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+        // Echo off through stty (no extra dependency); restored even on error.
+        let off = std::process::Command::new("stty").arg("-echo").status().is_ok_and(|s| s.success());
+        let mut line = String::new();
+        let result = stdin.lock().read_line(&mut line);
+        if off {
+            let _ = std::process::Command::new("stty").arg("echo").status();
+        }
+        eprintln!();
+        result?;
+        Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+    };
+    let first = read("New password (at least 12 characters): ")?;
+    let second = read("Repeat it: ")?;
+    if first != second {
+        return Err("the two passwords differ".into());
+    }
+    Ok(first)
 }
 
 /// Create the demo account and data on a fresh install. Returns whether the

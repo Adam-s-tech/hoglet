@@ -107,10 +107,20 @@ pub fn router(access: Arc<ProjectAccess>) -> Router {
 /// [`router`] with operator security settings (setup token, proxy trust,
 /// cookie policy).
 pub fn router_with(access: Arc<ProjectAccess>, security: SecurityConfig) -> Router {
+    router_with_throttle(access, security, Arc::new(LoginThrottle::default()))
+}
+
+/// [`router_with`] sharing a sign-in throttle with other routes that check
+/// passwords (accepting an invite signs an existing account in).
+pub fn router_with_throttle(
+    access: Arc<ProjectAccess>,
+    security: SecurityConfig,
+    throttle: Arc<LoginThrottle>,
+) -> Router {
     let state = WorkspaceState {
         access,
         security: Arc::new(security),
-        throttle: Arc::new(LoginThrottle::default()),
+        throttle,
     };
     Router::new()
         .route("/api/auth/bootstrap", get(bootstrap))
@@ -494,7 +504,7 @@ fn secure_cookie(state: &WorkspaceState, headers: &HeaderMap) -> bool {
     state.security.secure_cookies || forwarded_https(headers)
 }
 
-fn set_session_cookie(headers: &mut HeaderMap, session_id: &str, secure: bool) {
+pub fn set_session_cookie(headers: &mut HeaderMap, session_id: &str, secure: bool) {
     let secure = if secure { "; Secure" } else { "" };
     let cookie = format!(
         "{SESSION_COOKIE}={session_id}; Max-Age={SESSION_MAX_AGE_SECONDS}; Path=/; HttpOnly; SameSite=Lax{secure}"

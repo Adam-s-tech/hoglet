@@ -86,7 +86,9 @@ Work down this list. Each step tells you which side of the problem you are on.
 | Capture (`/e/`, `/batch/`), `/flags`, `/array/{token}/config` | The token is missing, malformed, or not a project of this Hoglet. A `phx_` personal key is not accepted as a token. A project created a moment ago may need a few seconds: unknown tokens are remembered as unknown for up to 10 seconds. |
 | Dashboard API | No credentials, an expired session (they last 7 days; log in again), a mistyped or revoked key, or a header that is not exactly `Authorization: Bearer phx_...`. |
 | Local evaluation (`/flags/definitions`) | No `Authorization: Bearer phx_...` header, or `token=phc_...` missing or unknown (`401`); the key's user cannot access that project (`403`). |
-| `403` on a write | A `read` key was used for a change, or the user is a `member`. Use a `write` key from an owner or admin. |
+| `403` on a write | A `read` key was used for a change, or the user is a `member` (read-only). Use a `write` key from an owner or admin, or ask an owner to change the role ([Team](team.md)). |
+| "This invite link doesn't work" | Expired (7 days), already used, revoked, or replaced by a newer link. Ask for a new one. |
+| Locked out, no other owner | `hoglet user reset-password --email ...` on the server ([Team](team.md#if-the-owner-is-locked-out)). |
 | `403` on `/api/auth/keys` and similar | Account management needs a session; keys cannot do it. |
 
 ## Ad-blockers

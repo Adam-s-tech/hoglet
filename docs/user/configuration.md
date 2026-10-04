@@ -36,6 +36,9 @@ HOGLET_ADDR=0.0.0.0:8000 HOGLET_DATA=/srv/hoglet HOGLET_RETENTION_DAYS=365 hogle
 hoglet                   start the server (same as `hoglet serve`)
 hoglet import posthog    copy a PostHog project's history into Hoglet
 hoglet reconcile posthog compare Hoglet's numbers with PostHog's
+hoglet user list         list accounts, organizations and roles (read-only)
+hoglet user reset-password --email <email>
+                         set a new password while the server is stopped
 hoglet --version         print the version (also: -V, version)
 hoglet --help            print help (also: -h, help)
 ```
@@ -128,6 +131,18 @@ operators run into.
 | Flags | 2,000 per project, 50 condition groups per flag, 50 variants |
 
 Per-endpoint behavior and status codes: [API](api.md).
+
+## `hoglet user`
+
+Offline account tools; they read `HOGLET_DATA` directly. See [Team](team.md#if-the-owner-is-locked-out).
+
+- `hoglet user list`: one line per account (email, name, organizations with
+  roles). Read-only; fine while the server runs.
+- `hoglet user reset-password --email <email>`: sets a new password (12 to 1024
+  characters) and ends that account's sessions. The password comes from
+  `HOGLET_NEW_PASSWORD`, else a prompt (asked twice, no echo), else one line on
+  stdin. Refuses with a clear message while a server is running on the data
+  directory.
 
 ## `hoglet healthcheck`
 

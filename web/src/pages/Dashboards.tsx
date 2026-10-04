@@ -28,6 +28,7 @@ import { toast } from "@/components/toast";
 import { ChartSkeleton, InsightResultView } from "@/insight/Result";
 import { incomplete, kindInfo, sanitize, summarize, withDateRange } from "@/insight/defaults";
 import { api, errorMessage, type Dashboard, type DashboardTile, type SavedInsight, type TileInput } from "@/lib/api";
+import { Gated } from "@/components/role";
 import { canEdit, projectPath, useApp, usePath, useProjectId } from "@/lib/context";
 import { fmtDate, fmtRelative } from "@/lib/format";
 import { navigate } from "@/lib/nav";
@@ -103,14 +104,14 @@ export function DashboardsPage() {
 
   return (
     <Page>
-      <PageHeader title="Dashboards" sub="Insights side by side, live, on one screen." actions={editable ? newButton("New dashboard") : null} />
+      <PageHeader title="Dashboards" sub="Insights side by side, live, on one screen." actions={<Gated allowed={editable}>{newButton("New dashboard")}</Gated>} />
       <Panel>
         {error && !data ? (
           <ErrorState error={error} retry={() => void refetch()} />
         ) : isPending ? (
           <SkeletonRows rows={4} />
         ) : data && data.length === 0 ? (
-          <Empty icon="dashboard" title="No dashboards yet" action={editable ? newButton("Create a dashboard") : null}>
+          <Empty icon="dashboard" title="No dashboards yet" action={<Gated allowed={editable}>{newButton("Create a dashboard")}</Gated>}>
             Create one, then use “Add to dashboard” on any insight to pin it.
           </Empty>
         ) : (

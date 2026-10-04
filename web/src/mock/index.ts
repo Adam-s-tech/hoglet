@@ -2,7 +2,9 @@
 // contract answers with generated, realistic data and plausible latency.
 //
 // URL switches: ?mock=fresh starts at first-run setup with no events;
-// ?mock=logout starts signed out.
+// ?mock=logout starts signed out; ?mock=member / ?mock=admin sign in with that
+// role (read-only UI, team management without owners). /invite/hgi_demo opens a
+// sample invite.
 
 import type { ActorsRequest } from "../types/ActorsRequest";
 import type { CatalogEvent } from "../types/CatalogEvent";
@@ -10,6 +12,9 @@ import type { EventRow } from "../types/EventRow";
 import type { FeatureFlag } from "../types/FeatureFlag";
 import type { FeatureFlagInput } from "../types/FeatureFlagInput";
 import type { InsightQuery } from "../types/InsightQuery";
+import type { Invite } from "../types/Invite";
+import type { Member } from "../types/Member";
+import type { Role } from "../types/Role";
 import type { PropertyFilter } from "../types/PropertyFilter";
 import type { QueryRequest } from "../types/QueryRequest";
 import type { WebDimension } from "../types/WebDimension";
@@ -27,6 +32,9 @@ const PROJECTS = [
 
 interface State {
   setupDone: boolean;
+  role: Role;
+  members: Member[];
+  invites: (Invite & { token: string })[];
   session: boolean;
   firstEventAt: number;
   user: { id: string; email: string; name: string };
@@ -122,8 +130,21 @@ function seedState(): State {
     flagBase(5, "kill-switch-exports", "Emergency off switch for CSV exports", true, { groups: [{ properties: [], rollout_percentage: 100, variant: null }], multivariate: null, payloads: {} }, 40),
   ];
 
+  const roleParam = params.get("mock");
+  const role: Role = roleParam === "member" || roleParam === "admin" ? roleParam : "owner";
+  const joined = sec() - 86_400 * 30;
   return {
     setupDone: !FRESH,
+    role,
+    members: FRESH
+      ? []
+      : [
+          { user_id: "u0", name: "Priya", email: "priya@acme.example", role: "owner", joined_at: joined - 86_400 * 20 },
+          { user_id: "u1", name: "Dana", email: "demo@hoglet.dev", role: role === "owner" ? "owner" : role, joined_at: joined },
+          { user_id: "u2", name: "Sam", email: "sam@acme.example", role: "admin", joined_at: joined + 86_400 * 4 },
+          { user_id: "u3", name: "Lee", email: "lee@acme.example", role: "member", joined_at: joined + 86_400 * 9 },
+        ],
+    invites: FRESH ? [] : [{ id: "inv_1", email: "kim@acme.example", role: "member", created_by: "u0", created_at: sec() - 86_400, expires_at: sec() + 86_400 * 6, token: "hgi_demo" }],
     session: !FRESH && params.get("mock") !== "logout",
     firstEventAt: FRESH ? Infinity : 0,
     user: { id: "u1", email: "demo@hoglet.dev", name: "Dana" },
@@ -183,7 +204,7 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
 function workspace() {
   return {
     user: state.user,
-    organizations: [{ id: "org_1", name: state.orgName, role: "owner", projects: state.projects }],
+    organizations: [{ id: "org_1", name: state.orgName, role: state.role, projects: state.projects }],
   };
 }
 function hasEvents(): boolean {
@@ -444,6 +465,19 @@ async function handle({ method, url, body, signal }: RawRequest): Promise<RawRes
     return ok({ status: "ok" });
   }
   if (path.startsWith("/api/shares/")) return err(404, "not_found", "The shared resource was not found.");
+  if (path === "/api/invites/preview" || path === "/api/invites/accept") {
+    const b = body as { token: string; name?: string | null; password?: string };
+    const invite = state.invites.find((i) => i.token === b.token);
+    if (!invite) return err(404, "invite_invalid", "This invite link is invalid, expired or already used.");
+    const exists = invite.email.startsWith("existing");
+    if (path.endsWith("/preview")) return ok({ organization_name: state.orgName, email: invite.email, role: invite.role, expires_at: invite.expires_at, account_exists: exists });
+    if (exists ? (b.password ?? "").length < 4 : (b.password ?? "").length < 12) return err(exists ? 401 : 400, exists ? "unauthorized" : "invalid_request", "The password must be at least 12 characters.");
+    state.invites = state.invites.filter((i) => i !== invite);
+    state.session = true;
+    state.role = invite.role;
+    state.user = { id: `u${state.nextId++}`, email: invite.email, name: b.name?.trim() || invite.email };
+    return ok(workspace());
+  }
   if (path === "/capture" && method === "POST") {
     if (state.firstEventAt === Infinity) state.firstEventAt = now() + 1500;
     return ok({ status: 1 });
@@ -468,6 +502,43 @@ async function handle({ method, url, body, signal }: RawRequest): Promise<RawRes
     return ok(null, 204);
   }
   if (path === "/api/organizations") return ok(workspace().organizations);
+  if ((m = /^\/api\/organizations\/[^/]+\/members(?:\/([^/]+))?$/.exec(path))) {
+    const target = state.members.find((x) => x.user_id === m![1]);
+    if (!m[1]) return ok(state.members);
+    if (!target) return err(404, "not_found", "The requested resource was not found.");
+    const owners = state.members.filter((x) => x.role === "owner").length;
+    if (state.role === "member" || (state.role === "admin" && target.role === "owner")) return err(403, "forbidden", "You do not have access to this resource.");
+    if (method === "PATCH") {
+      const role = (body as { role: Role }).role;
+      if (target.role === "owner" && role !== "owner" && owners <= 1) return err(409, "last_owner", "An organization needs at least one owner.");
+      if (state.role === "admin" && role === "owner") return err(403, "forbidden", "You do not have access to this resource.");
+      target.role = role;
+      return ok(target);
+    }
+    if (method === "DELETE") {
+      if (target.role === "owner" && owners <= 1) return err(409, "last_owner", "An organization needs at least one owner.");
+      state.members = state.members.filter((x) => x !== target);
+      return ok(null, 204);
+    }
+  }
+  if ((m = /^\/api\/organizations\/[^/]+\/invites(?:\/([^/]+))?$/.exec(path))) {
+    if (state.role === "member") return err(403, "forbidden", "You do not have access to this resource.");
+    if (method === "GET") return ok(state.invites.map(({ token: _token, ...invite }) => invite));
+    if (method === "DELETE") {
+      state.invites = state.invites.filter((i) => i.id !== m![1]);
+      return ok(null, 204);
+    }
+    const b = body as { email: string; role: Role };
+    if (!/^\S+@\S+\.\S+$/.test(b.email)) return err(400, "invalid_request", "Enter a valid email address.");
+    if (state.members.some((x) => x.email === b.email.toLowerCase())) return err(409, "already_member", "This person is already a member of the organization.");
+    if (state.role === "admin" && b.role === "owner") return err(403, "forbidden", "You do not have access to this resource.");
+    state.invites = state.invites.filter((i) => i.email !== b.email.toLowerCase());
+    const token = `hgi_${Array.from({ length: 64 }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("")}`;
+    const invite = { id: `inv_${state.nextId++}`, email: b.email.trim().toLowerCase(), role: b.role, created_by: "u1", created_at: sec(), expires_at: sec() + 7 * 86_400, token };
+    state.invites.push(invite);
+    const { token: _t, ...listed } = invite;
+    return ok({ invite: listed, token, path: `/invite/${token}` }, 201);
+  }
   if ((m = /^\/api\/organizations\/[^/]+\/projects$/.exec(path)) && method === "POST") {
     const p = { id: `0190f3a2-7c1e-7d4a-9b11-${String(state.nextId++).padStart(12, "0")}`, name: (body as { name: string }).name, token: `phc_${Math.random().toString(36).slice(2, 14)}` };
     state.projects = [...state.projects, p];

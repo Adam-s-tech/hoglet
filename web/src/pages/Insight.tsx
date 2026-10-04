@@ -10,6 +10,7 @@ import type { ChartDisplay } from "@/types/ChartDisplay";
 import type { InsightQuery } from "@/types/InsightQuery";
 import type { Interval } from "@/types/Interval";
 import { api, errorMessage, type SavedInsight, type ShareLink } from "@/lib/api";
+import { Gated } from "@/components/role";
 import { canEdit, useApp, usePath, useProjectId } from "@/lib/context";
 import { autoInterval, fmtNumber, fmtRelative } from "@/lib/format";
 import { navigate as go } from "@/lib/nav";
@@ -495,10 +496,12 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
         actions={
           <>
             <AddToDashboard ensureSaved={async () => (id && !dirty && saved.data ? saved.data : save())} />
-            {id && saved.data && editable && (
-              <Button variant="outline" onClick={() => setSharing(true)}>
-                <Icon name="share" size={14} /> Share
-              </Button>
+            {id && saved.data && (
+              <Gated allowed={editable}>
+                <Button variant="outline" onClick={() => setSharing(true)}>
+                  <Icon name="share" size={14} /> Share
+                </Button>
+              </Gated>
             )}
             {id && (
               <DropdownMenu>
@@ -525,9 +528,11 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
-            <Button onClick={() => void save()} disabled={saveMutation.isPending || (!dirty && !!id)} title="Save (Ctrl+S)" aria-keyshortcuts="Control+S Meta+S">
-              <Icon name="save" size={14} /> {saveMutation.isPending ? "Saving…" : id ? "Save" : "Save insight"}
-            </Button>
+            <Gated allowed={editable}>
+              <Button onClick={() => void save()} disabled={saveMutation.isPending || (!dirty && !!id)} title="Save (Ctrl+S)" aria-keyshortcuts="Control+S Meta+S">
+                <Icon name="save" size={14} /> {saveMutation.isPending ? "Saving…" : id ? "Save" : "Save insight"}
+              </Button>
+            </Gated>
           </>
         }
       />

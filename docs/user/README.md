@@ -15,6 +15,7 @@ Then, as needed:
 - [Data and backup](data-and-backup.md): what is on disk, backup, restore, retention, erasure, querying Parquet.
 - [Configuration](configuration.md): every environment variable and CLI command.
 - [Insights and queries](insights-and-queries.md): what each insight computes, the SQL tab.
+- [Team](team.md): roles, invite links, removing people, recovering a locked-out owner.
 - [Feature flags](feature-flags.md): model, evaluation, local evaluation.
 - [API](api.md): authentication, scopes, errors, response codes.
 - [FAQ](faq.md) and [troubleshooting](troubleshooting.md).

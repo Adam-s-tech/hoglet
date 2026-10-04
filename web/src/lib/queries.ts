@@ -61,6 +61,9 @@ export const qk = {
   web: (pid: string) => ["p", pid, "web"] as const,
   catalog: (pid: string) => ["p", pid, "catalog"] as const,
   keys: ["keys"] as const,
+  members: (oid: string) => ["org", oid, "members"] as const,
+  invites: (oid: string) => ["org", oid, "invites"] as const,
+  invite: (token: string) => ["invite", token] as const,
   share: (token: string) => ["share", token] as const,
 };
 
@@ -108,6 +111,12 @@ export const flagQuery = (pid: string, id: number) =>
   queryOptions({ queryKey: qk.flag(pid, id), queryFn: ({ signal }) => api.flag(pid, id, signal) });
 
 export const keysQuery = queryOptions({ queryKey: qk.keys, queryFn: ({ signal }) => api.listKeys(signal) });
+
+export const membersQuery = (oid: string) => queryOptions({ queryKey: qk.members(oid), queryFn: ({ signal }) => api.members(oid, signal) });
+export const invitesQuery = (oid: string) => queryOptions({ queryKey: qk.invites(oid), queryFn: ({ signal }) => api.invites(oid, signal) });
+/** An invite link is a capability token: resolved without a session, never retried (a miss is final). */
+export const invitePreviewQuery = (token: string) =>
+  queryOptions({ queryKey: qk.invite(token), queryFn: ({ signal }) => api.previewInvite(token, signal), retry: false, staleTime: Infinity });
 
 /** Public share links are capability tokens, resolved without a session. */
 export const publicShareQuery = (token: string) =>
