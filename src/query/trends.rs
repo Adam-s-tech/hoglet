@@ -242,12 +242,25 @@ fn compute(
             (Some(text), Some(top)) => mapped_breakdown(text, top, &mut params),
             _ => "NULL::VARCHAR".to_owned(),
         };
+        // A person active at granule `g` counts for every window whose end
+        // `we` lies in (g, g + days]. Each person's coverage is merged into
+        // disjoint islands, so counting islands per window counts distinct
+        // persons without a DISTINCT over (person × window) rows.
+        let span = days * DAY_US;
         let sql = format!(
             "WITH ev AS ({relation}), \
-             pairs AS (SELECT DISTINCT person_id, {} AS g, {bd} AS bd FROM ev WHERE {pred}) \
-             SELECT w.b, p.bd, count(DISTINCT p.person_id)::DOUBLE \
-             FROM trend_windows w JOIN pairs p ON p.g >= w.ws AND p.g < w.we \
-             GROUP BY w.b, p.bd",
+             pairs AS (SELECT DISTINCT person_id, {} AS g, {bd} AS bd FROM ev WHERE {pred}), \
+             marked AS (SELECT person_id, bd, g, \
+                 CASE WHEN g > max(g) OVER (PARTITION BY person_id, bd ORDER BY g \
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) + {span} \
+                 THEN 1 ELSE 0 END AS starts FROM pairs), \
+             numbered AS (SELECT person_id, bd, g, sum(starts) OVER (PARTITION BY person_id, bd \
+                 ORDER BY g ROWS UNBOUNDED PRECEDING) AS island FROM marked), \
+             islands AS (SELECT bd, min(g) AS s, max(g) + {span} AS e \
+                 FROM numbered GROUP BY person_id, bd, island) \
+             SELECT w.b, i.bd, count(*)::DOUBLE \
+             FROM trend_windows w JOIN islands i ON w.we > i.s AND w.we <= i.e \
+             GROUP BY w.b, i.bd",
             bucket_expr(granule(period.interval), "ts")
         );
         rows = ctx.rows(&sql, &params, |row| {

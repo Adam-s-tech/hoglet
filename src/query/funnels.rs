@@ -251,6 +251,26 @@ fn analyze(
         .map(|text| format!(", {text} AS bd"))
         .unwrap_or_default();
     let bd_select = if breakdown.is_some() { ", bd" } else { "" };
+    // Only step and exclusion events matter unless order is strict (where
+    // any event in between breaks a sequence) or a step matches all events.
+    // Saying so explicitly lets DuckDB skip row groups: files are sorted by
+    // (event, timestamp).
+    let event_prefilter = if q.funnel_order != FunnelOrder::Strict
+        && q.series.iter().all(|node| node.event.is_some())
+    {
+        let names: Vec<String> = q
+            .series
+            .iter()
+            .filter_map(|node| node.event.as_deref())
+            .chain(q.exclusions.iter().map(|exclusion| exclusion.event.as_str()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|name| params.text(name))
+            .collect();
+        format!("event IN ({})", names.join(", "))
+    } else {
+        "TRUE".to_owned()
+    };
     let keep = if q.funnel_order == FunnelOrder::Strict {
         "TRUE"
     } else {
@@ -295,7 +315,7 @@ fn analyze(
         let sql = format!(
             "WITH ev AS ({relation}), \
              x AS (SELECT person_id, ts, uuid, ({mask_sql})::BIGINT AS mask{bd_column} FROM ev \
-                   WHERE {}) \
+                   WHERE {} AND {event_prefilter}) \
              SELECT person_id, ts, mask{bd_select} FROM x WHERE {keep} \
              ORDER BY person_id, ts, uuid",
             super::partition_clause(partition, partitions)
