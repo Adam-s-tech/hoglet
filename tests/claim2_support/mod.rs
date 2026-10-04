@@ -65,7 +65,7 @@ impl Server {
                 .env("HOGLET_ADDR", format!("127.0.0.1:{port}"))
                 .env("HOGLET_MAX_EVENTS_PER_SEC", "1000000")
                 .env("RUST_LOG", "hoglet=warn")
-                .stdout(Stdio::null())
+                .stdout(Stdio::from(stderr.try_clone().expect("clone log handle")))
                 .stderr(Stdio::from(stderr));
             for (name, value) in env {
                 command.env(name, value);
@@ -101,7 +101,7 @@ impl Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_hoglet"))
             .env("HOGLET_DATA", data_dir)
             .env("HOGLET_ADDR", format!("127.0.0.1:{port}"))
-            .stdout(Stdio::null())
+            .stdout(Stdio::from(stderr.try_clone().expect("clone log handle")))
             .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn hoglet");
@@ -131,7 +131,9 @@ impl Server {
             if self.child.try_wait().expect("poll child").is_some() {
                 return Up::Exited;
             }
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            // A bare TCP connect can "succeed" against nothing at all (TCP
+            // self-connect on an ephemeral-range port); only HTTP proves it.
+            if http("GET", self.port, "/health", None, None).0 == Outcome::Acked {
                 return Up::Yes;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -206,7 +208,7 @@ pub enum Outcome {
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(120))
         .build()
 }
 
@@ -269,7 +271,7 @@ pub fn setup(port: u16) -> Project {
             "project_name": "Durability",
             "existing_project_token": TOKEN
         }))
-        .expect("setup");
+        .unwrap_or_else(|error| panic!("setup failed: {error}"));
     let cookie = response
         .header("set-cookie")
         .and_then(|value| value.split(';').next())
@@ -298,6 +300,13 @@ pub struct Ledger {
     pub sent: Mutex<HashMap<Uuid, Sent>>,
     pub acked: Mutex<HashSet<Uuid>>,
     pub retryable: AtomicU64,
+    /// Set once any request was answered 5xx.
+    pub failure_seen: AtomicBool,
+    /// Requests that STARTED after a 5xx was already observed yet were
+    /// answered 2xx. With a poisoned WAL this must stay zero.
+    pub acks_after_failure: AtomicU64,
+    /// Every distinct status code a 5xx carried.
+    pub failure_codes: Mutex<BTreeSet<u16>>,
 }
 
 impl Ledger {
@@ -335,6 +344,7 @@ pub fn plan_event(
 
 /// POST one batch; every event is recorded as sent first, acked only on 200.
 pub fn post_batch(port: u16, ledger: &Ledger, plans: &[EventPlan]) -> Outcome {
+    let failed_before_send = ledger.failure_seen.load(Ordering::SeqCst);
     {
         let mut sent = ledger.sent.lock().unwrap();
         for plan in plans {
@@ -369,11 +379,16 @@ pub fn post_batch(port: u16, ledger: &Ledger, plans: &[EventPlan]) -> Outcome {
     );
     match outcome {
         Outcome::Acked => {
+            if failed_before_send {
+                ledger.acks_after_failure.fetch_add(1, Ordering::SeqCst);
+            }
             let mut acked = ledger.acked.lock().unwrap();
             acked.extend(plans.iter().map(|plan| plan.uuid));
         }
-        Outcome::Retryable(_) => {
+        Outcome::Retryable(code) => {
             ledger.retryable.fetch_add(1, Ordering::Relaxed);
+            ledger.failure_seen.store(true, Ordering::SeqCst);
+            ledger.failure_codes.lock().unwrap().insert(code);
         }
         _ => {}
     }

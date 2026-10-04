@@ -505,12 +505,14 @@ impl WalReader {
 
     /// Bytes held by sealed segments that are not yet reclaimed.
     pub fn sealed_bytes(&self) -> Result<u64, WalError> {
-        let layout = discover_segment_layout(&self.directory)?;
-        let mut bytes = 0_u64;
-        for (_, path) in layout.sealed {
-            bytes = bytes.saturating_add(std::fs::metadata(&path)?.len());
-        }
-        Ok(bytes)
+        retry_layout_race(|| {
+            let layout = discover_segment_layout(&self.directory)?;
+            let mut bytes = 0_u64;
+            for (_, path) in layout.sealed {
+                bytes = bytes.saturating_add(std::fs::metadata(&path)?.len());
+            }
+            Ok(bytes)
+        })
     }
 }
 
@@ -535,6 +537,14 @@ pub struct SealedRecords {
 
 impl SealedRecords {
     fn open(
+        directory: &Path,
+        cursor: WalCursor,
+        max_record_bytes: usize,
+    ) -> Result<Self, WalError> {
+        retry_layout_race(|| Self::open_once(directory, cursor, max_record_bytes))
+    }
+
+    fn open_once(
         directory: &Path,
         cursor: WalCursor,
         max_record_bytes: usize,
@@ -710,6 +720,14 @@ impl Iterator for PublicationWindow {
 }
 
 fn reclaim_through(
+    directory: &Path,
+    config: WalConfig,
+    checkpoint: WalCursor,
+) -> Result<Vec<u64>, WalError> {
+    retry_layout_race(|| reclaim_through_once(directory, config, checkpoint))
+}
+
+fn reclaim_through_once(
     directory: &Path,
     config: WalConfig,
     checkpoint: WalCursor,
@@ -935,13 +953,48 @@ impl SegmentLayout {
     }
 }
 
+/// How often a reader retries after losing a race with the writer.
+const LAYOUT_RACE_ATTEMPTS: usize = 50;
+
+/// The publisher reads the directory while the writer renames a full segment
+/// to `.wal` and creates the next `.open`. A listing, or a file opened from a
+/// listing, can then show a gap, two "newest" segments, or a vanished file —
+/// all gone a millisecond later. Such a result is a race, not corruption: try
+/// again, and only report it if it persists (a real gap or a real
+/// double-active segment never goes away).
+fn is_layout_race(error: &WalError) -> bool {
+    match error {
+        WalError::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+        WalError::Corruption { reason, .. } => matches!(
+            *reason,
+            "missing WAL segment before this sequence"
+                | "active segment is not newest"
+                | "duplicate segment sequence"
+                | "multiple active segments"
+                | "cursor segment does not exist"
+        ),
+        _ => false,
+    }
+}
+
+fn retry_layout_race<T>(mut attempt: impl FnMut() -> Result<T, WalError>) -> Result<T, WalError> {
+    for _ in 1..LAYOUT_RACE_ATTEMPTS {
+        match attempt() {
+            Err(error) if is_layout_race(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            other => return other,
+        }
+    }
+    attempt()
+}
+
 /// Discover the complete WAL layout and reject any ambiguity before a caller
 /// reads, repairs, or removes a segment. The first sequence may be greater
 /// than one after prefix reclamation; every sequence after it must be exactly
 /// contiguous.
 fn discover_segment_layout(directory: &Path) -> Result<SegmentLayout, WalError> {
-    let sealed = list_segments(directory, SEALED_SUFFIX)?;
-    let active_segments = list_segments(directory, OPEN_SUFFIX)?;
+    let (sealed, active_segments) = list_segments(directory)?;
     if active_segments.len() > 1 {
         return Err(corruption(0, 0, "multiple active segments"));
     }
@@ -1143,11 +1196,24 @@ fn sealed_path(directory: &Path, sequence: u64) -> PathBuf {
     directory.join(format!("{sequence:016}{SEALED_SUFFIX}"))
 }
 
-fn list_segments(directory: &Path, suffix: &str) -> Result<Vec<(u64, PathBuf)>, WalError> {
-    let mut segments = Vec::new();
+/// Sealed and active segments from ONE pass over the directory: two passes
+/// would let any number of seals happen between them.
+#[allow(clippy::type_complexity)]
+fn list_segments(
+    directory: &Path,
+) -> Result<(Vec<(u64, PathBuf)>, Vec<(u64, PathBuf)>), WalError> {
+    let mut sealed = Vec::new();
+    let mut open = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let (suffix, into) = if name.ends_with(SEALED_SUFFIX) {
+            (SEALED_SUFFIX, &mut sealed)
+        } else if name.ends_with(OPEN_SUFFIX) {
+            (OPEN_SUFFIX, &mut open)
+        } else {
             continue;
         };
         let Some(sequence) = name
@@ -1157,8 +1223,9 @@ fn list_segments(directory: &Path, suffix: &str) -> Result<Vec<(u64, PathBuf)>, 
         else {
             continue;
         };
-        segments.push((sequence, path));
+        into.push((sequence, path));
     }
-    segments.sort_by_key(|(sequence, _)| *sequence);
-    Ok(segments)
+    sealed.sort_by_key(|(sequence, _)| *sequence);
+    open.sort_by_key(|(sequence, _)| *sequence);
+    Ok((sealed, open))
 }

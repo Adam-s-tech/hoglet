@@ -49,3 +49,68 @@ fn checkpoint_taken_between_segment_seal_and_next_segment_creation_stays_valid()
         .read_window(checkpoint, 1 << 20)
         .unwrap_or_else(|error| panic!("checkpoint {checkpoint:?} is unusable: {error}"));
 }
+
+/// The real thing: a writer sealing a tiny segment on nearly every append
+/// while a publisher thread walks the log the way `Publisher` does (read a
+/// window, move the checkpoint, reclaim). Every record must be seen exactly
+/// once, in order, and no step may fail — least of all with a bogus
+/// "corruption" report on a healthy log.
+#[test]
+fn a_publisher_walking_the_wal_while_the_writer_seals_never_errors_and_sees_every_record_once() {
+    const RECORDS: u128 = 3_000;
+    let dir = tempfile::tempdir().unwrap();
+    let config = WalConfig::new(150, 1 << 20).unwrap();
+    let (mut wal, _) = WriteAheadLog::open(dir.path(), config).unwrap();
+    let reader = wal.reader();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_writer = done.clone();
+
+    let writer = std::thread::spawn(move || {
+        for sequence in 1..=RECORDS {
+            wal.append(batch(sequence)).unwrap();
+        }
+        wal.seal().unwrap();
+        done_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+        wal
+    });
+
+    let mut checkpoint = WalCursor::origin();
+    let mut seen: Vec<u128> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    loop {
+        let finished = done.load(std::sync::atomic::Ordering::SeqCst);
+        match reader.read_window(checkpoint, 1 << 20) {
+            Ok(mut window) => {
+                let mut failed = false;
+                for record in window.by_ref() {
+                    match record {
+                        Ok(record) => seen.push(record.batch.events[0].uuid.as_u128()),
+                        Err(error) => {
+                            errors.push(format!("reading: {error}"));
+                            failed = true;
+                        }
+                    }
+                }
+                if !failed {
+                    checkpoint = window.next_cursor();
+                    if let Err(error) = reader.reclaim_through(checkpoint) {
+                        errors.push(format!("reclaiming through {checkpoint:?}: {error}"));
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("opening a window at {checkpoint:?}: {error}")),
+        }
+        if finished && seen.len() as u128 >= RECORDS {
+            break;
+        }
+        assert!(errors.len() < 50, "too many errors: {errors:?}");
+    }
+    let _wal = writer.join().unwrap();
+    assert!(
+        errors.is_empty(),
+        "publisher steps failed on a healthy log: {:?}",
+        &errors[..errors.len().min(5)]
+    );
+    let expected: Vec<u128> = (1..=RECORDS).collect();
+    assert_eq!(seen, expected, "every record exactly once, in order");
+}
