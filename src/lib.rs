@@ -10,6 +10,7 @@ pub mod capture;
 pub mod contract;
 pub mod control;
 pub mod control_resources;
+pub mod demo;
 pub mod enrichment;
 pub mod event_lake;
 pub mod flags;

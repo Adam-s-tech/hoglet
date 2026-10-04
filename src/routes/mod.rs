@@ -1,7 +1,9 @@
 pub mod catalog_v2;
 pub mod config;
 pub mod dashboard;
+pub mod demo;
 pub mod docs;
+pub mod erasure;
 pub mod flags;
 pub mod health;
 pub mod metrics;

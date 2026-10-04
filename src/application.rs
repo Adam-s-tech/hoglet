@@ -143,6 +143,7 @@ pub struct Application {
     lake: Arc<Lake>,
     persons: Arc<PersonStore>,
     access: Arc<ProjectAccess>,
+    sink: Arc<dyn crate::sink::EventSink>,
 }
 
 impl fmt::Debug for Application {
@@ -206,8 +207,9 @@ impl Application {
         let authorizer: Arc<dyn CaptureAuthorizer> = Arc::new(
             ProjectAccessCaptureAuthorizer::new(access.as_ref().clone()),
         );
+        let sink: Arc<dyn crate::sink::EventSink> = durable_sink;
         let capture = CaptureState {
-            sink: durable_sink,
+            sink: sink.clone(),
             authorizer: authorizer.clone(),
             limiter: Arc::new(crate::ratelimit::RateLimiter::new(
                 config.max_events_per_second,
@@ -239,6 +241,11 @@ impl Application {
                 lake.clone(),
                 wal_runtime.stats(),
             ))
+            .merge(crate::routes::demo::router(access.clone(), sink.clone()))
+            .merge(crate::routes::erasure::router(
+                access.clone(),
+                wal_runtime.eraser(),
+            ))
             .merge(crate::routes::resources::router(access.clone(), resources));
 
         Ok(Self {
@@ -249,7 +256,13 @@ impl Application {
             lake,
             persons,
             access,
+            sink,
         })
+    }
+
+    /// The durable capture sink: what `/e` and `/batch` append to.
+    pub fn sink(&self) -> Arc<dyn crate::sink::EventSink> {
+        self.sink.clone()
     }
 
     pub fn lake(&self) -> Arc<Lake> {

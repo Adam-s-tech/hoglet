@@ -233,6 +233,13 @@ enum WriterRequest {
         _queue_bytes: OwnedSemaphorePermit,
         ack: oneshot::Sender<Result<(), SinkError>>,
     },
+    /// Seal, then hand the erasure to the publisher so it covers every
+    /// event acknowledged before it.
+    Erase {
+        project_id: String,
+        person_id: String,
+        ack: oneshot::Sender<Result<ErasureReport, DurablePipelineError>>,
+    },
     Shutdown {
         ack: oneshot::Sender<Result<(), DurablePipelineError>>,
     },
@@ -240,9 +247,21 @@ enum WriterRequest {
 
 enum PublisherSignal {
     Sealed,
+    Erase {
+        project_id: String,
+        person_id: String,
+        ack: oneshot::Sender<Result<ErasureReport, DurablePipelineError>>,
+    },
     Shutdown {
         ack: std::sync::mpsc::SyncSender<Result<(), DurablePipelineError>>,
     },
+}
+
+/// What a person erasure removed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ErasureReport {
+    pub distinct_ids: usize,
+    pub events: u64,
 }
 
 /// The production capture adapter.
@@ -253,6 +272,7 @@ pub struct DurableWalSink {
 
 pub struct DurableWalRuntime {
     sender: sync_mpsc::SyncSender<WriterRequest>,
+    publisher_signals: sync_mpsc::SyncSender<PublisherSignal>,
     writer: Option<std::thread::JoinHandle<()>>,
     publisher: Option<std::thread::JoinHandle<()>>,
     stats: Arc<PipelineStats>,
@@ -292,6 +312,7 @@ impl DurableWalSink {
         );
 
         let (signal_tx, signal_rx) = sync_mpsc::sync_channel(64);
+        let publisher_signals = signal_tx.clone();
         let publisher_stats = stats.clone();
         let publisher_thread = std::thread::Builder::new()
             .name("hoglet-publisher".to_owned())
@@ -318,6 +339,7 @@ impl DurableWalSink {
             }),
             DurableWalRuntime {
                 sender,
+                publisher_signals,
                 writer: Some(writer_thread),
                 publisher: Some(publisher_thread),
                 stats,
@@ -370,6 +392,13 @@ impl DurableWalRuntime {
         self.stats.clone()
     }
 
+    /// A cloneable handle for erasure requests.
+    pub fn eraser(&self) -> Eraser {
+        Eraser {
+            writer: self.sender.clone(),
+        }
+    }
+
     /// Stop accepting, flush and fsync, publish everything, then stop.
     pub async fn shutdown(mut self) -> Result<(), DurablePipelineError> {
         let (ack, receive) = oneshot::channel();
@@ -392,6 +421,35 @@ impl DurableWalRuntime {
             }
         }
         result
+    }
+}
+
+/// Requests physical erasure of a person, serialized with publication and
+/// compaction on the publisher thread.
+#[derive(Clone)]
+pub struct Eraser {
+    writer: sync_mpsc::SyncSender<WriterRequest>,
+}
+
+impl Eraser {
+    /// Publish everything acknowledged so far, then remove the person, their
+    /// distinct ids, and every stored event of those distinct ids.
+    pub async fn erase_person(
+        &self,
+        project_id: &str,
+        person_id: &str,
+    ) -> Result<ErasureReport, DurablePipelineError> {
+        let (ack, receive) = oneshot::channel();
+        self.writer
+            .try_send(WriterRequest::Erase {
+                project_id: project_id.to_owned(),
+                person_id: person_id.to_owned(),
+                ack,
+            })
+            .map_err(|_| DurablePipelineError::WorkerPanicked)?;
+        receive
+            .await
+            .unwrap_or(Err(DurablePipelineError::WorkerPanicked))
     }
 }
 
@@ -420,6 +478,7 @@ fn writer_loop(
         };
 
         let mut group: Vec<Pending> = Vec::new();
+        let mut erasures = Vec::new();
         let mut group_bytes = 0_u64;
         let mut next = first;
         while let Some(request) = next.take() {
@@ -450,6 +509,13 @@ fn writer_loop(
                         _queue_bytes,
                     });
                 }
+                WriterRequest::Erase {
+                    project_id,
+                    person_id,
+                    ack,
+                } => {
+                    erasures.push((project_id, person_id, ack));
+                }
                 WriterRequest::Shutdown { ack } => {
                     shutdown_ack = Some(ack);
                     break;
@@ -479,7 +545,7 @@ fn writer_loop(
         if shutdown_ack.is_some() {
             break;
         }
-        if last_seal.elapsed() >= SEAL_INTERVAL {
+        if !erasures.is_empty() || last_seal.elapsed() >= SEAL_INTERVAL {
             last_seal = Instant::now();
             if wal.active_bytes() > 0 {
                 let before = wal.active_bytes();
@@ -492,6 +558,18 @@ fn writer_loop(
                     }
                     Err(error) => tracing::error!(%error, "sealing the WAL segment failed"),
                 }
+            }
+        }
+        for (project_id, person_id, ack) in erasures {
+            if let Err(sync_mpsc::TrySendError::Full(PublisherSignal::Erase { ack, .. })
+            | sync_mpsc::TrySendError::Disconnected(PublisherSignal::Erase { ack, .. })) =
+                publisher.try_send(PublisherSignal::Erase {
+                    project_id,
+                    person_id,
+                    ack,
+                })
+            {
+                let _ = ack.send(Err(DurablePipelineError::WorkerPanicked));
             }
         }
     }
@@ -527,6 +605,16 @@ fn publisher_loop(
     loop {
         let shutdown = match signals.recv_timeout(PUBLISHER_TICK) {
             Ok(PublisherSignal::Sealed) | Err(sync_mpsc::RecvTimeoutError::Timeout) => None,
+            Ok(PublisherSignal::Erase {
+                project_id,
+                person_id,
+                ack,
+            }) => {
+                let result = publish_and_account(&publisher, &stats)
+                    .and_then(|()| erase(&publisher, &compactor, &project_id, &person_id));
+                let _ = ack.send(result);
+                continue;
+            }
             Ok(PublisherSignal::Shutdown { ack }) => Some(ack),
             Err(sync_mpsc::RecvTimeoutError::Disconnected) => return,
         };
@@ -564,6 +652,36 @@ fn publisher_loop(
             publisher.lake().sweep_graveyard();
         }
     }
+}
+
+fn erase(
+    publisher: &Publisher,
+    compactor: &Compactor,
+    project_id: &str,
+    person_id: &str,
+) -> Result<ErasureReport, DurablePipelineError> {
+    let distinct_ids = {
+        let mut connection = publisher.lake().lock_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| DurablePipelineError::Lake(error.into()))?;
+        let ids = crate::projections::erase_person(&transaction, project_id, person_id)
+            .map_err(|error| DurablePipelineError::Publish(error.into()))?;
+        transaction
+            .commit()
+            .map_err(|error| DurablePipelineError::Lake(error.into()))?;
+        ids
+    };
+    let events = compactor.erase(project_id, &distinct_ids)?;
+    tracing::info!(
+        distinct_ids = distinct_ids.len(),
+        events,
+        "erased a person and their events"
+    );
+    Ok(ErasureReport {
+        distinct_ids: distinct_ids.len(),
+        events,
+    })
 }
 
 fn publish_and_account(

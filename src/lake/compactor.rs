@@ -195,6 +195,116 @@ impl Compactor {
     }
 }
 
+impl Compactor {
+    /// Physically remove every event of `distinct_ids` from a project's
+    /// files. Each affected partition is rewritten without them and swapped
+    /// in as a new generation; the old files are retired like compaction
+    /// inputs. Returns the number of events removed.
+    pub fn erase(&self, project_id: &str, distinct_ids: &[String]) -> Result<u64, LakeError> {
+        if distinct_ids.is_empty() {
+            return Ok(0);
+        }
+        let ids = distinct_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut removed = 0_u64;
+        for partition in self
+            .lake
+            .partitions()
+            .into_iter()
+            .filter(|partition| partition.project_id == project_id)
+        {
+            let sources = partition
+                .files
+                .iter()
+                .map(|file| sql_string(&file.path))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let matching: i64 = self
+                .duck
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM read_parquet([{sources}], union_by_name = true)
+                         WHERE distinct_id IN ({ids})"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(duck_error)?;
+            if matching == 0 {
+                continue;
+            }
+            let dir = self.lake.partition_dir(project_id, partition.day)?;
+            let generation = self.lake.generation() + 1;
+            let path = dir.join(format!("e{generation:012}.parquet"));
+            let temporary = path.with_extension("parquet.tmp");
+            let kept = self
+                .duck
+                .execute(
+                    &format!(
+                        "COPY (
+                            SELECT * FROM read_parquet([{sources}], union_by_name = true)
+                            WHERE distinct_id NOT IN ({ids})
+                            QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1
+                            ORDER BY event, timestamp
+                         ) TO {} (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880)",
+                        sql_string(&temporary)
+                    ),
+                    [],
+                )
+                .map_err(duck_error)? as u64;
+            let file = std::fs::File::open(&temporary).map_err(super::io_error(&temporary))?;
+            file.sync_all().map_err(super::io_error(&temporary))?;
+            let bytes = file.metadata().map_err(super::io_error(&temporary))?.len();
+            std::fs::rename(&temporary, &path).map_err(super::io_error(&path))?;
+            sync_dir(&dir)?;
+
+            let retired: HashSet<i64> = partition.files.iter().map(|file| file.id).collect();
+            let now = Utc::now().timestamp();
+            let mut connection = self.lake.lock_connection()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state = read_state(&transaction)?;
+            if state.generation + 1 != generation {
+                return Err(LakeError::Corrupt(
+                    "lake generation moved during erasure".to_owned(),
+                ));
+            }
+            let added = (kept > 0)
+                .then(|| {
+                    insert_file(
+                        &transaction,
+                        &self.lake,
+                        NewFile {
+                            project_id,
+                            day: partition.day,
+                            path: &path,
+                            rows: kept,
+                            bytes,
+                            level: 1,
+                        },
+                        generation,
+                        now,
+                    )
+                })
+                .transpose()?;
+            retire(&transaction, &retired, generation)?;
+            advance_state(&transaction, &state, None, now)?;
+            transaction.commit()?;
+            drop(connection);
+            if added.is_none() {
+                let _ = std::fs::remove_file(&path);
+            }
+            self.lake
+                .activate(generation, added.into_iter().collect(), &retired);
+            removed += matching as u64;
+        }
+        Ok(removed)
+    }
+}
+
 /// Files of one partition worth merging now, bounded.
 fn merge_inputs(partition: &Partition, today: NaiveDate) -> Vec<Arc<LakeFile>> {
     let mut small: Vec<Arc<LakeFile>> = partition

@@ -375,3 +375,50 @@ fn identify_publishes_an_identity_override() {
 fn fixed_time() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap()
 }
+
+#[tokio::test]
+async fn erasure_physically_removes_a_person_and_all_their_events() {
+    let fixture = Fixture::new();
+    let lake = fixture.lake();
+    let (sink, runtime, _) = DurableWalSink::open(fixture.config(), lake.clone()).unwrap();
+    let mut identify = Map::new();
+    identify.insert("$anon_distinct_id".into(), json!("anon-9"));
+    identify.insert("$set".into(), json!({"email": "erase-me@example.com"}));
+    sink.append(fixture.batch(vec![
+        event("$pageview", "anon-9", 50),
+        event("$pageview", "anon-9", 2),
+        event_with("$identify", "user-9", 1, identify),
+        event("purchase", "user-9", 1),
+        event("$pageview", "someone-else", 1),
+    ]))
+    .await
+    .unwrap();
+
+    let persons = PersonStore::open(&fixture.paths().projections()).unwrap();
+    let epoch_before = persons.overrides_since(0).unwrap().epoch;
+    let report = runtime
+        .eraser()
+        .erase_person(&fixture.project_id, "user-9")
+        .await
+        .expect("erasure succeeds");
+    assert_eq!(report.distinct_ids, 2);
+    assert_eq!(report.events, 4);
+
+    let rows = stored_rows(&lake, &fixture.project_id);
+    assert_eq!(rows.len(), 1, "only the other person's event remains");
+    assert!(persons
+        .person_for_distinct_id(&fixture.project_id, "anon-9")
+        .unwrap()
+        .is_none());
+    assert!(persons
+        .person_for_distinct_id(&fixture.project_id, "user-9")
+        .unwrap()
+        .is_none());
+    assert_ne!(persons.overrides_since(0).unwrap().epoch, epoch_before);
+
+    // No file on disk still holds the erased ids once leases are gone.
+    lake.sweep_graveyard();
+    runtime.shutdown().await.unwrap();
+    let reopened = fixture.lake();
+    assert_eq!(stored_rows(&reopened, &fixture.project_id).len(), 1);
+}

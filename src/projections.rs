@@ -469,6 +469,33 @@ fn apply_person_properties(
     Ok(())
 }
 
+/// Remove a person and every distinct id that resolves to them (GDPR
+/// erasure). Returns the removed distinct ids. Bumps the identity epoch so
+/// every reader of identity overrides reloads from scratch.
+pub fn erase_person(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    person_id: &str,
+) -> Result<Vec<String>, ProjectionError> {
+    let distinct_ids: Vec<String> = transaction
+        .prepare("SELECT distinct_id FROM distinct_ids WHERE project_id = ?1 AND person_id = ?2")?
+        .query_map(params![project_id, person_id], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    transaction.execute(
+        "DELETE FROM distinct_ids WHERE project_id = ?1 AND person_id = ?2",
+        params![project_id, person_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM persons WHERE project_id = ?1 AND id = ?2",
+        params![project_id, person_id],
+    )?;
+    transaction.execute(
+        "UPDATE identity_state SET epoch = epoch + 1, seq = seq + 1 WHERE singleton = 1",
+        [],
+    )?;
+    Ok(distinct_ids)
+}
+
 fn decode_properties(encoded: &str) -> Result<Map<String, Value>, ProjectionError> {
     let decoded: Value = serde_json::from_str(encoded)?;
     decoded
