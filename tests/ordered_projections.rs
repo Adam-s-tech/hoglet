@@ -1,7 +1,7 @@
 use chrono::{TimeZone, Utc};
 use hoglet::pipeline::wal::WalCursor;
 use hoglet::projections::{ApplyOutcome, apply_captured_event, initialize_schema};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -31,11 +31,6 @@ fn connection() -> Connection {
     connection
 }
 
-fn scalar(connection: &Connection, sql: &str, project_id: &str) -> i64 {
-    connection
-        .query_row(sql, [project_id], |row| row.get(0))
-        .unwrap()
-}
 
 fn person_properties(
     connection: &Connection,
@@ -58,101 +53,6 @@ fn person_properties(
         .as_object()
         .unwrap()
         .clone()
-}
-
-#[test]
-fn duplicate_in_one_project_has_no_second_identity_or_catalog_effect() {
-    let mut connection = connection();
-    let captured = event(
-        "phc_edge_token",
-        1,
-        "signup",
-        "person-1",
-        json!({"plan": "free", "$set": {"name": "Ada"}}),
-    );
-
-    let transaction = connection.transaction().unwrap();
-    assert_eq!(
-        apply_captured_event(&transaction, "project-a", &captured, WalCursor::new(4, 128),)
-            .unwrap(),
-        ApplyOutcome::Applied
-    );
-    assert_eq!(
-        apply_captured_event(&transaction, "project-a", &captured, WalCursor::new(4, 256),)
-            .unwrap(),
-        ApplyOutcome::Duplicate
-    );
-    transaction.commit().unwrap();
-
-    assert_eq!(
-        scalar(
-            &connection,
-            "SELECT count FROM event_names WHERE project_id=?1 AND name='signup'",
-            "project-a",
-        ),
-        1
-    );
-    assert_eq!(
-        scalar(
-            &connection,
-            "SELECT count FROM property_keys WHERE project_id=?1 AND source='event' AND key='plan'",
-            "project-a",
-        ),
-        1
-    );
-    assert_eq!(
-        scalar(
-            &connection,
-            "SELECT count FROM property_values WHERE project_id=?1 AND key='plan' AND value='free'",
-            "project-a",
-        ),
-        1
-    );
-    assert_eq!(
-        person_properties(&connection, "project-a", "person-1")["name"],
-        "Ada"
-    );
-}
-
-#[test]
-fn an_uuid_collision_in_two_projects_is_two_events() {
-    let mut connection = connection();
-    let captured = event("phc_edge_token", 7, "clicked", "same-person", json!({}));
-
-    let transaction = connection.transaction().unwrap();
-    assert_eq!(
-        apply_captured_event(&transaction, "project-a", &captured, WalCursor::new(1, 10),).unwrap(),
-        ApplyOutcome::Applied
-    );
-    assert_eq!(
-        apply_captured_event(&transaction, "project-b", &captured, WalCursor::new(1, 20),).unwrap(),
-        ApplyOutcome::Applied
-    );
-    transaction.commit().unwrap();
-
-    assert_eq!(
-        connection
-            .query_row("SELECT count(*) FROM projected_events", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        scalar(
-            &connection,
-            "SELECT count FROM event_names WHERE project_id=?1 AND name='clicked'",
-            "project-a",
-        ),
-        1
-    );
-    assert_eq!(
-        scalar(
-            &connection,
-            "SELECT count FROM event_names WHERE project_id=?1 AND name='clicked'",
-            "project-b",
-        ),
-        1
-    );
 }
 
 #[test]
@@ -247,7 +147,6 @@ fn rolling_back_the_publication_transaction_removes_every_projection_effect() {
     transaction.rollback().unwrap();
 
     for table in [
-        "projected_events",
         "persons",
         "distinct_ids",
         "event_names",
@@ -262,13 +161,4 @@ fn rolling_back_the_publication_transaction_removes_every_projection_effect() {
         assert_eq!(count, 0, "{table} escaped the rolled-back transaction");
     }
 
-    let missing: Option<String> = connection
-        .query_row(
-            "SELECT uuid FROM projected_events WHERE project_id=?1",
-            ["project-a"],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap();
-    assert!(missing.is_none());
 }

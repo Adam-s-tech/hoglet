@@ -7,4 +7,5 @@ pub mod health;
 pub mod metrics;
 pub mod project;
 pub mod resources;
+pub mod status;
 pub mod workspace;

@@ -1,22 +1,13 @@
-mod capture {
-    pub mod event {
-        pub use hoglet::capture::event::CapturedEvent;
-    }
-}
-
-#[path = "../src/pipeline/wal.rs"]
-mod pipeline_wal;
-
 use chrono::{TimeZone, Utc};
-use pipeline_wal::{CapturedBatch, WalConfig, WalCursor, WalError, WriteAheadLog};
+use hoglet::pipeline::wal::{CapturedBatch, WalConfig, WalCursor, WalError, WriteAheadLog};
 use serde_json::{Map, Value};
 use std::fs::OpenOptions;
 use uuid::Uuid;
 
-fn event(sequence: u128, payload_len: usize) -> capture::event::CapturedEvent {
+fn event(sequence: u128, payload_len: usize) -> hoglet::capture::event::CapturedEvent {
     let mut properties = Map::new();
     properties.insert("payload".into(), Value::String("x".repeat(payload_len)));
-    capture::event::CapturedEvent {
+    hoglet::capture::event::CapturedEvent {
         uuid: Uuid::from_u128(sequence),
         event: "pageview".into(),
         distinct_id: format!("person-{sequence}"),

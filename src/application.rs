@@ -14,12 +14,14 @@ use tower_http::cors::CorsLayer;
 use crate::capture::{CaptureAuthorizer, CaptureState, ProjectAccessCaptureAuthorizer};
 use crate::control::{AccessError, ProjectAccess, ProjectAccessRuntime};
 use crate::control_resources::{ControlResourceError, ControlResources};
-use crate::event_lake::EventLakeError;
-use crate::pipeline::publication::PublicationCoordinator;
+use crate::lake::{Lake, LakeError};
+use crate::persons::{PersonStore, PersonStoreError};
 use crate::projection_catalog::{ProjectionCatalog, ProjectionCatalogError};
 use crate::query::QueryEngine;
 use crate::routes::health::Readiness;
-use crate::sink::{DurablePipelineError, DurableWalRuntime, DurableWalSink};
+use crate::sink::{
+    DurablePipelineError, DurableWalRuntime, DurableWalSink, PipelineConfig, PipelineStats,
+};
 use crate::storage_bootstrap::{
     StorageBootstrapError, StorageDisposition, StoragePaths, bootstrap_storage, inspect_storage,
 };
@@ -28,6 +30,9 @@ use crate::storage_bootstrap::{
 pub struct ApplicationConfig {
     pub data_dir: PathBuf,
     pub max_events_per_second: u32,
+    /// Drop event files older than this many days.
+    pub retention_days: Option<u32>,
+    pub enrichment: crate::enrichment::EnrichmentConfig,
 }
 
 impl ApplicationConfig {
@@ -35,15 +40,14 @@ impl ApplicationConfig {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
             max_events_per_second: crate::ratelimit::DEFAULT_MAX_PER_SEC,
+            retention_days: None,
+            enrichment: crate::enrichment::EnrichmentConfig::default(),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum ApplicationError {
-    LegacyOnly {
-        data_dir: PathBuf,
-    },
     MigrationIncomplete {
         data_dir: PathBuf,
     },
@@ -51,7 +55,8 @@ pub enum ApplicationError {
     Access(AccessError),
     Resources(ControlResourceError),
     ProjectionCatalog(ProjectionCatalogError),
-    EventLake(EventLakeError),
+    Lake(LakeError),
+    Persons(PersonStoreError),
     Query(String),
     Wal(crate::pipeline::wal::WalError),
     Pipeline(DurablePipelineError),
@@ -65,14 +70,9 @@ pub enum ApplicationError {
 impl fmt::Display for ApplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LegacyOnly { data_dir } => write!(
-                formatter,
-                "legacy Hoglet storage found in {}; stop the server and run `hoglet migrate`",
-                data_dir.display()
-            ),
             Self::MigrationIncomplete { data_dir } => write!(
                 formatter,
-                "incomplete storage migration found in {}; inspect it and rerun `hoglet migrate`",
+                "incomplete storage found in {}: one of control.db/projections.db is missing",
                 data_dir.display()
             ),
             Self::Storage(error) => write!(formatter, "storage bootstrap failed: {error}"),
@@ -81,7 +81,8 @@ impl fmt::Display for ApplicationError {
             Self::ProjectionCatalog(error) => {
                 write!(formatter, "projection catalog failed: {error}")
             }
-            Self::EventLake(error) => write!(formatter, "event lake failed: {error}"),
+            Self::Lake(error) => write!(formatter, "event lake failed: {error}"),
+            Self::Persons(error) => write!(formatter, "person store failed: {error}"),
             Self::Query(error) => write!(formatter, "query engine failed: {error}"),
             Self::Wal(error) => write!(formatter, "durable capture WAL failed: {error}"),
             Self::Pipeline(error) => write!(formatter, "durable pipeline failed: {error}"),
@@ -113,9 +114,14 @@ impl From<ProjectionCatalogError> for ApplicationError {
         Self::ProjectionCatalog(error)
     }
 }
-impl From<EventLakeError> for ApplicationError {
-    fn from(error: EventLakeError) -> Self {
-        Self::EventLake(error)
+impl From<LakeError> for ApplicationError {
+    fn from(error: LakeError) -> Self {
+        Self::Lake(error)
+    }
+}
+impl From<PersonStoreError> for ApplicationError {
+    fn from(error: PersonStoreError) -> Self {
+        Self::Persons(error)
     }
 }
 impl From<crate::pipeline::wal::WalError> for ApplicationError {
@@ -134,6 +140,9 @@ pub struct Application {
     readiness: Readiness,
     wal_runtime: DurableWalRuntime,
     control_runtime: ProjectAccessRuntime,
+    lake: Arc<Lake>,
+    persons: Arc<PersonStore>,
+    access: Arc<ProjectAccess>,
 }
 
 impl fmt::Debug for Application {
@@ -151,20 +160,10 @@ impl Application {
             StorageDisposition::Fresh | StorageDisposition::ReadyV2(_) => {
                 bootstrap_storage(paths.control(), paths.projections())?;
             }
-            StorageDisposition::LegacyOnly => {
-                return Err(ApplicationError::LegacyOnly {
-                    data_dir: config.data_dir,
-                });
-            }
-            StorageDisposition::MigrationIncomplete
-                if recoverable_fresh_bootstrap(&paths) && !paths.has_legacy_artifacts() =>
-            {
-                // Fresh-pair publication renames projections first. If the
+            StorageDisposition::MigrationIncomplete if recoverable_fresh_bootstrap(&paths) => {
+                // Fresh-pair creation renames projections first. If the
                 // process died before the final control rename, the staged
-                // control database can be validated against that projection
-                // database and completed safely. Legacy migrations use the
-                // same staging suffix, so their artifacts deliberately keep
-                // this recovery path closed and must resume through `migrate`.
+                // control database is validated against it and completed.
                 bootstrap_storage(paths.control(), paths.projections())?;
             }
             StorageDisposition::MigrationIncomplete => {
@@ -174,22 +173,27 @@ impl Application {
             }
         }
 
-        let event_root = canonical_directory(config.data_dir.join("events"))?;
-        let wal_root = config.data_dir.join("wal-v2");
         let (access, control_runtime) = ProjectAccess::open(paths.control())?;
         let access = Arc::new(access);
         let resources = Arc::new(ControlResources::open(&paths.control())?);
-        let coordinator = PublicationCoordinator::open(paths.projections(), &event_root)
-            .map_err(DurablePipelineError::Publication)?;
+        let lake = Arc::new(Lake::open(&paths.projections(), &config.data_dir.join("events"))?);
+        let persons = Arc::new(PersonStore::open(&paths.projections())?);
+        let (durable_sink, wal_runtime, recovery) = DurableWalSink::open(
+            PipelineConfig {
+                wal_dir: config.data_dir.join("wal"),
+                tmp_dir: config.data_dir.join("tmp"),
+                retention_days: config.retention_days,
+            },
+            lake.clone(),
+        )?;
+        if recovery.truncated_tail {
+            tracing::warn!("recovered a torn tail from the capture WAL");
+        }
         let engine = Arc::new(
-            QueryEngine::try_new_versioned(coordinator.event_lake())
+            QueryEngine::try_new(config.data_dir.join("events"))
                 .map_err(|error| ApplicationError::Query(format!("{error:?}")))?,
         );
         let projection_catalog = Arc::new(ProjectionCatalog::open(&paths.projections())?);
-        let (durable_sink, wal_runtime, recovery) = DurableWalSink::open(wal_root, coordinator)?;
-        if recovery.truncated_tail {
-            tracing::warn!("recovered a torn tail from the v2 capture WAL");
-        }
 
         let identity = Arc::new(
             crate::identity::IdentityStore::in_memory().map_err(|error| {
@@ -199,8 +203,9 @@ impl Application {
         let metrics = Arc::new(crate::metrics::Metrics::new(
             chrono::Utc::now().timestamp().max(0) as u64,
         ));
-        let authorizer: Arc<dyn CaptureAuthorizer> =
-            Arc::new(ProjectAccessCaptureAuthorizer::new(access.as_ref().clone()));
+        let authorizer: Arc<dyn CaptureAuthorizer> = Arc::new(
+            ProjectAccessCaptureAuthorizer::new(access.as_ref().clone()),
+        );
         let capture = CaptureState {
             sink: durable_sink,
             authorizer: authorizer.clone(),
@@ -208,6 +213,7 @@ impl Application {
                 config.max_events_per_second,
             )),
             metrics: metrics.clone(),
+            enricher: Arc::new(crate::enrichment::Enricher::new(config.enrichment.clone())),
         };
         let readiness = Readiness::new();
         let wire = crate::capture::router(capture)
@@ -228,14 +234,38 @@ impl Application {
                 access.clone(),
                 projection_catalog,
             ))
-            .merge(crate::routes::resources::router(access, resources));
+            .merge(crate::routes::status::router(
+                access.clone(),
+                lake.clone(),
+                wal_runtime.stats(),
+            ))
+            .merge(crate::routes::resources::router(access.clone(), resources));
 
         Ok(Self {
             router: wire.merge(public).merge(dashboard),
             readiness,
             wal_runtime,
             control_runtime,
+            lake,
+            persons,
+            access,
         })
+    }
+
+    pub fn lake(&self) -> Arc<Lake> {
+        self.lake.clone()
+    }
+
+    pub fn persons(&self) -> Arc<PersonStore> {
+        self.persons.clone()
+    }
+
+    pub fn access(&self) -> Arc<ProjectAccess> {
+        self.access.clone()
+    }
+
+    pub fn pipeline_stats(&self) -> Arc<PipelineStats> {
+        self.wal_runtime.stats()
     }
 
     pub fn router(&self) -> Router {
@@ -268,10 +298,4 @@ fn recoverable_fresh_bootstrap(paths: &StoragePaths) -> bool {
         && !paths.projections_migrating().exists()
 }
 
-fn canonical_directory(path: PathBuf) -> Result<PathBuf, ApplicationError> {
-    std::fs::create_dir_all(&path).map_err(|source| ApplicationError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    std::fs::canonicalize(&path).map_err(|source| ApplicationError::Io { path, source })
-}
+

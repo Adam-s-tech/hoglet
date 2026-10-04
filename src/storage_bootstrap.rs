@@ -4,12 +4,10 @@
 //! generation. Operational control tables are initialized by `control`; keeping
 //! that boundary avoids a second, subtly different control schema.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
@@ -18,33 +16,14 @@ pub const CONTROL_APPLICATION_ID: i64 = 0x4843_544c;
 /// SQLite application id for a Hoglet projections database (`HPRJ`).
 pub const PROJECTIONS_APPLICATION_ID: i64 = 0x4850_524a;
 pub const CONTROL_SCHEMA_VERSION: i64 = 1;
-pub const PROJECTIONS_SCHEMA_VERSION: i64 = 1;
-
-const EMPTY_MANIFEST_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+/// 2: generation-tracked lake files, identity override sequencing.
+pub const PROJECTIONS_SCHEMA_VERSION: i64 = 2;
 
 const DATABASE_META_SCHEMA: &str = "
 CREATE TABLE database_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     pair_id TEXT NOT NULL CHECK (length(pair_id) > 0),
     database_role TEXT NOT NULL CHECK (database_role IN ('control', 'projections'))
-);";
-
-const PROJECTIONS_SCHEMA: &str = "
-CREATE TABLE event_generations (
-    id INTEGER PRIMARY KEY CHECK (id >= 0),
-    parent_generation_id INTEGER REFERENCES event_generations(id),
-    reason TEXT NOT NULL CHECK (reason IN ('initial', 'publish', 'compact', 'retention', 'erasure')),
-    manifest_checksum TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
-CREATE TABLE projection_state (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    current_generation_id INTEGER NOT NULL REFERENCES event_generations(id),
-    applied_wal_segment INTEGER NOT NULL CHECK (applied_wal_segment >= 0),
-    applied_wal_offset INTEGER NOT NULL CHECK (applied_wal_offset >= 0),
-    data_epoch INTEGER NOT NULL CHECK (data_epoch >= 0),
-    updated_at INTEGER NOT NULL
 );";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,38 +109,16 @@ impl StoragePaths {
         migrating_path(&self.projections())
     }
 
-    /// Whether the directory contains any artifact from Hoglet's legacy
-    /// multi-database/event layout. This check only inspects directory entries.
-    pub fn has_legacy_artifacts(&self) -> bool {
-        const LEGACY_ARTIFACTS: &[&str] = &[
-            "auth.db",
-            "projects.db",
-            "flags.db",
-            "dashboards.db",
-            "cohorts.db",
-            "identity.db",
-            "catalog.db",
-            "sessions.db",
-            "events",
-            "wal",
-        ];
-
-        LEGACY_ARTIFACTS
-            .iter()
-            .any(|name| self.data_dir.join(name).exists())
-    }
 }
 
 /// Read-only startup classification for one data directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageDisposition {
-    /// No v2 or recognized legacy artifacts exist.
+    /// No databases exist yet.
     Fresh,
-    /// A complete, internally consistent v2 database pair exists.
+    /// A complete, internally consistent database pair exists.
     ReadyV2(StorageMetadata),
-    /// Legacy state exists and no v2 migration has begun.
-    LegacyOnly,
-    /// A v2 pair or its crash-safe staging files are only partly present.
+    /// The pair or its crash-safe staging files are only partly present.
     MigrationIncomplete,
 }
 
@@ -294,7 +251,6 @@ pub fn inspect_storage(paths: &StoragePaths) -> Result<StorageDisposition, Stora
         (true, true) => validate_pair_read_only(&control_path, &projections_path)
             .map(StorageDisposition::ReadyV2),
         (true, false) | (false, true) => Ok(StorageDisposition::MigrationIncomplete),
-        (false, false) if paths.has_legacy_artifacts() => Ok(StorageDisposition::LegacyOnly),
         (false, false) => Ok(StorageDisposition::Fresh),
     }
 }
@@ -509,36 +465,24 @@ fn create_control_database(path: &Path, pair_id: &str) -> Result<(), StorageBoot
 fn create_projections_database(path: &Path, pair_id: &str) -> Result<(), StorageBootstrapError> {
     let mut connection = open_database(path)?;
     initialize_pragmas(&connection, DatabaseRole::Projections)?;
-    let now = unix_timestamp();
     let transaction = connection
         .transaction()
         .map_err(|source| sqlite_error(path, source))?;
     transaction
         .execute_batch(DATABASE_META_SCHEMA)
-        .and_then(|_| transaction.execute_batch(PROJECTIONS_SCHEMA))
+        .and_then(|_| transaction.execute_batch(crate::lake::SCHEMA))
         .map_err(|source| sqlite_error(path, source))?;
+    crate::projections::initialize_schema(&transaction).map_err(|_| {
+        StorageBootstrapError::InvalidMetadata {
+            role: DatabaseRole::Projections,
+            detail: "projection schema could not be installed",
+        }
+    })?;
     transaction
         .execute(
             "INSERT INTO database_meta (singleton, pair_id, database_role)
              VALUES (1, ?1, 'projections')",
             [pair_id],
-        )
-        .map_err(|source| sqlite_error(path, source))?;
-    transaction
-        .execute(
-            "INSERT INTO event_generations
-                (id, parent_generation_id, reason, manifest_checksum, created_at)
-             VALUES (0, NULL, 'initial', ?1, ?2)",
-            rusqlite::params![EMPTY_MANIFEST_SHA256, now],
-        )
-        .map_err(|source| sqlite_error(path, source))?;
-    transaction
-        .execute(
-            "INSERT INTO projection_state
-                (singleton, current_generation_id, applied_wal_segment, applied_wal_offset,
-                 data_epoch, updated_at)
-             VALUES (1, 0, 1, 0, 0, ?1)",
-            [now],
         )
         .map_err(|source| sqlite_error(path, source))?;
     transaction
@@ -584,42 +528,23 @@ fn validate_pair_read_only(
         });
     }
 
-    let generation_zero: Option<i64> = projections
+    let generation: i64 = projections
         .query_row(
-            "SELECT id FROM event_generations WHERE id = 0 AND reason = 'initial'",
+            "SELECT generation FROM projection_state WHERE singleton = 1",
             [],
             |row| row.get(0),
-        )
-        .optional()
-        .map_err(|source| sqlite_error(projections_path, source))?;
-    if generation_zero.is_none() {
-        return Err(StorageBootstrapError::InvalidMetadata {
-            role: DatabaseRole::Projections,
-            detail: "generation zero is absent or not initial",
-        });
-    }
-
-    let state = projections
-        .query_row(
-            "SELECT state.current_generation_id, state.data_epoch
-             FROM projection_state AS state
-             JOIN event_generations AS generation
-               ON generation.id = state.current_generation_id
-             WHERE state.singleton = 1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()
         .map_err(|source| sqlite_error(projections_path, source))?
         .ok_or(StorageBootstrapError::InvalidMetadata {
             role: DatabaseRole::Projections,
-            detail: "projection state is absent or references an unknown generation",
+            detail: "projection state is absent",
         })?;
 
     Ok(StorageMetadata {
         pair_id: control_pair,
-        current_generation_id: state.0,
-        data_epoch: state.1,
+        current_generation_id: generation,
+        data_epoch: 0,
     })
 }
 
@@ -748,86 +673,4 @@ fn sqlite_error(path: &Path, source: rusqlite::Error) -> StorageBootstrapError {
     }
 }
 
-fn unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
 
-/// Read project tokens from known legacy SQLite tables without creating or
-/// mutating any database. Missing paths and absent known tables are ignored.
-pub fn discover_legacy_tokens<I, P>(paths: I) -> Result<BTreeSet<String>, StorageBootstrapError>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<Path>,
-{
-    const SOURCES: &[(&str, &str)] = &[
-        ("projects", "token"),
-        ("projects", "capture_token"),
-        ("persons", "token"),
-        ("distinct_ids", "token"),
-        ("event_names", "token"),
-        ("property_keys", "token"),
-        ("property_values", "token"),
-        ("sessions", "token"),
-        ("saved_insights", "token"),
-        ("dashboards", "token"),
-        ("cohorts", "token"),
-        ("feature_flags", "token"),
-    ];
-
-    let mut tokens = BTreeSet::new();
-    for path in paths {
-        let path = path.as_ref();
-        if !path.exists() {
-            continue;
-        }
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|source| sqlite_error(path, source))?;
-        connection
-            .pragma_update(None, "query_only", true)
-            .map_err(|source| sqlite_error(path, source))?;
-
-        for &(table, column) in SOURCES {
-            if !known_column_exists(&connection, path, table, column)? {
-                continue;
-            }
-            // `table` and `column` come only from the static allowlist above.
-            let sql = format!(
-                "SELECT DISTINCT {column} FROM {table}
-                 WHERE typeof({column}) = 'text' AND length(trim({column})) > 0"
-            );
-            let mut statement = connection
-                .prepare(&sql)
-                .map_err(|source| sqlite_error(path, source))?;
-            let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|source| sqlite_error(path, source))?;
-            for token in rows {
-                tokens.insert(token.map_err(|source| sqlite_error(path, source))?);
-            }
-        }
-    }
-    Ok(tokens)
-}
-
-fn known_column_exists(
-    connection: &Connection,
-    path: &Path,
-    table: &str,
-    column: &str,
-) -> Result<bool, StorageBootstrapError> {
-    connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
-             )",
-            [table, column],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|source| sqlite_error(path, source))
-}

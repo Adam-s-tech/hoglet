@@ -501,19 +501,32 @@ impl Lake {
     }
 }
 
+/// A file about to be catalogued.
+pub(crate) struct NewFile<'a> {
+    pub project_id: &'a str,
+    pub day: NaiveDate,
+    pub path: &'a Path,
+    pub rows: u64,
+    pub bytes: u64,
+    pub level: u8,
+}
+
 /// Persist a new file row inside the caller's transaction.
 pub(crate) fn insert_file(
     transaction: &rusqlite::Transaction<'_>,
     lake: &Lake,
-    project_id: &str,
-    day: NaiveDate,
-    path: &Path,
-    rows: u64,
-    bytes: u64,
-    level: u8,
+    file: NewFile<'_>,
     generation: u64,
     now: i64,
 ) -> Result<LakeFile, LakeError> {
+    let NewFile {
+        project_id,
+        day,
+        path,
+        rows,
+        bytes,
+        level,
+    } = file;
     let relative = lake.relative(path)?;
     transaction.execute(
         "INSERT INTO lake_files

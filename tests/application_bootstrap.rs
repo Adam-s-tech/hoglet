@@ -101,25 +101,6 @@ async fn fresh_storage_bootstraps_a_safe_production_router() {
 }
 
 #[tokio::test]
-async fn legacy_storage_is_rejected_without_mutation() {
-    let directory = tempfile::tempdir().expect("temporary data directory");
-    let legacy = directory.path().join("auth.db");
-    let original = b"legacy bytes that normal startup must not touch";
-    fs::write(&legacy, original).expect("legacy fixture");
-
-    let error = Application::prepare(ApplicationConfig::new(directory.path()))
-        .await
-        .expect_err("legacy storage requires explicit migration");
-
-    assert!(matches!(error, ApplicationError::LegacyOnly { .. }));
-    assert_eq!(fs::read(&legacy).expect("legacy fixture remains"), original);
-    assert!(!directory.path().join("control.db").exists());
-    assert!(!directory.path().join("projections.db").exists());
-    assert!(!directory.path().join("events").exists());
-    assert!(!directory.path().join("wal-v2").exists());
-}
-
-#[tokio::test]
 async fn incomplete_storage_is_rejected_without_recovery_writes() {
     let directory = tempfile::tempdir().expect("temporary data directory");
     let partial = directory.path().join("control.db.migrating");

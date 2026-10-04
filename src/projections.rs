@@ -12,16 +12,6 @@ use crate::capture::event::CapturedEvent;
 use crate::pipeline::wal::WalCursor;
 
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS projected_events (
-    project_id TEXT NOT NULL,
-    uuid TEXT NOT NULL,
-    wal_segment INTEGER NOT NULL CHECK(wal_segment >= 0),
-    wal_offset INTEGER NOT NULL CHECK(wal_offset >= 0),
-    PRIMARY KEY (project_id, uuid)
-);
-CREATE INDEX IF NOT EXISTS projected_events_wal_order
-    ON projected_events(wal_segment, wal_offset);
-
 CREATE TABLE IF NOT EXISTS persons (
     project_id TEXT NOT NULL,
     id TEXT NOT NULL,
@@ -156,34 +146,19 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), ProjectionError>
 /// Apply one event's rebuildable effects inside the caller's publication
 /// transaction.
 ///
-/// The `(project_id, uuid)` guard is inserted first.  A duplicate therefore
-/// returns before identity or catalog state can be counted twice.  Callers
-/// must invoke this function in WAL order; `$set`, `$set_once`, and identify
-/// merges consequently have deterministic last-writer behavior.
+/// Callers must invoke this in WAL order; `$set`, `$set_once`, and identify
+/// merges consequently have deterministic last-writer behavior. Every effect
+/// is idempotent for a repeated event except catalog counts, which are
+/// approximate by design. `_cursor` is accepted for call-site compatibility.
 pub fn apply_captured_event(
     transaction: &Transaction<'_>,
     project_id: &str,
     event: &CapturedEvent,
-    cursor: WalCursor,
+    _cursor: WalCursor,
 ) -> Result<ApplyOutcome, ProjectionError> {
     if project_id.trim().is_empty() {
         return Err(ProjectionError::InvalidProjectId);
     }
-    let segment =
-        i64::try_from(cursor.segment).map_err(|_| ProjectionError::CursorOutOfRange(cursor))?;
-    let offset =
-        i64::try_from(cursor.byte_offset).map_err(|_| ProjectionError::CursorOutOfRange(cursor))?;
-
-    let inserted = transaction.execute(
-        "INSERT OR IGNORE INTO projected_events(
-             project_id, uuid, wal_segment, wal_offset
-         ) VALUES (?1, ?2, ?3, ?4)",
-        params![project_id, event.uuid.to_string(), segment, offset],
-    )?;
-    if inserted == 0 {
-        return Ok(ApplyOutcome::Duplicate);
-    }
-
     apply_identity(transaction, project_id, event)?;
     apply_catalog(transaction, project_id, event)?;
     Ok(ApplyOutcome::Applied)
