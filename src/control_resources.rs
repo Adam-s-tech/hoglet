@@ -1,11 +1,10 @@
 //! Authoritative project resources stored in the validated `control.db`.
 //!
-//! This module is the single project-scoping seam for feature flags, saved
-//! insights, dashboards, tiles, and share links. Capture tokens are deliberately
-//! absent from its interface: callers must arrive with an Authorized Project's
-//! stable project id.
+//! This module is the single project-scoping seam for saved insights,
+//! dashboards, tiles, and share links (feature flags live in `crate::flags`).
+//! Capture tokens are deliberately absent from its interface: callers must
+//! arrive with an Authorized Project's stable project id.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -16,27 +15,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::flags::Variant;
 use crate::query::ir::Query;
 use crate::query::supported::SupportedQuery;
 use crate::storage_bootstrap::CONTROL_APPLICATION_ID;
 
-const MAX_KEY_BYTES: usize = 256;
 const MAX_NAME_BYTES: usize = 512;
 
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS feature_flags (
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    key TEXT NOT NULL,
-    active INTEGER NOT NULL CHECK(active IN (0, 1)),
-    rollout_percentage REAL NOT NULL CHECK(rollout_percentage >= 0 AND rollout_percentage <= 100),
-    variants TEXT NOT NULL DEFAULT '[]',
-    payload TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY(project_id, key)
-);
-
 CREATE TABLE IF NOT EXISTS saved_insights (
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     id TEXT NOT NULL,
@@ -96,8 +81,6 @@ CREATE TABLE IF NOT EXISTS share_links (
         REFERENCES dashboards(project_id, id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_feature_flags_project
-    ON feature_flags(project_id, key);
 CREATE INDEX IF NOT EXISTS idx_saved_insights_project_updated
     ON saved_insights(project_id, updated_at DESC, id);
 CREATE INDEX IF NOT EXISTS idx_dashboards_project_updated
@@ -149,24 +132,6 @@ impl From<rusqlite::Error> for ControlResourceError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Database(error)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeatureFlag {
-    pub key: String,
-    pub active: bool,
-    pub rollout_percentage: f64,
-    #[serde(default)]
-    pub variants: Vec<Variant>,
-    pub payload: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportedFeatureFlag {
-    pub flag: FeatureFlag,
-    pub created_at: i64,
-    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,136 +277,6 @@ impl ControlResources {
         Ok(Self {
             connection: Mutex::new(connection),
         })
-    }
-
-    pub fn list_flags(&self, project_id: &str) -> Result<Vec<FeatureFlag>, ControlResourceError> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT key,active,rollout_percentage,variants,payload
-             FROM feature_flags WHERE project_id=?1 ORDER BY key",
-        )?;
-        let flags = statement
-            .query_map([project_id], row_to_flag)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(flags)
-    }
-
-    pub fn get_flag(
-        &self,
-        project_id: &str,
-        key: &str,
-    ) -> Result<FeatureFlag, ControlResourceError> {
-        let connection = self.lock()?;
-        load_flag(&connection, project_id, key)
-    }
-
-    pub fn create_flag(
-        &self,
-        project_id: &str,
-        flag: &FeatureFlag,
-    ) -> Result<FeatureFlag, ControlResourceError> {
-        validate_flag(flag)?;
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_project(&transaction, project_id)?;
-        let now = Utc::now().timestamp();
-        let variants = serde_json::to_string(&flag.variants).map_err(invalid_resource_json)?;
-        transaction
-            .execute(
-                "INSERT INTO feature_flags(
-                    project_id,key,active,rollout_percentage,variants,payload,created_at,updated_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
-                params![
-                    project_id,
-                    flag.key,
-                    flag.active,
-                    flag.rollout_percentage,
-                    variants,
-                    flag.payload,
-                    now
-                ],
-            )
-            .map_err(map_write_error)?;
-        transaction.commit()?;
-        load_flag(&connection, project_id, &flag.key)
-    }
-
-    pub fn update_flag(
-        &self,
-        project_id: &str,
-        key: &str,
-        flag: &FeatureFlag,
-    ) -> Result<FeatureFlag, ControlResourceError> {
-        let connection = self.lock()?;
-        ensure_flag(&connection, project_id, key)?;
-        if key != flag.key {
-            return Err(ControlResourceError::Conflict);
-        }
-        validate_flag(flag)?;
-        let variants = serde_json::to_string(&flag.variants).map_err(invalid_resource_json)?;
-        connection.execute(
-            "UPDATE feature_flags SET
-                active=?3,rollout_percentage=?4,variants=?5,payload=?6,updated_at=?7
-             WHERE project_id=?1 AND key=?2",
-            params![
-                project_id,
-                key,
-                flag.active,
-                flag.rollout_percentage,
-                variants,
-                flag.payload,
-                Utc::now().timestamp()
-            ],
-        )?;
-        load_flag(&connection, project_id, key)
-    }
-
-    pub fn delete_flag(&self, project_id: &str, key: &str) -> Result<(), ControlResourceError> {
-        let connection = self.lock()?;
-        deleted(connection.execute(
-            "DELETE FROM feature_flags WHERE project_id=?1 AND key=?2",
-            params![project_id, key],
-        )?)
-    }
-
-    /// Migration-only upsert preserving the historical timestamps.
-    pub fn import_flag(
-        &self,
-        project_id: &str,
-        imported: ImportedFeatureFlag,
-    ) -> Result<FeatureFlag, ControlResourceError> {
-        validate_flag(&imported.flag)?;
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_project(&transaction, project_id)?;
-        let variants =
-            serde_json::to_string(&imported.flag.variants).map_err(invalid_resource_json)?;
-        transaction
-            .execute(
-                "INSERT INTO feature_flags(
-                    project_id,key,active,rollout_percentage,variants,payload,created_at,updated_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-                 ON CONFLICT(project_id,key) DO UPDATE SET
-                    active=excluded.active,
-                    rollout_percentage=excluded.rollout_percentage,
-                    variants=excluded.variants,
-                    payload=excluded.payload,
-                    created_at=excluded.created_at,
-                    updated_at=excluded.updated_at",
-                params![
-                    project_id,
-                    imported.flag.key,
-                    imported.flag.active,
-                    imported.flag.rollout_percentage,
-                    variants,
-                    imported.flag.payload,
-                    imported.created_at,
-                    imported.updated_at
-                ],
-            )
-            .map_err(map_write_error)?;
-        transaction.commit()?;
-        load_flag(&connection, project_id, &imported.flag.key)
     }
 
     pub fn list_insights(
@@ -999,33 +834,6 @@ fn validate_name(name: &str) -> Result<(), ControlResourceError> {
     validate_required("name", name, MAX_NAME_BYTES)
 }
 
-fn validate_flag(flag: &FeatureFlag) -> Result<(), ControlResourceError> {
-    validate_required("key", &flag.key, MAX_KEY_BYTES)?;
-    if !flag.rollout_percentage.is_finite() || !(0.0..=100.0).contains(&flag.rollout_percentage) {
-        return Err(ControlResourceError::InvalidResource {
-            field: "rollout_percentage",
-            message: "must be a finite number from 0 through 100".into(),
-        });
-    }
-    let mut keys = BTreeSet::new();
-    for variant in &flag.variants {
-        validate_required("variants.key", &variant.key, MAX_KEY_BYTES)?;
-        if !keys.insert(variant.key.as_str()) {
-            return Err(ControlResourceError::InvalidResource {
-                field: "variants.key",
-                message: "variant keys must be unique".into(),
-            });
-        }
-        if !variant.rollout.is_finite() || !(0.0..=100.0).contains(&variant.rollout) {
-            return Err(ControlResourceError::InvalidResource {
-                field: "variants.rollout",
-                message: "must be a finite number from 0 through 100".into(),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn validate_tile(tile: &DashboardTileInput) -> Result<(), ControlResourceError> {
     validate_required("insight_id", &tile.insight_id, MAX_NAME_BYTES)?;
     if tile.x < 0 || tile.y < 0 || tile.w <= 0 || tile.h <= 0 {
@@ -1073,13 +881,6 @@ fn imported_query_json(query_ir: &Value) -> Result<(String, bool), ControlResour
     Ok((encoded, supported))
 }
 
-fn invalid_resource_json(error: serde_json::Error) -> ControlResourceError {
-    ControlResourceError::InvalidResource {
-        field: "resource",
-        message: error.to_string(),
-    }
-}
-
 fn map_write_error(error: rusqlite::Error) -> ControlResourceError {
     match error {
         rusqlite::Error::SqliteFailure(code, _)
@@ -1104,18 +905,6 @@ fn ensure_project(connection: &Connection, project_id: &str) -> Result<(), Contr
         connection,
         "SELECT 1 FROM projects WHERE id=?1",
         params![project_id],
-    )
-}
-
-fn ensure_flag(
-    connection: &Connection,
-    project_id: &str,
-    key: &str,
-) -> Result<(), ControlResourceError> {
-    ensure_exists(
-        connection,
-        "SELECT 1 FROM feature_flags WHERE project_id=?1 AND key=?2",
-        params![project_id, key],
     )
 }
 
@@ -1152,33 +941,6 @@ fn ensure_exists(
         .query_row(sql, parameters, |_| Ok(()))
         .optional()?;
     exists.ok_or(ControlResourceError::NotFound)
-}
-
-fn load_flag(
-    connection: &Connection,
-    project_id: &str,
-    key: &str,
-) -> Result<FeatureFlag, ControlResourceError> {
-    connection
-        .query_row(
-            "SELECT key,active,rollout_percentage,variants,payload
-             FROM feature_flags WHERE project_id=?1 AND key=?2",
-            params![project_id, key],
-            row_to_flag,
-        )
-        .optional()?
-        .ok_or(ControlResourceError::NotFound)
-}
-
-fn row_to_flag(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeatureFlag> {
-    let encoded: String = row.get(3)?;
-    Ok(FeatureFlag {
-        key: row.get(0)?,
-        active: row.get(1)?,
-        rollout_percentage: row.get(2)?,
-        variants: decode_json(3, &encoded)?,
-        payload: row.get(4)?,
-    })
 }
 
 fn load_insight(

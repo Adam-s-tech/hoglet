@@ -1230,6 +1230,7 @@ dependencies = [
  "mime_guess",
  "parquet",
  "rand 0.8.7",
+ "regex",
  "rusqlite",
  "rust-embed",
  "serde",
