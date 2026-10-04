@@ -191,6 +191,16 @@ pub struct EngineConfig {
     /// Rows one ordered per-person partition aims for (funnels, paths,
     /// lifecycle, retention); bounds materialized intermediate results.
     pub partition_rows: u64,
+    /// Rows one funnel partition aims for. Funnels stream their rows (only
+    /// one person's events are held at a time), so a partition is bounded by
+    /// DuckDB's sort, which spills; larger partitions mean fewer rescans.
+    pub funnel_partition_rows: u64,
+    /// Bytes of per-person state a funnel pass may gather in memory before
+    /// the sorted (spilling) paths take over.
+    pub funnel_gather_bytes: usize,
+    /// Persons whose equal-timestamp events differ that a funnel resolves by
+    /// uuid before it orders everything by uuid instead.
+    pub funnel_max_tied: usize,
 }
 
 impl Default for EngineConfig {
@@ -206,6 +216,9 @@ impl Default for EngineConfig {
             sql_memory_limit_mb: 256,
             cache_entries: 256,
             partition_rows: PARTITION_ROWS,
+            funnel_partition_rows: FUNNEL_PARTITION_ROWS,
+            funnel_gather_bytes: 256 * 1024 * 1024,
+            funnel_max_tied: 20_000,
         }
     }
 }
@@ -299,6 +312,9 @@ pub(crate) struct Ctx<'a> {
     pub sql_memory_limit_mb: u32,
     pub threads: u32,
     pub partition_rows: u64,
+    pub funnel_partition_rows: u64,
+    pub funnel_gather_bytes: usize,
+    pub funnel_max_tied: usize,
     /// Absolute spill directory (`<data dir>/tmp/query`) for the SQL sandbox.
     pub temp_directory: Option<&'a std::path::Path>,
 }
@@ -423,6 +439,15 @@ impl Ctx<'_> {
     /// materialized partition stays near [`PARTITION_ROWS`] rows (from the
     /// files' row counts — Parquet metadata, no scan).
     pub fn person_partitions(&self) -> Result<u64, QueryError> {
+        self.partitions_of(self.partition_rows)
+    }
+
+    /// Like [`Ctx::person_partitions`] with the funnel's larger partitions.
+    pub fn funnel_partitions(&self) -> Result<u64, QueryError> {
+        self.partitions_of(self.funnel_partition_rows)
+    }
+
+    fn partitions_of(&self, partition_rows: u64) -> Result<u64, QueryError> {
         if self.source.files.is_empty() {
             return Ok(1);
         }
@@ -439,7 +464,7 @@ impl Ctx<'_> {
             |row| row.get(0),
         )?;
         Ok((rows.max(0) as u64)
-            .div_ceil(self.partition_rows)
+            .div_ceil(partition_rows)
             .clamp(1, MAX_PARTITIONS))
     }
 
@@ -487,6 +512,8 @@ impl Ctx<'_> {
 
 /// Rows one per-person partition aims for.
 pub const PARTITION_ROWS: u64 = 2_000_000;
+/// Rows one funnel partition aims for (see [`EngineConfig`]).
+pub const FUNNEL_PARTITION_ROWS: u64 = 12_000_000;
 const MAX_PARTITIONS: u64 = 1_024;
 
 /// SQL selecting one person-hash partition (server integers only).
@@ -987,6 +1014,9 @@ impl QueryEngine {
             sql_memory_limit_mb: self.config.sql_memory_limit_mb,
             threads: self.config.threads,
             partition_rows: self.config.partition_rows.max(1),
+            funnel_partition_rows: self.config.funnel_partition_rows.max(1),
+            funnel_gather_bytes: self.config.funnel_gather_bytes,
+            funnel_max_tied: self.config.funnel_max_tied,
             temp_directory: self.config.temp_directory.as_deref(),
         };
         let output = match work {

@@ -291,6 +291,10 @@ fn bench_ten_million() {
         temp_directory: Some(root.join("spill")),
         partition_rows: env_usize("HOGLET_BENCH_PARTITION_ROWS", super::PARTITION_ROWS as usize)
             as u64,
+        funnel_partition_rows: env_usize(
+            "HOGLET_BENCH_FUNNEL_PARTITION_ROWS",
+            super::FUNNEL_PARTITION_ROWS as usize,
+        ) as u64,
         ..EngineConfig::default()
     };
     config.timeout = StdDuration::from_secs(600);

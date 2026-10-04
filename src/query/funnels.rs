@@ -205,10 +205,6 @@ pub(crate) struct PersonOutcome {
     pub breakdown: Option<String>,
 }
 
-/// Persons whose equal-timestamp events differ are ordered by uuid in a
-/// second, small query; past this many the whole analysis runs that way.
-const MAX_TIED_PERSONS: usize = 20_000;
-
 /// Everything about the scan that is the same for every pass.
 struct Scan {
     relation: String,
@@ -361,6 +357,24 @@ impl Scan {
         })
     }
 
+    /// Order a person's events by timestamp (ties keep no particular order;
+    /// [`Scan::tie_matters`] says whether that matters).
+    fn sort_by_time(&self, collected: &mut Collected) {
+        if !self.has_breakdown {
+            collected.events.sort_unstable_by_key(|event| event.ts);
+            return;
+        }
+        let mut order: Vec<usize> = (0..collected.events.len()).collect();
+        order.sort_by_key(|index| collected.events[*index].ts);
+        let events = order.iter().map(|index| collected.events[*index]).collect();
+        let breakdowns = order
+            .iter()
+            .map(|index| collected.breakdowns[*index].clone())
+            .collect();
+        collected.events = events;
+        collected.breakdowns = breakdowns;
+    }
+
     fn push(&self, collected: &mut Collected, ts: i64, mask: i64, breakdown: Option<Option<String>>) {
         collected.events.push(Event {
             ts,
@@ -378,10 +392,144 @@ fn analyze(
     range: &ResolvedRange,
 ) -> Result<Vec<PersonOutcome>, QueryError> {
     let scan = scan_plan(ctx, q, range)?;
+    if let Some(outcomes) = analyze_gathered(ctx, &scan)? {
+        return Ok(outcomes);
+    }
     match analyze_by_hash(ctx, &scan)? {
         Some(outcomes) => Ok(outcomes),
         None => analyze_ordered(ctx, &scan, false),
     }
+}
+
+/// Rough fixed cost of one gathered person (map slot, `String`, vectors).
+const GATHER_PERSON_BYTES: usize = 112;
+/// Events reserved per gathered person up front (avoids regrowth churn).
+const GATHER_EVENTS_HINT: usize = 8;
+const GATHER_EVENT_BYTES: usize = std::mem::size_of::<Event>();
+
+/// Multiplicative hasher for person ids: the gather map hashes every row, so
+/// the default SipHash would dominate the pass.
+#[derive(Default, Clone, Copy)]
+struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut state = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let mut word = [0_u8; 8];
+            word.copy_from_slice(chunk);
+            state = (state.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(K);
+        }
+        for byte in chunks.remainder() {
+            state = (state.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(K);
+        }
+        self.0 = state;
+    }
+}
+
+/// Gathering path: DuckDB streams the matching rows unordered (a scan and a
+/// join, no sort, no uuid) and each person's events are collected here,
+/// ordered by timestamp, and analysed. Persons whose equal-timestamp events
+/// differ are re-read in uuid order, as in [`analyze_by_hash`]. `None` when a
+/// partition's state would exceed `funnel_gather_bytes` or too many persons tie;
+/// the sorted paths then take over, so memory stays bounded either way.
+fn analyze_gathered(ctx: &Ctx<'_>, scan: &Scan) -> Result<Option<Vec<PersonOutcome>>, QueryError> {
+    use std::collections::HashMap;
+    use std::hash::BuildHasherDefault;
+
+    let partitions = ctx.funnel_partitions()?;
+    let mut outcomes = Vec::new();
+    let mut tied: Vec<String> = Vec::new();
+    let mut types = vec![DataType::Utf8, DataType::Int64, DataType::Int64];
+    if scan.has_breakdown {
+        types.push(DataType::Utf8);
+    }
+    let bd_select = if scan.has_breakdown { ", bd" } else { "" };
+    for partition in 0..partitions {
+        let sql = format!(
+            "WITH ev AS ({relation}), \
+             x AS (SELECT person_id, ts, ({mask_sql})::BIGINT AS mask{bd_column} FROM ev \
+                   WHERE {part} AND {prefilter}) \
+             SELECT person_id, ts, mask{bd_select} FROM x WHERE {keep}",
+            relation = scan.relation,
+            mask_sql = scan.mask_sql,
+            bd_column = scan.bd_column,
+            part = super::partition_clause(partition, partitions),
+            prefilter = scan.event_prefilter,
+            keep = scan.keep,
+        );
+        let mut people: HashMap<String, Collected, BuildHasherDefault<FastHasher>> =
+            HashMap::default();
+        let mut bytes = 0_usize;
+        let mut over_budget = false;
+        ctx.arrow_streaming(&sql, &scan.params, &types, |batch| {
+            if over_budget {
+                return Ok(());
+            }
+            let persons = string_column(batch, 0)?;
+            let times = i64_column(batch, 1)?;
+            let masks = i64_column(batch, 2)?;
+            let breakdowns = if scan.has_breakdown {
+                Some(string_column(batch, 3)?)
+            } else {
+                None
+            };
+            for row in 0..batch.num_rows() {
+                let person = persons.value(row);
+                let collected = match people.get_mut(person) {
+                    Some(collected) => collected,
+                    None => {
+                        bytes += GATHER_PERSON_BYTES + person.len() + GATHER_EVENTS_HINT * GATHER_EVENT_BYTES;
+                        people
+                            .entry(person.to_owned())
+                            .or_insert_with(|| {
+                                let mut collected = Collected::new(person);
+                                collected.events.reserve_exact(GATHER_EVENTS_HINT);
+                                collected
+                            })
+                    }
+                };
+                let breakdown = breakdowns
+                    .as_ref()
+                    .map(|values| (!values.is_null(row)).then(|| values.value(row).to_owned()));
+                bytes += GATHER_EVENT_BYTES
+                    + breakdown
+                        .as_ref()
+                        .map_or(0, |value| 24 + value.as_ref().map_or(0, String::len));
+                scan.push(collected, times.value(row), masks.value(row), breakdown);
+            }
+            if bytes > ctx.funnel_gather_bytes {
+                over_budget = true;
+                people.clear();
+            }
+            Ok(())
+        })?;
+        if over_budget {
+            return Ok(None);
+        }
+        for (_, mut collected) in people {
+            scan.sort_by_time(&mut collected);
+            if scan.tie_matters(&collected) {
+                if tied.len() >= ctx.funnel_max_tied {
+                    return Ok(None);
+                }
+                tied.push(collected.person);
+            } else if let Some(outcome) = scan.outcome(&collected) {
+                outcomes.push(outcome);
+            }
+        }
+    }
+    if !tied.is_empty() {
+        ctx.temp_text_table("funnel_tied", "person_id", &tied)?;
+        outcomes.extend(analyze_ordered(ctx, scan, true)?);
+    }
+    Ok(Some(outcomes))
 }
 
 /// Fast path: DuckDB orders each partition by `(hash(person), timestamp)` —
@@ -391,7 +539,7 @@ fn analyze(
 /// not decided here: their order is the uuid's, so they are re-read by
 /// [`analyze_ordered`] restricted to them. `None` when too many persons tie.
 fn analyze_by_hash(ctx: &Ctx<'_>, scan: &Scan) -> Result<Option<Vec<PersonOutcome>>, QueryError> {
-    let partitions = ctx.person_partitions()?;
+    let partitions = ctx.funnel_partitions()?;
     let mut outcomes = Vec::new();
     let mut tied: Vec<String> = Vec::new();
     // The rows of one hash value; almost always a single person.
@@ -405,7 +553,7 @@ fn analyze_by_hash(ctx: &Ctx<'_>, scan: &Scan) -> Result<Option<Vec<PersonOutcom
                   overflow: &mut bool| {
         for collected in run.drain(..) {
             if scan.tie_matters(&collected) {
-                if tied.len() >= MAX_TIED_PERSONS {
+                if tied.len() >= ctx.funnel_max_tied {
                     *overflow = true;
                 } else {
                     tied.push(collected.person);
@@ -492,7 +640,7 @@ fn analyze_ordered(
     let partitions = if tied_only {
         1
     } else {
-        ctx.person_partitions()?
+        ctx.funnel_partitions()?
     };
     let only = if tied_only {
         "person_id IN (SELECT person_id FROM funnel_tied)"
