@@ -2,7 +2,7 @@ import { useState } from "react";
 import { ApiError, api, errorMessage } from "../lib/api";
 import { useApp, usePath, useProjectId } from "../lib/context";
 import { fmtNumber, fmtRelative } from "../lib/format";
-import { useApi } from "../lib/hooks";
+import { invalidate, useApi } from "../lib/hooks";
 import { SNIPPETS, hostOrigin } from "../lib/snippets";
 import { Link } from "../lib/router";
 import { Icon } from "../ui/icons";
@@ -30,6 +30,41 @@ export function TokenBox({ token }: { token: string }) {
       <code>{token}</code>
       <CopyButton text={token} />
     </div>
+  );
+}
+
+/**
+ * Fills the project with 90 days of realistic demo data through the real
+ * ingest path. Events become queryable a second or two after it returns.
+ */
+export function LoadDemoButton({ primary = false, small = false, onLoaded }: { primary?: boolean; small?: boolean; onLoaded?: () => void }) {
+  const projectId = useProjectId();
+  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      className={`btn${primary ? " accent" : ""}${small ? " small" : ""}`}
+      disabled={busy}
+      title="Adds 90 days of sample product data to this project so you can explore every screen"
+      onClick={async () => {
+        setBusy(true);
+        try {
+          const { events } = await api.loadDemo(projectId);
+          // Give publication a moment, then drop every cached answer for this project.
+          await new Promise((r) => window.setTimeout(r, 2500));
+          invalidate("");
+          toast(`Loaded ${fmtNumber(events)} demo events`);
+          onLoaded?.();
+          window.dispatchEvent(new Event("hoglet:data-changed"));
+        } catch (e) {
+          toast(errorMessage(e), true);
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      {busy ? <span className="spinner" style={{ width: 14, height: 14 }} /> : <Icon name="sparkle" size={14} />}
+      {busy ? "Loading demo data…" : "Load demo data"}
+    </button>
   );
 }
 
@@ -91,6 +126,7 @@ export function FirstEventWatcher() {
       <button className="btn" onClick={sendTest} disabled={sending}>
         <Icon name="bolt" size={14} /> {sending ? "Sending…" : "Send a test event"}
       </button>
+      <LoadDemoButton primary onLoaded={status.reload} />
     </div>
   );
 }
@@ -138,6 +174,9 @@ export function OnboardingPage() {
             <h2>Send an event</h2>
           </div>
           <FirstEventWatcher />
+          <p className="muted small">
+            Just looking around? <b>Load demo data</b> fills this project with 90 days of a sample SaaS product: pageviews, signups, subscriptions, AI generations and errors.
+          </p>
         </div>
       </div>
     </div>

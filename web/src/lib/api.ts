@@ -48,9 +48,12 @@ export interface Workspace {
   user: User;
   organizations: Organization[];
 }
+export type KeyScope = "read" | "write";
 export interface PersonalApiKey {
   id: string;
   name: string;
+  /** Older servers omit it; treat as read. */
+  scope?: KeyScope;
   key_prefix: string;
   last_used: number | null;
   created_at: number;
@@ -352,7 +355,7 @@ export const api = {
   logout: () => request<{ status: string }>("POST", "/api/auth/logout", { authFlow: true }),
   me: (signal?: AbortSignal) => request<Workspace>("GET", "/api/auth/me", { signal, authFlow: true }),
   listKeys: (signal?: AbortSignal) => request<PersonalApiKey[]>("GET", "/api/auth/keys", { signal }),
-  createKey: (name: string) => request<CreatedKey>("POST", "/api/auth/keys", { body: { name } }),
+  createKey: (name: string, scope: KeyScope) => request<CreatedKey>("POST", "/api/auth/keys", { body: { name, scope } }),
   revokeKey: (id: string) => request<null>("DELETE", `/api/auth/keys/${encodeURIComponent(id)}`),
   createOrganization: (name: string) => request<Organization>("POST", "/api/organizations", { body: { name } }),
   createProject: (organizationId: string, name: string) =>
@@ -368,6 +371,12 @@ export const api = {
   webBreakdown: (projectId: string, q: WebQuery, dimension: WebDimension, limit: number, signal?: AbortSignal) =>
     request<WebBreakdown>("GET", `${p(projectId)}/web/breakdown`, { query: { ...webParams(q), dimension, limit }, signal }),
   status: (projectId: string, signal?: AbortSignal) => request<ProjectStatus>("GET", `${p(projectId)}/status`, { signal }),
+
+  /** Fill the project with 90 days of realistic demo events. */
+  loadDemo: (projectId: string) => request<{ events: number }>("POST", `${p(projectId)}/demo`),
+  /** GDPR erase: the person, every distinct id, every event. Owner/admin only. */
+  erasePerson: (projectId: string, personId: string) =>
+    request<{ distinct_ids: number; events: number }>("POST", `${p(projectId)}/persons/${encodeURIComponent(personId)}/erase`),
 
   // Persons & events
   persons: (projectId: string, q: { search?: string; cursor?: string | null; limit?: number }, signal?: AbortSignal) =>

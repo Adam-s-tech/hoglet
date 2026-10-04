@@ -10,7 +10,7 @@ import { Icon } from "../ui/icons";
 import { Empty, ErrorState, Skeleton, SkeletonRows } from "../ui/kit";
 import { eventNode, kindInfo, summarize } from "../insight/defaults";
 import { ChartSkeleton, InsightResultView, useInsightQuery } from "../insight/Result";
-import { FirstEventWatcher } from "./Onboarding";
+import { FirstEventWatcher, LoadDemoButton } from "./Onboarding";
 
 function ActivityChart() {
   const query: InsightQuery = useMemo(
@@ -73,6 +73,7 @@ export function HomePage() {
         <div className="card card-pad col gap-12" style={{ marginBottom: 16 }}>
           <div className="row">
             <h2 className="grow">Get started</h2>
+            <LoadDemoButton />
             <Link className="btn primary" to={path("onboarding")}>
               Connect your app <Icon name="arrowRight" size={13} />
             </Link>

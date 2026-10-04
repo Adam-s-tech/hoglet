@@ -72,6 +72,12 @@ export function useApi<T>(
   }, [key, tick]);
 
   useEffect(() => {
+    const onChange = () => setTick((t) => t + 1);
+    window.addEventListener("hoglet:data-changed", onChange);
+    return () => window.removeEventListener("hoglet:data-changed", onChange);
+  }, []);
+
+  useEffect(() => {
     if (!pollMs || key === null) return;
     const id = window.setInterval(() => {
       if (document.visibilityState === "visible") setTick((t) => t + 1);
