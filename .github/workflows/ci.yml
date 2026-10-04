@@ -93,4 +93,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: no forbidden services
         run: |
-          ! grep -riE "kafka|clickhouse|redis|zookeeper" Cargo.toml src/
+          # Crates in the lock file, the manifest, and code. Comments may
+          # name them (a doc line citing ClickHouse's windowFunnel is not a
+          # dependency).
+          ! grep -iE '^name = "[^"]*(kafka|clickhouse|redis|zookeeper)' Cargo.lock
+          ! grep -iE "kafka|clickhouse|redis|zookeeper" Cargo.toml
+          ! grep -rniE "kafka|clickhouse|redis|zookeeper" src/ | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//'
+
+  audit:
+    # Known-vulnerable crates in Cargo.lock (RustSec). Runs nightly too: new
+    # advisories appear without any change to this repo.
+    # RUSTSEC-2026-0235 (rkyv) is a Cargo.lock entry that is not in the build
+    # graph (`cargo tree -i rkyv` is empty).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --ignore RUSTSEC-2026-0235
+      - name: web dependencies
+        working-directory: web
+        run: npm audit --omit=dev

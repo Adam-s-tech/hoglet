@@ -23,6 +23,16 @@ ENVIRONMENT:
     HOGLET_MAX_EVENTS_PER_SEC   Per-project capture limit (default 10000)
     HOGLET_COOKIELESS_SALT      Enable cookieless device ids with this secret salt
     HOGLET_NO_UA_PARSE          Set to disable user-agent enrichment
+    HOGLET_SETUP_TOKEN          Require this token (header X-Hoglet-Setup-Token or body
+                                field setup_token) to create the first account
+    HOGLET_TRUST_PROXY          Set to 1 behind a reverse proxy that appends the client
+                                to X-Forwarded-For (used by login throttling)
+    HOGLET_SECURE_COOKIES       Set to 1 to always mark the session cookie Secure
+                                (it is also Secure when X-Forwarded-Proto is https)
+    HOGLET_METRICS_TOKEN        Require `Authorization: Bearer <token>` on /metrics
+    HOGLET_ALLOW_PRIVATE_FORWARDING
+                                Set to 1 to let shadow-mode forwarding reach private
+                                and loopback addresses (default: refused)
     HOGLET_DEMO                 Set to 1 on a fresh data directory to create a demo
                                 account (demo@hoglet.dev / hoglet-demo-1) with 90 days
                                 of realistic data
@@ -82,6 +92,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     config.retention_days = env_number("HOGLET_RETENTION_DAYS")?;
     config.enrichment = hoglet::enrichment::EnrichmentConfig::from_env();
+    config.security = hoglet::security::SecurityConfig::from_env();
 
     let started = std::time::Instant::now();
     let application = Application::prepare(config).await?;
@@ -92,6 +103,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     application.mark_ready();
+    if !addr.ip().is_loopback()
+        && application.access().setup_required().await.unwrap_or(false)
+        && !demo
+        && std::env::var("HOGLET_SETUP_TOKEN").is_err()
+    {
+        tracing::warn!(
+            "no account exists yet and {addr} is reachable beyond this machine: whoever \
+             opens the dashboard first creates the owner account. Finish setup now, or \
+             set HOGLET_SETUP_TOKEN"
+        );
+    }
 
     let shown = if addr.ip().is_unspecified() {
         format!("http://localhost:{}", addr.port())
@@ -106,18 +128,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     eprintln!("  data        {}", data_dir.display());
     if demo {
         eprintln!("  demo login  {DEMO_EMAIL} / {DEMO_PASSWORD}");
+        if !addr.ip().is_loopback() {
+            tracing::warn!(
+                "HOGLET_DEMO created a published password and {addr} is reachable beyond \
+                 this machine: change it or do not expose this instance"
+            );
+        }
     }
     eprintln!();
     tracing::info!(%addr, "hoglet listening");
 
     let shutdown_readiness = application.readiness();
-    let server_result = axum::serve(listener, application.router())
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            shutdown_readiness.mark_not_ready();
-            tracing::info!("shutting down: draining requests and publishing the WAL");
-        })
-        .await;
+    let server_result = hoglet::server::serve(listener, application.router(), async move {
+        shutdown_signal().await;
+        shutdown_readiness.mark_not_ready();
+        tracing::info!("shutting down: draining requests and publishing the WAL");
+    })
+    .await;
     let shutdown_result = application.shutdown().await;
     server_result?;
     shutdown_result?;

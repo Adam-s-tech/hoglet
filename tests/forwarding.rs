@@ -62,9 +62,10 @@ async fn captured_events_are_forwarded_to_posthog() {
     .await;
 
     let data = tempfile::tempdir().unwrap();
-    let application = Application::prepare(ApplicationConfig::new(data.path()))
-        .await
-        .unwrap();
+    // The stand-in PostHog listens on loopback.
+    let mut config = ApplicationConfig::new(data.path());
+    config.security.allow_private_forwarding = true;
+    let application = Application::prepare(config).await.unwrap();
     application.mark_ready();
     let hoglet = serve(application.router()).await;
 

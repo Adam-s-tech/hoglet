@@ -33,6 +33,7 @@ pub struct ApplicationConfig {
     /// Drop event files older than this many days.
     pub retention_days: Option<u32>,
     pub enrichment: crate::enrichment::EnrichmentConfig,
+    pub security: crate::security::SecurityConfig,
 }
 
 impl ApplicationConfig {
@@ -42,6 +43,7 @@ impl ApplicationConfig {
             max_events_per_second: crate::ratelimit::DEFAULT_MAX_PER_SEC,
             retention_days: None,
             enrichment: crate::enrichment::EnrichmentConfig::default(),
+            security: crate::security::SecurityConfig::default(),
         }
     }
 }
@@ -159,6 +161,7 @@ impl fmt::Debug for Application {
 
 impl Application {
     pub async fn prepare(config: ApplicationConfig) -> Result<Self, ApplicationError> {
+        restrict_data_directory(&config.data_dir)?;
         let paths = StoragePaths::new(&config.data_dir);
         match inspect_storage(&paths)? {
             StorageDisposition::Fresh | StorageDisposition::ReadyV2(_) => {
@@ -222,7 +225,10 @@ impl Application {
             ProjectAccessCaptureAuthorizer::new(access.as_ref().clone()),
         );
         let sink: Arc<dyn crate::sink::EventSink> = durable_sink;
-        let forwarder = crate::forward::Forwarder::open(&paths.control())
+        let forwarder = crate::forward::Forwarder::open_with_policy(
+            &paths.control(),
+            config.security.allow_private_forwarding,
+        )
             .map_err(|error| ApplicationError::LocalStore(format!("forwarding: {error}")))?;
         let capture = CaptureState {
             sink: sink.clone(),
@@ -245,9 +251,15 @@ impl Application {
             .layer(CorsLayer::very_permissive());
         let public = crate::routes::dashboard::router()
             .merge(crate::routes::health::router(readiness.clone()))
-            .merge(crate::routes::metrics::router(metrics))
+            .merge(crate::routes::metrics::router_with_token(
+                metrics,
+                config.security.metrics_token.clone(),
+            ))
             .merge(crate::routes::docs::router());
-        let dashboard = crate::routes::workspace::router(access.clone())
+        let dashboard = crate::routes::workspace::router_with(
+            access.clone(),
+            config.security.clone(),
+        )
             .merge(crate::routes::project::router(access.clone(), engine))
             .merge(crate::routes::catalog_v2::router(
                 access.clone(),
@@ -278,10 +290,15 @@ impl Application {
                 explorer.clone(),
             ))
             .merge(crate::routes::web::router(access.clone(), explorer))
-            .merge(crate::routes::resources::router(access.clone(), resources));
+            .merge(crate::routes::resources::router(access.clone(), resources))
+            // Cookie-authenticated mutations must come from this origin.
+            .layer(axum::middleware::from_fn(crate::security::csrf_guard));
 
         Ok(Self {
-            router: wire.merge(public).merge(dashboard),
+            router: wire
+                .merge(public)
+                .merge(dashboard)
+                .layer(axum::middleware::from_fn(crate::security::security_headers)),
             readiness,
             wal_runtime,
             control_runtime,
@@ -336,6 +353,27 @@ impl Application {
         wal_result?;
         Ok(())
     }
+}
+
+/// The data directory holds every event and credential: owner-only, even when
+/// the operator created it (a Docker volume, systemd `StateDirectory`) with a
+/// looser mode.
+fn restrict_data_directory(data_dir: &Path) -> Result<(), ApplicationError> {
+    // A missing directory is created owner-only by storage bootstrap.
+    if !data_dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |source| ApplicationError::Io {
+                path: data_dir.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn recoverable_fresh_bootstrap(paths: &StoragePaths) -> bool {

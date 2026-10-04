@@ -83,10 +83,92 @@ pub struct Forwarder {
     ready: Condvar,
     project_counters: Mutex<HashMap<String, Arc<Counters>>>,
     last_error: Mutex<HashMap<String, String>>,
+    allow_private: bool,
+}
+
+/// Why a forwarding host was refused.
+pub fn validate_host(host: &str, allow_private: bool) -> Result<(), &'static str> {
+    let (rest, _) = host
+        .strip_prefix("https://")
+        .map(|rest| (rest, true))
+        .or_else(|| host.strip_prefix("http://").map(|rest| (rest, false)))
+        .ok_or("host must start with http:// or https://")?;
+    if host.len() > 256 || host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("host is not a valid URL");
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err("host must not contain credentials and must name a server");
+    }
+    let (name, port) = match authority.strip_prefix('[') {
+        Some(inner) => {
+            let (address, after) = inner.split_once(']').ok_or("host is not a valid URL")?;
+            (address, after.strip_prefix(':'))
+        }
+        None => match authority.rsplit_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (authority, None),
+        },
+    };
+    if let Some(port) = port
+        && port.parse::<u16>().is_err()
+    {
+        return Err("host has an invalid port");
+    }
+    if allow_private {
+        return Ok(());
+    }
+    let lowered = name.to_ascii_lowercase();
+    if lowered == "localhost" || lowered.ends_with(".localhost") || lowered.ends_with(".internal") {
+        return Err("host resolves to this machine or a private network");
+    }
+    if let Ok(ip) = name.parse::<std::net::IpAddr>()
+        && crate::security::is_forbidden_address(ip)
+    {
+        return Err("host resolves to this machine or a private network");
+    }
+    Ok(())
+}
+
+/// Resolves forwarding hosts at connect time and drops loopback, link-local
+/// (cloud metadata), private and other internal addresses, so neither a DNS
+/// name that points inside nor a rebinding answer can reach them.
+struct PublicOnlyResolver {
+    allow_private: bool,
+}
+
+impl ureq::Resolver for PublicOnlyResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addresses: Vec<_> = netloc.to_socket_addrs()?.collect();
+        if self.allow_private {
+            return Ok(addresses);
+        }
+        let allowed: Vec<_> = addresses
+            .into_iter()
+            .filter(|address| !crate::security::is_forbidden_address(address.ip()))
+            .collect();
+        if allowed.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "forwarding host resolves only to private or internal addresses",
+            ));
+        }
+        Ok(allowed)
+    }
 }
 
 impl Forwarder {
     pub fn open(control_db: &Path) -> Result<Arc<Self>, rusqlite::Error> {
+        Self::open_with_policy(control_db, false)
+    }
+
+    /// `allow_private` lifts the outbound address policy
+    /// (`HOGLET_ALLOW_PRIVATE_FORWARDING=1`), for a PostHog on the same network.
+    pub fn open_with_policy(
+        control_db: &Path,
+        allow_private: bool,
+    ) -> Result<Arc<Self>, rusqlite::Error> {
         let connection = Connection::open_with_flags(
             control_db,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -119,6 +201,7 @@ impl Forwarder {
             ready: Condvar::new(),
             project_counters: Mutex::new(HashMap::new()),
             last_error: Mutex::new(HashMap::new()),
+            allow_private,
         });
         let worker = forwarder.clone();
         std::thread::Builder::new()
@@ -157,6 +240,10 @@ impl Forwarder {
         });
         drop(queue);
         self.ready.notify_one();
+    }
+
+    pub fn allow_private(&self) -> bool {
+        self.allow_private
     }
 
     pub fn config(&self, project_id: &str) -> Option<ForwardingConfig> {
@@ -241,6 +328,11 @@ impl Forwarder {
 
     fn run(&self) {
         let agent = ureq::AgentBuilder::new()
+            .resolver(PublicOnlyResolver {
+                allow_private: self.allow_private,
+            })
+            // A redirect could point anywhere; PostHog's ingestion hosts do not redirect.
+            .redirects(0)
             .timeout_connect(Duration::from_secs(5))
             .timeout(Duration::from_secs(30))
             .user_agent(concat!("hoglet-forward/", env!("CARGO_PKG_VERSION")))
@@ -309,7 +401,8 @@ fn send(agent: &ureq::Agent, config: &ForwardingConfig, events: &[CapturedEvent]
     let mut delay = Duration::from_millis(250);
     for attempt in 1..=MAX_ATTEMPTS {
         match agent.post(&url).send_json(body.clone()) {
-            Ok(_) => return Ok(()),
+            Ok(response) if response.status() < 300 => return Ok(()),
+            Ok(response) => return Err(format!("PostHog answered HTTP {}", response.status())),
             Err(ureq::Error::Status(code, _)) if code < 500 && code != 429 => {
                 return Err(format!("PostHog answered HTTP {code}"));
             }

@@ -224,7 +224,10 @@ fn resolve_timestamp(
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, CaptureError> {
     if let Some(offset_ms) = obj.get("offset").and_then(Value::as_i64) {
-        return Ok(now - Duration::milliseconds(offset_ms));
+        // Client input: `Duration::milliseconds` and `-` panic on overflow.
+        return Duration::try_milliseconds(offset_ms)
+            .and_then(|offset| now.checked_sub_signed(offset))
+            .ok_or(CaptureError::Malformed("bad offset"));
     }
 
     let raw = match obj.get("timestamp").and_then(Value::as_str) {
@@ -241,7 +244,9 @@ fn resolve_timestamp(
         && !ignore_sent_at
     {
         let skew = sent_at - now;
-        ts -= skew;
+        ts = ts
+            .checked_sub_signed(skew)
+            .ok_or(CaptureError::Malformed("bad timestamp"))?;
     }
 
     if ts > now + Duration::hours(MAX_FUTURE_HOURS) {
@@ -257,7 +262,9 @@ pub fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
         return Some(ts.with_timezone(&Utc));
     }
     // Bare +NN / -NN timezone offset.
-    if raw.len() > 3 {
+    // `is_char_boundary`: the string is client input, and `split_at` panics
+    // when the cut lands inside a multi-byte character.
+    if raw.len() > 3 && raw.is_char_boundary(raw.len() - 3) {
         let (head, tail) = raw.split_at(raw.len() - 3);
         if (tail.starts_with('+') || tail.starts_with('-'))
             && tail[1..].chars().all(|c| c.is_ascii_digit())
@@ -290,6 +297,29 @@ fn uuid_v7_at(ts: DateTime<Utc>) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_with_multibyte_tails_are_rejected_not_panics() {
+        for raw in ["2026-10-05T00:00:00\u{e9}aa", "\u{e9}", "\u{e9}\u{e9}\u{e9}", "2026-10-05\u{1d11e}", "+\u{e9}", "\u{65e5}\u{672c}\u{8a9e}"] {
+            assert_eq!(parse_timestamp(raw), None, "{raw}");
+        }
+        let body = "[{\"event\":\"x\",\"distinct_id\":\"u\",\"token\":\"phc_t\",\"timestamp\":\"2026-10-05T00:00:00\u{e9}aa\"}]";
+        assert_eq!(parse(body).unwrap_err(), CaptureError::Malformed("bad timestamp"));
+    }
+
+    #[test]
+    fn absurd_offsets_and_skews_are_rejected_not_panics() {
+        for offset in ["9223372036854775807", "-9223372036854775808"] {
+            let body = format!(
+                "[{{\"event\":\"x\",\"distinct_id\":\"u\",\"token\":\"phc_t\",\"offset\":{offset}}}]"
+            );
+            assert!(matches!(parse(&body), Err(CaptureError::Malformed(_))), "{offset}");
+        }
+        // A far-future timestamp corrected by a large clock skew.
+        let body = "[{\"event\":\"x\",\"distinct_id\":\"u\",\"token\":\"phc_t\",\"timestamp\":\"+262142-12-31T23:59:59Z\"}]";
+        let far_sent_at = Utc.with_ymd_and_hms(1971, 1, 1, 0, 0, 0).single();
+        let _ = parse_body(body, far_sent_at, now());
+    }
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0).unwrap()
