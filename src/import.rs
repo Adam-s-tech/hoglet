@@ -287,6 +287,7 @@ impl Importer {
                 .post(&url)
                 .set("Authorization", &format!("Bearer {key}"))
                 .send_json(body.clone())
+                .map_err(Box::new)
         })?;
         Ok(response["results"].as_array().cloned().unwrap_or_default())
     }
@@ -298,6 +299,7 @@ impl Importer {
                 .get(&url)
                 .set("Authorization", &format!("Bearer {key}"))
                 .call()
+                .map_err(Box::new)
         })
     }
 
@@ -308,7 +310,7 @@ impl Importer {
             "historical_migration": true,
             "batch": events,
         });
-        self.with_retries(|agent, _| agent.post(&url).send_json(body.clone()))
+        self.with_retries(|agent, _| agent.post(&url).send_json(body.clone()).map_err(Box::new))
             .map(|_| ())
     }
 
@@ -342,11 +344,11 @@ impl Importer {
     /// Retry 429/5xx/transport errors with exponential backoff; 4xx is final.
     fn with_retries(
         &mut self,
-        call: impl Fn(&ureq::Agent, &str) -> Result<ureq::Response, ureq::Error>,
+        call: impl Fn(&ureq::Agent, &str) -> Result<ureq::Response, Box<ureq::Error>>,
     ) -> Result<Value, String> {
         let mut delay = Duration::from_millis(500);
         for attempt in 1..=MAX_ATTEMPTS {
-            match call(&self.agent, &self.config.posthog_key) {
+            match call(&self.agent, &self.config.posthog_key).map_err(|error| *error) {
                 Ok(response) => {
                     let text = response.into_string().map_err(|error| error.to_string())?;
                     return Ok(if text.trim().is_empty() {

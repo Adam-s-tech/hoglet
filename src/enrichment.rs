@@ -117,7 +117,7 @@ impl Enricher {
             return;
         }
 
-        let ip = match ip.and_then(|v| if v.is_empty() { None } else { Some(v) }) {
+        let ip = match ip.filter(|v| !v.is_empty()) {
             Some(ip) => ip,
             None => return,
         };
