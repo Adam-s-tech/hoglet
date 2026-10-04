@@ -435,6 +435,7 @@ export function WebPage() {
                     },
                   ]}
                   legend={false}
+                  dataTable
                 />
               ) : (
                 <Skeleton className="h-[260px]" />

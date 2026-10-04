@@ -440,6 +440,7 @@ function TrendsView({ query, series, compact, onSelect }: { query: TrendsQ; seri
       tooltipTitle={(i) => (base.days[i] ? fmtBucket(base.days[i], interval(query)) : labels[i])}
       onPointClick={(si, i) => select(series[si], i)}
       legend={!compact || series.length <= 6}
+      dataTable={!compact}
     />
   );
 }
@@ -489,6 +490,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
               series={[{ key: "ttc", label: "Persons converted", color: "var(--s1)", data: result.time_to_convert.map((b) => b.count) }]}
               tooltipTitle={(i) => `${fmtDuration(result.time_to_convert[i].from_s)} – ${fmtDuration(result.time_to_convert[i].to_s)}`}
               legend={false}
+              dataTable
             />
           )}
         </div>
@@ -520,6 +522,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
       <TimeSeriesChart
         kind="stacked"
         height={compact ? 220 : 340}
+        dataTable={!compact}
         labels={labels}
         series={statuses.map((s, i) => ({ key: s.key, label: s.label, color: seriesColor(i), data: s.data.map(Number) }))}
         onPointClick={(si, i) => {
@@ -538,6 +541,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
         <TimeSeriesChart
           kind="bar"
           height={compact ? 220 : 340}
+          dataTable={!compact}
           labels={labels}
           series={result.series.map((s, i) => ({ key: String(i), label: s.label, color: seriesColor(i), data: s.data.map(Number) }))}
           onPointClick={(si, i) => {

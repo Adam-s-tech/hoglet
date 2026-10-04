@@ -123,7 +123,7 @@ function Freshness() {
 }
 
 function ProjectMark({ name }: { name: string }) {
-  return <span className="grid size-6 flex-none place-items-center rounded-md bg-brand text-[10px] font-bold text-white">{name.slice(0, 2).toUpperCase()}</span>;
+  return <span className="grid size-6 flex-none place-items-center rounded-md bg-brand text-[10px] font-bold text-on-brand">{name.slice(0, 2).toUpperCase()}</span>;
 }
 
 function ProjectSwitcher({ onNavigate }: { onNavigate?: () => void }) {
@@ -185,7 +185,7 @@ function UserMenu({ onNavigate }: { onNavigate?: () => void }) {
         aria-label={`Account menu for ${email}`}
         className="flex h-9 w-full items-center gap-2 rounded-lg px-2 text-left font-medium outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring aria-expanded:bg-accent"
       >
-        <span className="grid size-[22px] flex-none place-items-center rounded-full bg-brand text-[10px] font-semibold text-white" aria-hidden="true">
+        <span className="grid size-[22px] flex-none place-items-center rounded-full bg-brand text-[10px] font-semibold text-on-brand" aria-hidden="true">
           {email.slice(0, 1).toUpperCase()}
         </span>
         <span className="truncate">{email}</span>
