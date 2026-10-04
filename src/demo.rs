@@ -67,7 +67,10 @@ const REFERRERS: &[(Option<(&str, &str)>, u32)] = &[
     (Some(("https://www.linkedin.com/", "www.linkedin.com")), 2),
 ];
 
-const CAMPAIGNS: &[(Option<(&str, &str, &str)>, u32)] = &[
+/// `(utm_source, utm_medium, utm_campaign)`.
+type Campaign = (&'static str, &'static str, &'static str);
+
+const CAMPAIGNS: &[(Option<Campaign>, u32)] = &[
     (None, 80),
     (Some(("newsletter", "email", "october_digest")), 7),
     (Some(("google", "cpc", "brand_search")), 6),

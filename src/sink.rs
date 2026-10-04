@@ -272,7 +272,6 @@ pub struct DurableWalSink {
 
 pub struct DurableWalRuntime {
     sender: sync_mpsc::SyncSender<WriterRequest>,
-    publisher_signals: sync_mpsc::SyncSender<PublisherSignal>,
     writer: Option<std::thread::JoinHandle<()>>,
     publisher: Option<std::thread::JoinHandle<()>>,
     stats: Arc<PipelineStats>,
@@ -312,7 +311,6 @@ impl DurableWalSink {
         );
 
         let (signal_tx, signal_rx) = sync_mpsc::sync_channel(64);
-        let publisher_signals = signal_tx.clone();
         let publisher_stats = stats.clone();
         let publisher_thread = std::thread::Builder::new()
             .name("hoglet-publisher".to_owned())
@@ -339,7 +337,6 @@ impl DurableWalSink {
             }),
             DurableWalRuntime {
                 sender,
-                publisher_signals,
                 writer: Some(writer_thread),
                 publisher: Some(publisher_thread),
                 stats,
