@@ -11,12 +11,13 @@
       (function () {
         try {
           var t = localStorage.getItem("hoglet.theme");
-          if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+          var dark = t === "dark" || (t !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.classList.add("dark");
         } catch (e) {}
       })();
     </script>
-    <script type="module" crossorigin src="/assets/index-DVJYaJCI.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-DLaFA32m.css">
+    <script type="module" crossorigin src="/assets/index-O9LpZEzk.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-BJYWpklQ.css">
   </head>
   <body>
     <div id="root"></div>
