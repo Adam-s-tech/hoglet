@@ -854,17 +854,16 @@ fn discover_segment_layout(directory: &Path) -> Result<SegmentLayout, WalError> 
             ));
         }
     }
-    if let Some((active_sequence, _)) = active.as_ref() {
-        if sequences
+    if let Some((active_sequence, _)) = active.as_ref()
+        && sequences
             .last()
             .is_some_and(|(last_sequence, _)| active_sequence != last_sequence)
-        {
-            return Err(corruption(
-                *active_sequence,
-                0,
-                "active segment is not newest",
-            ));
-        }
+    {
+        return Err(corruption(
+            *active_sequence,
+            0,
+            "active segment is not newest",
+        ));
     }
 
     Ok(SegmentLayout { sealed, active })
@@ -977,6 +976,7 @@ fn create_directory_durable(directory: &Path) -> Result<(), WalError> {
 fn acquire_writer_lock(directory: &Path) -> Result<File, WalError> {
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(directory.join(WRITER_LOCK_FILE))?;

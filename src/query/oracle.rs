@@ -111,7 +111,7 @@ fn trends_oracle(
         buckets.entry((iv, bv)).or_default().push(*e);
     }
     let mut results = Vec::new();
-    for (_si, series) in query.series.iter().enumerate() {
+    for series in query.series.iter() {
         let label = match &series.event {
             EventMatch::Name(n) => n.clone(),
             EventMatch::Any => "any event".into(),
@@ -222,19 +222,17 @@ fn f_matches(event: &CapturedEvent, filter: &Filter) -> bool {
     }
 }
 fn dr_matches(event: &CapturedEvent, range: &DateRange) -> bool {
-    if let Some(ref f) = range.from {
-        if let Ok(dt) = DateTime::parse_from_rfc3339(f) {
-            if event.timestamp < dt.with_timezone(&Utc) {
-                return false;
-            }
-        }
+    if let Some(ref f) = range.from
+        && let Ok(dt) = DateTime::parse_from_rfc3339(f)
+        && event.timestamp < dt.with_timezone(&Utc)
+    {
+        return false;
     }
-    if let Some(ref t) = range.to {
-        if let Ok(dt) = DateTime::parse_from_rfc3339(t) {
-            if event.timestamp > dt.with_timezone(&Utc) {
-                return false;
-            }
-        }
+    if let Some(ref t) = range.to
+        && let Ok(dt) = DateTime::parse_from_rfc3339(t)
+        && event.timestamp > dt.with_timezone(&Utc)
+    {
+        return false;
     }
     if let Some(ref ln) = range.last_n {
         let now = Utc::now();

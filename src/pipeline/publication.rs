@@ -226,7 +226,7 @@ impl PublicationCoordinator {
 
         let mut window = wal.read_window(state.checkpoint, max_wal_bytes)?;
         let mut records = Vec::new();
-        while let Some(record) = window.next() {
+        for record in window.by_ref() {
             records.push(record?);
         }
         if records.is_empty() {

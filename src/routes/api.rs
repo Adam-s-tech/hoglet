@@ -195,12 +195,11 @@ async fn query(State(s): State<ApiState>, Json(b): Json<QueryRequest>) -> Respon
         data_version: s.index.as_ref().map(|i| i.read_version()).unwrap_or(0),
     });
 
-    if !b.refresh {
-        if let (Some(cache), Some(key)) = (s.cache.as_ref(), key.as_ref()) {
-            if let Some(cached) = cache.get(key) {
-                return json_response(cached, "HIT");
-            }
-        }
+    if !b.refresh
+        && let (Some(cache), Some(key)) = (s.cache.as_ref(), key.as_ref())
+        && let Some(cached) = cache.get(key)
+    {
+        return json_response(cached, "HIT");
     }
 
     let token = b.token.clone();

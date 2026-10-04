@@ -93,11 +93,8 @@ fn extract_session(headers: &axum::http::HeaderMap) -> Option<String> {
         .and_then(|cookies| {
             cookies.split(';').find_map(|c| {
                 let c = c.trim();
-                if let Some(v) = c.strip_prefix(&format!("{COOKIE_NAME}=")) {
-                    Some(v.to_string())
-                } else {
-                    None
-                }
+                c.strip_prefix(&format!("{COOKIE_NAME}="))
+                    .map(|v| v.to_string())
             })
         })
 }
@@ -220,25 +217,25 @@ async fn revoke_key(
 
 // ── Auth helper for gated endpoints ──────────────────────────
 
+// The Err is a ready-to-send rejection Response — the axum idiom for auth
+// helpers; its size is irrelevant on the cold failure path.
+#[allow(clippy::result_large_err)]
 pub fn authenticate(
     state: &AuthState,
     headers: &axum::http::HeaderMap,
 ) -> Result<crate::auth::User, Response> {
-    if let Some(sid) = extract_session(headers) {
-        match state.store.validate_session(&sid) {
-            Ok(u) => return Ok(u),
-            Err(_) => {}
-        }
+    if let Some(sid) = extract_session(headers)
+        && let Ok(u) = state.store.validate_session(&sid)
+    {
+        return Ok(u);
     }
     if let Some(key) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        && let Ok(u) = state.store.validate_api_key(key)
     {
-        match state.store.validate_api_key(key) {
-            Ok(u) => return Ok(u),
-            Err(_) => {}
-        }
+        return Ok(u);
     }
     Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
 }

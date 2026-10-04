@@ -74,10 +74,10 @@ pub async fn require_auth(
     }
 
     // Session cookie.
-    if let Some(sid) = extract_session(&headers) {
-        if store.validate_session(&sid).is_ok() {
-            return next.run(request).await;
-        }
+    if let Some(sid) = extract_session(&headers)
+        && store.validate_session(&sid).is_ok()
+    {
+        return next.run(request).await;
     }
 
     // Personal API key.
@@ -85,12 +85,11 @@ pub async fn require_auth(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        && let Ok(user) = store.validate_api_key(key)
     {
-        if let Ok(user) = store.validate_api_key(key) {
-            let mut request = request;
-            request.extensions_mut().insert(user);
-            return next.run(request).await;
-        }
+        let mut request = request;
+        request.extensions_mut().insert(user);
+        return next.run(request).await;
     }
 
     (StatusCode::UNAUTHORIZED, "unauthorized").into_response()

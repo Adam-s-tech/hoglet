@@ -39,12 +39,11 @@ impl std::ops::DerefMut for PooledConn {
 
 impl Drop for PooledConn {
     fn drop(&mut self) {
-        if let Some(c) = self.conn.take() {
-            if let Ok(mut pool) = self.pool.lock() {
-                if pool.len() < MAX_CONCURRENT_QUERIES {
-                    pool.push_back(c);
-                }
-            }
+        if let Some(c) = self.conn.take()
+            && let Ok(mut pool) = self.pool.lock()
+            && pool.len() < MAX_CONCURRENT_QUERIES
+        {
+            pool.push_back(c);
         }
     }
 }
@@ -70,6 +69,9 @@ fn configured_connection() -> Result<Connection, duckdb::Error> {
     ))?;
     Ok(connection)
 }
+
+/// One trends result row: (interval, breakdown value, per-series counts).
+type TrendsRow = (String, Option<String>, Vec<(String, i64)>);
 
 pub struct QueryEngine {
     /// Present only for the explicitly versioned production query path.
@@ -720,7 +722,7 @@ impl QueryEngine {
         let hb = query.breakdown.is_some();
         let lo = if hb { 2 } else { 1 };
         let co = if hb { 3 } else { 2 };
-        let rows: Vec<(String, Option<String>, Vec<(String, i64)>)> = if vals.is_empty() {
+        let rows: Vec<TrendsRow> = if vals.is_empty() {
             stmt.query_map([], move |r| {
                 let iv: String = r.get(0)?;
                 let bd: Option<String> = if hb {
@@ -829,7 +831,7 @@ impl QueryEngine {
         )?;
         let te: i64 = resp
             .results
-            .get(0)
+            .first()
             .map(|s| s.data.iter().map(|d| d.count).sum())
             .unwrap_or(0);
         let up: i64 = resp
@@ -1132,7 +1134,7 @@ fn kind_str(query: &ir::Query) -> String {
 fn build_trends_results(
     has_bd: bool,
     ns: usize,
-    rows: &[(String, Option<String>, Vec<(String, i64)>)],
+    rows: &[TrendsRow],
     query: &ir::Query,
 ) -> Vec<ir::SeriesResult> {
     if has_bd {
@@ -1141,7 +1143,7 @@ fn build_trends_results(
         let mut co: Vec<(String, String)> = Vec::new();
         for (iv, bd, sd) in rows {
             let b = bd.clone().unwrap_or_default();
-            for (_i, (l, c)) in sd.iter().enumerate() {
+            for (l, c) in sd.iter() {
                 let k = (l.clone(), b.clone());
                 if !cm.contains_key(&k) {
                     co.push(k.clone());

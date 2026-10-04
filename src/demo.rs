@@ -26,11 +26,11 @@ pub fn seed_if_demo(
     }
 
     // Skip if data already exists
-    if let Ok(files) = store.list_files() {
-        if !files.is_empty() {
-            tracing::info!("demo mode: data already exists, skipping seed");
-            return;
-        }
+    if let Ok(files) = store.list_files()
+        && !files.is_empty()
+    {
+        tracing::info!("demo mode: data already exists, skipping seed");
+        return;
     }
 
     tracing::info!("demo mode: seeding sample data...");

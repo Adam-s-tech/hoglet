@@ -235,7 +235,7 @@ async fn flags(
         }
     };
 
-    let body = match query.v.as_deref() {
+    let shape = match query.v.as_deref() {
         // v1: array of enabled flag keys.
         Some("1") => {
             let keys: Vec<&str> = evaluated
@@ -293,7 +293,15 @@ async fn flags(
             })
         }
     };
-    Json(body).into_response()
+    // Every shape flattens the remote-config fields (spec/wire-compat.md):
+    // the SDK also reads feature toggles like `surveys` from the flags
+    // response, and an absent key reads as "unknown", not "off".
+    let mut body = crate::routes::config::remote_config_fields();
+    match shape {
+        Value::Object(map) => body.extend(map),
+        _ => unreachable!("flags shapes are objects"),
+    }
+    Json(Value::Object(body)).into_response()
 }
 
 async fn local_eval_definitions(

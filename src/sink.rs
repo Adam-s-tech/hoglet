@@ -232,13 +232,13 @@ impl DurableWalRuntime {
         } else {
             Err(DurablePipelineError::WorkerPanicked)
         };
-        if let Some(worker) = self.worker.take() {
-            if !matches!(
+        if let Some(worker) = self.worker.take()
+            && !matches!(
                 tokio::task::spawn_blocking(move || worker.join()).await,
                 Ok(Ok(()))
-            ) {
-                return Err(DurablePipelineError::WorkerPanicked);
-            }
+            )
+        {
+            return Err(DurablePipelineError::WorkerPanicked);
         }
         result
     }

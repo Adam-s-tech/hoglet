@@ -9,6 +9,12 @@ pub struct FileIndex {
     version: std::sync::atomic::AtomicU64,
 }
 
+impl Default for FileIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileIndex {
     pub fn new() -> Self {
         FileIndex {
@@ -43,7 +49,7 @@ impl FileIndex {
         let mut paths = Vec::new();
         for key in [token, "*"] {
             if let Some(dates) = map.get(key) {
-                for (_date, files) in dates {
+                for files in dates.values() {
                     paths.extend(files.clone());
                 }
             }

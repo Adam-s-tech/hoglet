@@ -365,8 +365,8 @@ fn compile_funnels(
             bind_filters(&mut params);
             ctes[0].push_str(" GROUP BY distinct_id)");
 
-            for i in 1..steps.len() {
-                let step = steps[i].replace('\'', "''");
+            for (i, step_name) in steps.iter().enumerate().skip(1) {
+                let step = step_name.replace('\'', "''");
                 let mut cte = format!(
                     "s{i} AS (SELECT s{prev}.distinct_id, min(e.timestamp) t \
                      FROM s{prev} JOIN e ON e.distinct_id = s{prev}.distinct_id \
@@ -410,8 +410,7 @@ fn compile_funnels(
             // completed all steps (any order) within the window.
             let step_conditions: Vec<String> = steps
                 .iter()
-                .enumerate()
-                .map(|(_i, s)| {
+                .map(|s| {
                     format!(
                         "sum(CASE WHEN e.event = '{}' THEN 1 ELSE 0 END) > 0",
                         s.replace('\'', "''")
@@ -512,8 +511,7 @@ fn compile_retention(
     };
     let total_periods = config.total_periods.min(90);
 
-    let mut params: Vec<ParamValue> = Vec::new();
-    params.push(ParamValue::Text(token.to_string()));
+    let params: Vec<ParamValue> = vec![ParamValue::Text(token.to_string())];
 
     let sql = format!(
         "WITH deduped AS (\n\

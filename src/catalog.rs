@@ -143,11 +143,11 @@ impl CatalogStore {
 
                 stmt_key.execute(rusqlite::params![token, "event", key, type_guess, now])?;
 
-                if let Some(v) = value {
-                    if !v.is_null() {
-                        let val_str = value_to_string(v);
-                        stmt_value.execute(rusqlite::params![token, key, &val_str])?;
-                    }
+                if let Some(v) = value
+                    && !v.is_null()
+                {
+                    let val_str = value_to_string(v);
+                    stmt_value.execute(rusqlite::params![token, key, &val_str])?;
                 }
             }
         }

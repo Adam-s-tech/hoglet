@@ -285,11 +285,11 @@ impl CohortStore {
             let mut stmt = conn.prepare(&sql)?;
             let members: Vec<String> = stmt
                 .query_map(
-                    &[
+                    [
                         &token as &dyn duckdb::ToSql,
                         &def.0 as &dyn duckdb::ToSql,
                         &(*def.3 as i64) as &dyn duckdb::ToSql,
-                        &(*def.2) as &dyn duckdb::ToSql,
+                        def.2 as &dyn duckdb::ToSql,
                     ],
                     |r| r.get(0),
                 )?

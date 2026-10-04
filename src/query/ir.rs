@@ -91,17 +91,13 @@ impl Series {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 #[serde(tag = "type", content = "value")]
+#[derive(Default)]
 pub enum EventMatch {
     #[serde(rename = "name")]
     Name(String),
     #[serde(rename = "any")]
+    #[default]
     Any,
-}
-
-impl Default for EventMatch {
-    fn default() -> Self {
-        EventMatch::Any
-    }
 }
 
 // ── Math ──────────────────────────────────────────────────────────
@@ -109,8 +105,10 @@ impl Default for EventMatch {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 #[serde(tag = "type", content = "value")]
+#[derive(Default)]
 pub enum Math {
     #[serde(rename = "total")]
+    #[default]
     Total,
     /// Distinct persons within each requested interval.
     #[serde(rename = "unique_persons")]
@@ -145,12 +143,6 @@ pub enum Math {
     PropertyP99(String),
     #[serde(rename = "count_per_actor")]
     CountPerActor(ActorAgg),
-}
-
-impl Default for Math {
-    fn default() -> Self {
-        Math::Total
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -330,16 +322,20 @@ pub struct Formula {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
+#[derive(Default)]
 pub enum FunnelOrder {
+    #[default]
     Ordered,
     Unordered,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
+#[derive(Default)]
 pub enum FunnelAttribution {
     FirstTouch,
     LastTouch,
+    #[default]
     AllSteps,
 }
 
@@ -362,30 +358,22 @@ pub struct FunnelConfig {
     pub attribution: FunnelAttribution,
 }
 
-impl Default for FunnelOrder {
-    fn default() -> Self {
-        FunnelOrder::Ordered
-    }
-}
-
-impl Default for FunnelAttribution {
-    fn default() -> Self {
-        FunnelAttribution::AllSteps
-    }
-}
-
 // ── Retention config ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
+#[derive(Default)]
 pub enum RetentionType {
+    #[default]
     Recurring,
     FirstTime,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
+#[derive(Default)]
 pub enum RetentionPeriod {
+    #[default]
     Day,
     Week,
     Month,
@@ -404,16 +392,6 @@ pub struct RetentionConfig {
     pub total_periods: u32,
 }
 
-impl Default for RetentionType {
-    fn default() -> Self {
-        RetentionType::Recurring
-    }
-}
-impl Default for RetentionPeriod {
-    fn default() -> Self {
-        RetentionPeriod::Day
-    }
-}
 fn default_total_periods() -> u32 {
     10
 }
@@ -431,7 +409,9 @@ pub enum LifecycleStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
+#[derive(Default)]
 pub enum LifecyclePeriod {
+    #[default]
     Day,
     Week,
     Month,
@@ -443,12 +423,6 @@ pub struct LifecycleConfig {
     pub event: EventMatch,
     #[serde(default)]
     pub prior_period: LifecyclePeriod,
-}
-
-impl Default for LifecyclePeriod {
-    fn default() -> Self {
-        LifecyclePeriod::Day
-    }
 }
 
 // ── Stickiness config ──────────────────────────────────────────────
@@ -598,10 +572,10 @@ impl Query {
         if self.series.len() > 10 {
             return Err(IrError::Invalid("max 10 series per query"));
         }
-        if let Some(ref b) = self.breakdown {
-            if b.key.is_empty() {
-                return Err(IrError::Invalid("breakdown key must not be empty"));
-            }
+        if let Some(ref b) = self.breakdown
+            && b.key.is_empty()
+        {
+            return Err(IrError::Invalid("breakdown key must not be empty"));
         }
         for s in &self.series {
             match &s.event {

@@ -1,5 +1,12 @@
 name: CI
 
+env:
+  # Full debug info on DuckDB-linked test binaries OOMs the runner's linker
+  # (ld killed with SIGBUS). Tests don't need debuginfo in CI; backtraces
+  # still carry symbol names.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
 on:
   push:
   pull_request:

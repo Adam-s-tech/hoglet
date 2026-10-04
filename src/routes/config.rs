@@ -10,13 +10,39 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde_json::json;
 
 use crate::{capture::CaptureAuthorizer, token};
+
+/// Remote-config fields shared by `/array/:token/config`, `config.js`, and
+/// flattened into every flags response shape (spec/wire-compat.md: "All shapes
+/// flatten a `config` object"). Features we don't implement are declared off
+/// in every source the SDK consults, because an absent key means "unknown" and
+/// can make it try loading the extension anyway.
+pub fn remote_config_fields() -> serde_json::Map<String, serde_json::Value> {
+    match json!({
+        "supportedCompression": ["gzip", "gzip-js"],
+        "hasFeatureFlags": true,
+        "sessionRecording": false,
+        "surveys": false,
+        "heatmaps": false,
+        "capturePerformance": false,
+        "autocaptureExceptions": false,
+        "isAuthenticated": false,
+        "toolbarParams": {},
+        "analytics": {"endpoint": "/i/v0/e/"},
+        "defaultIdentifiedOnly": true,
+        "siteApps": [],
+        "config": {"enable_collect_everything": true},
+    }) {
+        serde_json::Value::Object(fields) => fields,
+        _ => unreachable!(),
+    }
+}
 
 #[derive(Clone)]
 struct ConfigState {
@@ -42,37 +68,49 @@ fn routes(state: ConfigState) -> Router {
     Router::new()
         .route("/array/{token}/config", get(config))
         .route("/array/{token}/config/", get(config))
+        .route("/array/{token}/config.js", get(config_js))
         .with_state(state)
 }
 
-async fn config(State(state): State<ConfigState>, Path(token): Path<String>) -> Response {
-    if token::validate(&token).is_err() {
+async fn authorize(state: &ConfigState, token: &str) -> Result<(), StatusCode> {
+    if token::validate(token).is_err() {
         // Invalid token shape → 401, which posthog-js never retries.
-        return StatusCode::UNAUTHORIZED.into_response();
+        return Err(StatusCode::UNAUTHORIZED);
     }
     if let Some(authorizer) = &state.authorizer
-        && authorizer.authorize(&token).await.is_err()
+        && authorizer.authorize(token).await.is_err()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return Err(StatusCode::UNAUTHORIZED);
     }
+    Ok(())
+}
 
-    Json(json!({
-        "token": token,
-        "supportedCompression": ["gzip", "gzip-js"],
-        "hasFeatureFlags": true,
-        "sessionRecording": false,
-        "surveys": false,
-        "heatmaps": false,
-        "capturePerformance": false,
-        "autocaptureExceptions": false,
-        "isAuthenticated": false,
-        "toolbarParams": {},
-        "analytics": {"endpoint": "/i/v0/e/"},
-        "defaultIdentifiedOnly": true,
-        "siteApps": [],
-        "config": {"enable_collect_everything": true},
-    }))
-    .into_response()
+fn config_body(token: &str) -> serde_json::Value {
+    let mut fields = remote_config_fields();
+    fields.insert("token".into(), json!(token));
+    serde_json::Value::Object(fields)
+}
+
+async fn config(State(state): State<ConfigState>, Path(token): Path<String>) -> Response {
+    if let Err(status) = authorize(&state, &token).await {
+        return status.into_response();
+    }
+    Json(config_body(&token)).into_response()
+}
+
+/// The script variant posthog-js tries first: assigns the remote config into
+/// `window._POSTHOG_REMOTE_CONFIG[token]` (see posthog-js remote-config.ts;
+/// on failure the SDK falls back to the JSON endpoint above).
+async fn config_js(State(state): State<ConfigState>, Path(token): Path<String>) -> Response {
+    if let Err(status) = authorize(&state, &token).await {
+        return status.into_response();
+    }
+    let body = format!(
+        "(function() {{\n  window._POSTHOG_REMOTE_CONFIG = window._POSTHOG_REMOTE_CONFIG || {{}};\n  window._POSTHOG_REMOTE_CONFIG[{token}] = {{\n    config: {config},\n    siteApps: []\n  }}\n}})();\n",
+        token = json!(token),
+        config = config_body(&token),
+    );
+    ([(header::CONTENT_TYPE, "application/javascript")], body).into_response()
 }
 
 #[cfg(test)]
