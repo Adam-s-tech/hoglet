@@ -19,7 +19,15 @@ const SCALAR_JS: &[u8] = include_bytes!("../../web/vendor/scalar.standalone.js")
 pub fn router() -> Router {
     Router::new()
         .route("/openapi.json", get(|| async { Json(spec()) }))
-        .route("/docs", get(docs_page))
+        .route(
+            "/docs",
+            get(|| async {
+                (
+                    [(header::CONTENT_SECURITY_POLICY, crate::security::DOCS_CSP)],
+                    docs_page().await,
+                )
+            }),
+        )
         .route("/docs/scalar.js", get(scalar_js))
 }
 

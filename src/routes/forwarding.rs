@@ -66,15 +66,17 @@ async fn update(
     let Ok(Json(config)) = body else {
         return error(StatusCode::BAD_REQUEST, "invalid_request", "Expected {enabled, host, posthog_token}.");
     };
-    let host_ok = (config.host.starts_with("https://") || config.host.starts_with("http://"))
-        && config.host.len() <= 256;
+    let host_check = crate::forward::validate_host(&config.host, state.forwarder.allow_private());
     let token_ok = config.posthog_token.starts_with("phc_") && config.posthog_token.len() <= 128;
-    if config.enabled && (!host_ok || !token_ok) {
+    if config.enabled && !token_ok {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "host must be an http(s) URL and posthog_token a phc_ project key.",
         );
+    }
+    if let (true, Err(reason)) = (config.enabled, host_check) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", reason);
     }
     match state.forwarder.set_config(&project.project_id, config) {
         Ok(()) => Json(state.forwarder.status(&project.project_id)).into_response(),

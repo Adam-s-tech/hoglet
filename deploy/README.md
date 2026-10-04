@@ -27,6 +27,11 @@ Configuration is environment only:
 | `HOGLET_DATA` | `./hoglet-data` (unit: `/var/lib/hoglet`, image: `/data`) | data directory |
 | `HOGLET_MAX_EVENTS_PER_SEC` | `10000` | per-project capture rate limit |
 | `HOGLET_RETENTION_DAYS` | keep all | delete events older than N days |
+| `HOGLET_SETUP_TOKEN` | unset | if set, creating the first account needs it (`X-Hoglet-Setup-Token` header or `setup_token` body field) |
+| `HOGLET_TRUST_PROXY` | unset | `1` behind the proxies below: login throttling keys on the last `X-Forwarded-For` entry |
+| `HOGLET_SECURE_COOKIES` | unset | `1` forces the `Secure` cookie flag (it is also set when `X-Forwarded-Proto: https`) |
+| `HOGLET_METRICS_TOKEN` | unset | if set, `/metrics` needs `Authorization: Bearer <token>` |
+| `HOGLET_ALLOW_PRIVATE_FORWARDING` | unset | `1` lets shadow-mode forwarding reach private and loopback addresses |
 | `RUST_LOG` | `hoglet=info` | log filter |
 
 Health: `GET /health` is liveness; `GET /ready` is 200 while serving and 503

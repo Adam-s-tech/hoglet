@@ -279,10 +279,17 @@ enum Command {
     },
     Setup {
         request: SetupRequest,
+        password_hash: String,
         response: oneshot::Sender<Result<SetupResult, AccessError>>,
     },
-    Login {
-        request: LoginRequest,
+    /// Fetch the stored credentials for an email; hashing happens elsewhere.
+    LoginLookup {
+        email: String,
+        response: oneshot::Sender<Result<Option<(String, String)>, AccessError>>,
+    },
+    /// Open a session for a user whose password was already verified.
+    StartSession {
+        user_id: String,
         response: oneshot::Sender<Result<SetupResult, AccessError>>,
     },
     Logout {
@@ -338,9 +345,17 @@ enum Command {
     },
 }
 
+/// Concurrent password hash/verify jobs. Argon2 is deliberately expensive in
+/// time and memory, so it runs on the blocking pool behind this gate rather
+/// than on the control thread (which every capture authorization shares).
+const MAX_CONCURRENT_HASHING: usize = 2;
+/// How long a login or setup waits for a hashing slot before giving up.
+const HASHING_QUEUE_WAIT: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct ProjectAccess {
     tx: mpsc::Sender<Command>,
+    hashing: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 pub struct ProjectAccessRuntime {
@@ -357,7 +372,10 @@ impl ProjectAccess {
             .spawn(move || worker_loop(connection, rx))
             .map_err(|_| AccessError::Unavailable)?;
         Ok((
-            Self { tx: tx.clone() },
+            Self {
+                tx: tx.clone(),
+                hashing: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHING)),
+            },
             ProjectAccessRuntime {
                 tx,
                 worker: Some(worker),
@@ -366,12 +384,44 @@ impl ProjectAccess {
     }
 
     pub async fn setup(&self, request: SetupRequest) -> Result<SetupResult, AccessError> {
+        // Validate before spending a hashing slot; the worker validates again.
+        validate_email(&request.email)?;
+        validate_password(&request.password)?;
+        // Once an account exists, setup is closed: refuse before hashing so
+        // anonymous callers cannot spend CPU on a finished installation.
+        if !self.setup_required().await? {
+            return Err(AccessError::SetupComplete);
+        }
+        let password = request.password.clone();
+        let password_hash = self.run_hashing(move || hash_password(&password)).await??;
         let (response, receive) = oneshot::channel();
         self.tx
-            .send(Command::Setup { request, response })
+            .send(Command::Setup {
+                request,
+                password_hash,
+                response,
+            })
             .await
             .map_err(|_| AccessError::Unavailable)?;
         receive.await.map_err(|_| AccessError::Unavailable)?
+    }
+
+    /// Run a password hashing job on the blocking pool, at most
+    /// `MAX_CONCURRENT_HASHING` at a time.
+    async fn run_hashing<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, AccessError> {
+        let permit = tokio::time::timeout(HASHING_QUEUE_WAIT, self.hashing.clone().acquire_owned())
+            .await
+            .map_err(|_| AccessError::Unavailable)?
+            .map_err(|_| AccessError::Unavailable)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            job()
+        })
+        .await
+        .map_err(|_| AccessError::Unavailable)
     }
 
     pub async fn setup_required(&self) -> Result<bool, AccessError> {
@@ -384,9 +434,31 @@ impl ProjectAccess {
     }
 
     pub async fn login(&self, request: LoginRequest) -> Result<SetupResult, AccessError> {
+        validate_email(&request.email).map_err(|_| AccessError::InvalidCredentials)?;
+        validate_password(&request.password).map_err(|_| AccessError::InvalidCredentials)?;
+        let email = request.email.trim().to_ascii_lowercase();
         let (response, receive) = oneshot::channel();
         self.tx
-            .send(Command::Login { request, response })
+            .send(Command::LoginLookup { email, response })
+            .await
+            .map_err(|_| AccessError::Unavailable)?;
+        let credentials = receive.await.map_err(|_| AccessError::Unavailable)??;
+        // An unknown email verifies against a throwaway hash so the response
+        // time does not reveal which emails have accounts.
+        let known = credentials.is_some();
+        let (user_id, stored_hash) = credentials
+            .unwrap_or_else(|| (String::new(), dummy_password_hash().to_owned()));
+        let password = request.password;
+        let verified = self
+            .run_hashing(move || verify_password(&stored_hash, &password))
+            .await?;
+        if !known {
+            return Err(AccessError::InvalidCredentials);
+        }
+        verified?;
+        let (response, receive) = oneshot::channel();
+        self.tx
+            .send(Command::StartSession { user_id, response })
             .await
             .map_err(|_| AccessError::Unavailable)?;
         receive.await.map_err(|_| AccessError::Unavailable)?
@@ -647,11 +719,26 @@ fn worker_loop(mut connection: Connection, mut rx: mpsc::Receiver<Command>) {
                     .map_err(AccessError::from);
                 let _ = response.send(result);
             }
-            Command::Setup { request, response } => {
-                let _ = response.send(setup(&mut connection, request));
+            Command::Setup {
+                request,
+                password_hash,
+                response,
+            } => {
+                let _ = response.send(setup(&mut connection, request, password_hash));
             }
-            Command::Login { request, response } => {
-                let _ = response.send(login(&mut connection, request));
+            Command::LoginLookup { email, response } => {
+                let result = connection
+                    .query_row(
+                        "SELECT id,password_hash FROM users WHERE email=?1",
+                        [&email],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(AccessError::from);
+                let _ = response.send(result);
+            }
+            Command::StartSession { user_id, response } => {
+                let _ = response.send(start_session(&mut connection, &user_id));
             }
             Command::Logout {
                 session_id,
@@ -743,7 +830,11 @@ fn worker_loop(mut connection: Connection, mut rx: mpsc::Receiver<Command>) {
     }
 }
 
-fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResult, AccessError> {
+fn setup(
+    connection: &mut Connection,
+    request: SetupRequest,
+    password_hash: String,
+) -> Result<SetupResult, AccessError> {
     if let Some(value) = request.existing_project_token.as_deref() {
         token::validate(value).map_err(|_| AccessError::InvalidToken)?;
     }
@@ -754,8 +845,7 @@ fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResu
     let now = Utc::now().timestamp();
     let created_at = Utc::now().timestamp_millis();
     let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let password_hash = hash_password(&request.password)?;
+    let session_id = new_session_id();
     let email = request.email.trim().to_ascii_lowercase();
 
     // Hold the SQLite write lock while deciding whether setup is still
@@ -842,22 +932,9 @@ fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResu
     })
 }
 
-fn login(connection: &mut Connection, request: LoginRequest) -> Result<SetupResult, AccessError> {
-    validate_email(&request.email).map_err(|_| AccessError::InvalidCredentials)?;
-    validate_password(&request.password).map_err(|_| AccessError::InvalidCredentials)?;
-    let email = request.email.trim().to_ascii_lowercase();
-    let credentials: Option<(String, String)> = connection
-        .query_row(
-            "SELECT id,password_hash FROM users WHERE email=?1",
-            [&email],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let (user_id, password_hash) = credentials.ok_or(AccessError::InvalidCredentials)?;
-    verify_password(&password_hash, &request.password)?;
-
+fn start_session(connection: &mut Connection, user_id: &str) -> Result<SetupResult, AccessError> {
     let now = Utc::now().timestamp();
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = new_session_id();
     let transaction = connection.transaction()?;
     transaction.execute("DELETE FROM auth_sessions WHERE expires_at<=?1", [now])?;
     transaction.execute(
@@ -867,7 +944,7 @@ fn login(connection: &mut Connection, request: LoginRequest) -> Result<SetupResu
     transaction.commit()?;
 
     Ok(SetupResult {
-        workspace: workspace_for(connection, &user_id)?,
+        workspace: workspace_for(connection, user_id)?,
         session_id,
     })
 }
@@ -1164,6 +1241,26 @@ fn workspace_for(connection: &Connection, user_id: &str) -> Result<Workspace, Ac
         user,
         organizations,
     })
+}
+
+/// 256 bits from the OS generator, hex encoded. Session ids and API keys are
+/// credentials: they get a full-width random value, not a UUID's 122 bits
+/// with fixed version bits.
+fn random_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn new_session_id() -> String {
+    random_secret()
+}
+
+/// A valid Argon2 hash of a password nobody has, for timing equalization.
+fn dummy_password_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| hash_password("hoglet-timing-equalizer").unwrap_or_default())
 }
 
 fn hash_password(password: &str) -> Result<String, AccessError> {

@@ -318,11 +318,18 @@ fn parse_request(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"));
-    let text = crate::capture::decompress::decode(body, form_encoded, compression)
-        .map_err(|_| "The request body could not be decoded.")?;
-    if text.len() > MAX_FLAGS_DECODED_BYTES {
-        return Err("The request body is too large.");
-    }
+    let text = crate::capture::decompress::decode_limited(
+        body,
+        form_encoded,
+        compression,
+        MAX_FLAGS_DECODED_BYTES,
+    )
+    .map_err(|error| match error {
+        crate::capture::decompress::DecodeError::TooLarge => "The request body is too large.",
+        crate::capture::decompress::DecodeError::Undecodable => {
+            "The request body could not be decoded."
+        }
+    })?;
     if json_depth_exceeds(&text, MAX_JSON_DEPTH) {
         return Err("The request body is nested too deeply.");
     }

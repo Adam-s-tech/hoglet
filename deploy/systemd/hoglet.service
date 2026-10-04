@@ -24,6 +24,10 @@ Environment=HOGLET_DATA=/var/lib/hoglet
 # Loopback only: put Caddy or nginx in front for TLS (deploy/caddy, deploy/nginx).
 Environment=HOGLET_ADDR=127.0.0.1:8000
 Environment=RUST_LOG=hoglet=info
+# The proxies in deploy/ overwrite X-Forwarded-For with the real peer, so the
+# last entry is trustworthy; login throttling uses it. Remove if you run
+# without a proxy.
+Environment=HOGLET_TRUST_PROXY=1
 # Optional: Environment=HOGLET_MAX_EVENTS_PER_SEC=5000
 
 # SIGTERM (systemd's default) drains requests and publishes the WAL.
