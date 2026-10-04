@@ -385,19 +385,3 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
     </div>
   );
 }
-
-/** Tiny inline trend line (KPI tiles, tables). */
-export function Sparkline({ data, color = "var(--s1)", width = 96, height = 28 }: { data: number[]; color?: string; width?: number; height?: number }) {
-  if (data.length < 2) return <svg width={width} height={height} aria-hidden="true" />;
-  const max = Math.max(...data, 1);
-  const min = Math.min(...data, 0);
-  const x = linear(0, data.length - 1, 1, width - 1);
-  const yy = linear(min, max, height - 2, 2);
-  const d = `M${data.map((v, i) => `${x(i).toFixed(1)},${yy(v).toFixed(1)}`).join("L")}`;
-  return (
-    <svg width={width} height={height} aria-hidden="true">
-      <path d={`${d}L${width - 1},${height}L1,${height}Z`} fill={color} opacity={0.1} />
-      <path d={d} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" />
-    </svg>
-  );
-}

@@ -39,7 +39,7 @@ export function PersonsPage() {
   const q = useDebounced(search.trim(), 250);
   const { data, error, isPending, isPlaceholderData, refetch, fetchNextPage, hasNextPage, isFetchingNextPage, isFetchNextPageError } = useInfiniteQuery(personsQuery(pid, q));
 
-  const pages = data?.pages ?? [];
+  const pages = useMemo(() => data?.pages ?? [], [data]);
   const persons = useMemo(() => {
     const seen = new Set<string>();
     return pages.flatMap((p) => p.persons).filter((p) => !seen.has(p.id) && seen.add(p.id));
@@ -159,7 +159,7 @@ function str(v: unknown): string {
 function PersonEvents({ personId }: { personId: string }) {
   const pid = useProjectId();
   const { data, error, isPending, refetch, fetchNextPage, hasNextPage, isFetchingNextPage, isFetchNextPageError } = useInfiniteQuery(personEventsQuery(pid, personId));
-  const pages = data?.pages ?? [];
+  const pages = useMemo(() => data?.pages ?? [], [data]);
   const events = useMemo(() => {
     const seen = new Set<string>();
     return pages.flatMap((p) => p.events).filter((e) => !seen.has(e.uuid) && seen.add(e.uuid));

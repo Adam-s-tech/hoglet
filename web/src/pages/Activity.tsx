@@ -248,6 +248,7 @@ export function ActivityPage() {
   useEffect(() => {
     if (debouncedPerson !== (personId ?? "")) void navigate({ search: { event: event ?? undefined, person_id: debouncedPerson || undefined }, replace: true });
     // Only the debounced input drives the URL; `personId`/`event` changes are handled above and by setEvent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedPerson]);
 
   const setEvent = (e: string | null) => void navigate({ search: { event: e ?? undefined, person_id: personId ?? undefined }, replace: true });
@@ -255,7 +256,7 @@ export function ActivityPage() {
   const q = useInfiniteQuery(eventsQuery(pid, { event, personId }, live ? POLL_MS : false));
   const { data, error, isPending, isFetching, isPlaceholderData, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } = q;
 
-  const pages = data?.pages ?? [];
+  const pages = useMemo(() => data?.pages ?? [], [data]);
   const events = useMemo(() => {
     const seen = new Set<string>();
     const out: EventRow[] = [];

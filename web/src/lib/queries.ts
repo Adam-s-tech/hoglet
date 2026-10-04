@@ -11,7 +11,6 @@
 // insight results are minutes.
 
 import { infiniteQueryOptions, keepPreviousData, queryOptions } from "@tanstack/react-query";
-import type { ActorsRequest } from "../types/ActorsRequest";
 import type { QueryRequest } from "../types/QueryRequest";
 import type { WebDimension } from "../types/WebDimension";
 import type { WebQuery } from "../types/WebQuery";
@@ -165,13 +164,6 @@ export const insightResultQuery = (pid: string, request: QueryRequest) =>
     queryFn: ({ signal }) => api.query(pid, request, signal),
     staleTime: 60_000,
     placeholderData: keepPreviousData,
-  });
-
-export const actorsQuery = (pid: string, request: ActorsRequest) =>
-  queryOptions({
-    queryKey: [...qk.query(pid), "actors", JSON.stringify(request)] as const,
-    queryFn: ({ signal }) => api.actors(pid, request, signal),
-    staleTime: 60_000,
   });
 
 export const webOverviewQuery = (pid: string, q: WebQuery) =>

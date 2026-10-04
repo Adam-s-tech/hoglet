@@ -316,7 +316,7 @@ function TrendsTable({
   slot: (s: TrendSeries) => number;
   onSelect: (s: TrendSeries, i: number) => void;
 }) {
-  const labels = series[0]?.labels ?? [];
+  const labels = useMemo(() => series[0]?.labels ?? [], [series]);
   const rows = useMemo<SeriesRow[]>(() => series.map((s, si) => ({ s, si })), [series]);
   const columns = useMemo(
     () => [
@@ -449,7 +449,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
   const [target, setTarget] = useState<ActorsTarget | null>(null);
   const [funnelTab, setFunnelTab] = useState<"steps" | "time">("steps");
   const closeActors = useCallback(() => setTarget(null), []);
-  let body: ReactNode = null;
+  let body: ReactNode;
 
   if (result.kind === "Trends" && query.kind === "TrendsQuery") {
     body = <TrendsView query={query} series={result.series} compact={compact} onSelect={setTarget} />;
