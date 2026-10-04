@@ -46,6 +46,7 @@ export const bootQuery = queryOptions({
 export const qk = {
   project: (pid: string) => ["p", pid] as const,
   status: (pid: string) => ["p", pid, "status"] as const,
+  forwarding: (pid: string) => ["p", pid, "forwarding"] as const,
   insights: (pid: string) => ["p", pid, "insights"] as const,
   insight: (pid: string, id: string) => ["p", pid, "insights", id] as const,
   dashboards: (pid: string) => ["p", pid, "dashboards"] as const,
@@ -72,6 +73,15 @@ export const statusQuery = (pid: string, pollMs?: number) =>
     queryFn: ({ signal }) => api.status(pid, signal),
     staleTime: 5_000,
     refetchInterval: pollMs ?? false,
+  });
+
+/** Shadow-mode counters move while events flow, so the settings card polls (only while the tab is visible). */
+export const forwardingQuery = (pid: string) =>
+  queryOptions({
+    queryKey: qk.forwarding(pid),
+    queryFn: ({ signal }) => api.forwarding(pid, signal),
+    staleTime: 2_000,
+    refetchInterval: 5_000,
   });
 
 // ── Saved objects ────────────────────────────────────────────────────────

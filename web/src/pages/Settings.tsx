@@ -22,6 +22,7 @@ import { fmtBytes, fmtDate, fmtNumber, fmtRelative } from "@/lib/format";
 import { navigate } from "@/lib/nav";
 import { keysQuery, qk, statusQuery } from "@/lib/queries";
 import { setTheme, useTheme, type Theme } from "@/lib/theme";
+import { ForwardingCard } from "./Forwarding";
 import { LoadDemoButton, SnippetTabs, TokenBox } from "./Onboarding";
 
 const settingsRouteApi = getRouteApi("/project/$projectId/settings");
@@ -198,6 +199,17 @@ function ProjectSettings() {
       </SettingsCard>
       <SettingsCard title="Install snippets">
         <SnippetTabs token={project.token} />
+      </SettingsCard>
+      <SettingsCard
+        title="Forward to PostHog (shadow mode)"
+        description={
+          <>
+            Events still reach PostHog after Hoglet stores them, so you can run both side by side while you switch. Hoglet saves every event first and never waits on PostHog; if
+            forwarding falls behind it drops and counts rather than slowing capture. Run <code>hoglet reconcile posthog</code> to compare the two.
+          </>
+        }
+      >
+        <ForwardingCard projectId={projectId} editable={editable} />
       </SettingsCard>
       {editable && (
         <SettingsCard

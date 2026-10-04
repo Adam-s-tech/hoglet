@@ -119,6 +119,21 @@ export interface PublicShare {
   dashboard?: Dashboard;
 }
 
+/** Shadow-mode forwarding (src/forward.rs): events are also sent on to a PostHog project after Hoglet stores them. */
+export interface ForwardingConfig {
+  enabled: boolean;
+  host: string;
+  posthog_token: string;
+}
+export interface ForwardingStatus {
+  config: ForwardingConfig | null;
+  forwarded: number;
+  dropped: number;
+  failed: number;
+  queued: number;
+  last_error: string | null;
+}
+
 // ── Errors ─────────────────────────────────────────────────────────────────
 
 export class ApiError extends Error {
@@ -369,6 +384,9 @@ export const api = {
   webBreakdown: (projectId: string, q: WebQuery, dimension: WebDimension, limit: number, signal?: AbortSignal) =>
     request<WebBreakdown>("GET", `${p(projectId)}/web/breakdown`, { query: { ...webParams(q), dimension, limit }, signal }),
   status: (projectId: string, signal?: AbortSignal) => request<ProjectStatus>("GET", `${p(projectId)}/status`, { signal }),
+
+  forwarding: (projectId: string, signal?: AbortSignal) => request<ForwardingStatus>("GET", `${p(projectId)}/forwarding`, { signal }),
+  setForwarding: (projectId: string, config: ForwardingConfig) => request<ForwardingStatus>("PUT", `${p(projectId)}/forwarding`, { body: config }),
 
   /** Fill the project with 90 days of realistic demo events. */
   loadDemo: (projectId: string) => request<{ events: number }>("POST", `${p(projectId)}/demo`),
