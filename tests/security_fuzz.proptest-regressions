@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 142284c4ee892569c175c7346e22751f982a4254be9702e796df91f5398ee774 # shrinks to value = Object {"batch": Null, "sent_at": String("¡ A")}
+cc 2a96b810c60b3656e4b6dbaa3317e71a7fb01d8cb2af02ae07ad138210b67510 # shrinks to value = Object {"offset": Number(8336392383592006), "properties": Object {"distinct_id": Bool(false)}, "token": String("2026-10-05T00:00:00Z")}

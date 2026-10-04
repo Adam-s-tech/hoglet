@@ -70,19 +70,59 @@ async fn index() -> Response {
 
 fn serve_index() -> Response {
     match Assets::get("index.html") {
-        Some(file) => (
-            [
-                (
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/html; charset=utf-8"),
-                ),
-                (header::CACHE_CONTROL, HeaderValue::from_static(REVALIDATE)),
-            ],
-            file.data.into_owned(),
-        )
-            .into_response(),
+        Some(file) => {
+            let mut response = (
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/html; charset=utf-8"),
+                    ),
+                    (header::CACHE_CONTROL, HeaderValue::from_static(REVALIDATE)),
+                ],
+                file.data.into_owned(),
+            )
+                .into_response();
+            if let Ok(policy) = HeaderValue::from_str(index_csp()) {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_SECURITY_POLICY, policy);
+            }
+            response
+        }
         None => (StatusCode::INTERNAL_SERVER_ERROR, "dashboard not built").into_response(),
     }
+}
+
+/// The dashboard's Content-Security-Policy, with the hash of every inline
+/// `<script>` in the embedded `index.html` (the pre-paint theme bootstrap).
+fn index_csp() -> &'static str {
+    static POLICY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    POLICY.get_or_init(|| {
+        let html = Assets::get("index.html")
+            .map(|file| String::from_utf8_lossy(&file.data).into_owned())
+            .unwrap_or_default();
+        crate::security::dashboard_csp(&inline_script_hashes(&html))
+    })
+}
+
+fn inline_script_hashes(html: &str) -> Vec<String> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let mut hashes = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<script>") {
+        let after = &rest[start + "<script>".len()..];
+        let Some(end) = after.find("</script>") else {
+            break;
+        };
+        let digest = Sha256::digest(&after.as_bytes()[..end]);
+        hashes.push(format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        ));
+        rest = &after[end..];
+    }
+    hashes
 }
 
 fn serve_file(path: &str, cache: &'static str) -> Option<Response> {
@@ -103,6 +143,9 @@ fn serve_file(path: &str, cache: &'static str) -> Option<Response> {
 }
 
 async fn asset(Path(path): Path<String>) -> Response {
+    if path.split(['/', '\\']).any(|part| part == "..") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // Hashed filenames are immutable — cache hard.
     serve_file(&format!("assets/{path}"), IMMUTABLE)
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
@@ -172,6 +215,20 @@ mod tests {
         ] {
             assert_eq!(classify(path), Fallback::NotFound, "{path}");
         }
+    }
+
+    #[test]
+    fn csp_hashes_the_inline_theme_script_and_forbids_framing() {
+        let policy = index_csp();
+        assert!(policy.contains("script-src 'self' 'sha256-"), "{policy}");
+        assert!(policy.contains("frame-ancestors 'none'"));
+        assert!(!policy.contains("script-src 'self' 'unsafe-inline'"));
+    }
+
+    #[tokio::test]
+    async fn assets_refuse_parent_segments() {
+        let response = asset(Path("../index.html".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

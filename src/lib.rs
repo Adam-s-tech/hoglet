@@ -27,6 +27,8 @@ pub mod query;
 pub mod reconcile;
 pub mod ratelimit;
 pub mod routes;
+pub mod security;
+pub mod server;
 pub mod sink;
 pub mod source;
 pub mod storage_bootstrap;

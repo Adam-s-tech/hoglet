@@ -19,7 +19,15 @@ const SCALAR_JS: &[u8] = include_bytes!("../../web/vendor/scalar.standalone.js")
 pub fn router() -> Router {
     Router::new()
         .route("/openapi.json", get(|| async { Json(spec()) }))
-        .route("/docs", get(docs_page))
+        .route(
+            "/docs",
+            get(|| async {
+                (
+                    [(header::CONTENT_SECURITY_POLICY, crate::security::DOCS_CSP)],
+                    docs_page().await,
+                )
+            }),
+        )
         .route("/docs/scalar.js", get(scalar_js))
 }
 
@@ -95,6 +103,12 @@ async fn docs_page() -> Html<&'static str> {
       theme: 'none',
       darkMode: true,
       hideDarkModeToggle: true,
+      // Self-hosted means no third-party requests: no web fonts, telemetry,
+      // or agent/MCP registry lookups from the reference viewer.
+      withDefaultFonts: false,
+      telemetry: false,
+      agent: { disabled: true },
+      mcp: { disabled: true },
       metaData: { title: 'Hoglet API — one binary, PostHog-compatible' },
     })
   </script>
@@ -168,7 +182,9 @@ Everything else is Hoglet's own JSON API, used by the bundled dashboard.
 (set by `/api/auth/login` and `/api/auth/setup`) or a personal API key sent as \
 `Authorization: Bearer phx_…`. Reads need project membership. Writes need a session or a \
 `write`-scoped key, plus the `owner` or `admin` role in the project's organization. \
-Account management (keys, organizations, projects) needs a session.
+Account management (keys, organizations, projects) needs a session. \
+State-changing requests that carry the session cookie are refused (403) when a browser marks them \
+cross-site (`Sec-Fetch-Site`, or an `Origin` that is not this host); bearer-key requests are not affected.
 
 **Errors.** API errors are JSON: `{\"error\": {\"code\", \"message\", \"request_id\"?, \"field\"?}}`. \
 Most API responses carry an `x-request-id` header that matches `request_id`.
@@ -797,6 +813,7 @@ fn workspace_paths(paths: &mut Paths) {
             "responses": responses(
                 json!({
                     "200": setup_ok,
+                    "403": ok("`HOGLET_SETUP_TOKEN` is set and the `X-Hoglet-Setup-Token` header (or `setup_token` field) is missing or wrong.", schema("ApiError")),
                     "409": ok("Setup was already completed.", schema("ApiError"))
                 }),
                 &["400", "404", "500", "503"]
@@ -819,7 +836,10 @@ fn workspace_paths(paths: &mut Paths) {
             "security": auth_none(),
             "requestBody": json_request(schema("LoginRequest")),
             "responses": responses(
-                json!({ "200": login_ok }),
+                json!({
+                    "200": login_ok,
+                    "429": ok("Too many failed attempts for this email or address; wait `Retry-After` seconds.", schema("ApiError"))
+                }),
                 &["400", "401", "500", "503"]
             )
         }),
@@ -2390,7 +2410,8 @@ fn workspace_schemas() -> Map<String, Value> {
             "password": { "type": "string", "minLength": 12, "maxLength": 1024 },
             "organization_name": name(),
             "project_name": { "type": "string", "minLength": 1, "maxLength": 128, "default": "Default" },
-            "existing_project_token": { "type": "string", "description": "Claim the organization of an existing project with this capture token." }
+            "existing_project_token": { "type": "string", "description": "Claim the organization of an existing project with this capture token." },
+            "setup_token": { "type": "string", "description": "The `HOGLET_SETUP_TOKEN` value, when the server sets one (the `X-Hoglet-Setup-Token` header works too)." }
         })),
         "LoginRequest": object(&["email", "password"], json!({
             "email": { "type": "string" },

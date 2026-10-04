@@ -189,6 +189,25 @@ pub struct CaptureState {
 pub const MAX_EVENT_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// Body limit for server-SDK batches (/batch).
 pub const MAX_BATCH_BODY_BYTES: usize = 20 * 1024 * 1024;
+/// Ceiling on a decompressed browser-SDK payload (a body is never refused for
+/// being larger than its own raw size, so uncompressed bodies are unaffected).
+pub const MAX_EVENT_DECODED_BYTES: usize = 16 * 1024 * 1024;
+/// Ceiling on a decompressed server-SDK batch.
+pub const MAX_BATCH_DECODED_BYTES: usize = 32 * 1024 * 1024;
+/// Decodes that can expand run on the blocking pool, this many at a time.
+const MAX_CONCURRENT_DECODES: usize = 2;
+/// Parsed JSON costs up to ~16x its text in memory (tiny elements are 32-byte
+/// values). Requests reserve `16 x decoded size` from this pool before
+/// parsing, so a flood of anonymous payloads cannot exhaust the machine.
+const PARSE_COST_FACTOR: usize = 16;
+const PARSE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+/// A request waits this long for memory budget before being told to retry.
+const PARSE_BUDGET_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+static DECODE_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_DECODES);
+/// One permit per KiB of parse budget.
+static PARSE_BUDGET: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(PARSE_BUDGET_BYTES / 1024);
 
 #[derive(serde::Deserialize, Default)]
 pub struct CaptureQuery {
@@ -221,6 +240,7 @@ pub fn router(state: CaptureState) -> Router {
 
 async fn capture(
     State(state): State<CaptureState>,
+    uri: axum::http::Uri,
     Query(query): Query<CaptureQuery>,
     headers: HeaderMap,
     body: Bytes,
@@ -232,7 +252,32 @@ async fn capture(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
 
-    let text = match decompress::decode(&body, form_encoded, query.compression.as_deref()) {
+    let decoded_limit = if uri.path().starts_with("/batch") {
+        MAX_BATCH_DECODED_BYTES
+    } else {
+        MAX_EVENT_DECODED_BYTES
+    }
+    .max(body.len());
+    let hint = query.compression.clone();
+    let decoded = if decompress::may_expand(&body, form_encoded, hint.as_deref()) {
+        // Anything that can expand is decoded off the async workers and at
+        // most a couple at a time.
+        let Ok(gate) = DECODE_GATE.acquire().await else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            decompress::decode_limited(&body, form_encoded, hint.as_deref(), decoded_limit)
+        })
+        .await;
+        drop(gate);
+        match result {
+            Ok(result) => result,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        decompress::decode_limited(&body, form_encoded, hint.as_deref(), decoded_limit)
+    };
+    let text = match decoded {
         Ok(text) => text,
         Err(decompress::DecodeError::TooLarge) => {
             return StatusCode::PAYLOAD_TOO_LARGE.into_response();
@@ -242,10 +287,32 @@ async fn capture(
         }
     };
 
+    // Reserve memory for the parsed form before building it. Held until the
+    // events are handed to the sink (or the request is refused).
+    let cost_kib = (text.len().saturating_mul(PARSE_COST_FACTOR) / 1024 + 1)
+        .min(PARSE_BUDGET_BYTES / 1024);
+    let _budget = match tokio::time::timeout(
+        PARSE_BUDGET_WAIT,
+        PARSE_BUDGET.acquire_many(u32::try_from(cost_kib).unwrap_or(u32::MAX)),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+
     let now = Utc::now();
     let sent_at = query.sent_at.as_deref().and_then(event::parse_sent_at_ms);
 
-    let mut batch = match event::parse_body(&text, sent_at, now) {
+    let parsed = if text.len() > 64 * 1024 {
+        match tokio::task::spawn_blocking(move || event::parse_body(&text, sent_at, now)).await {
+            Ok(parsed) => parsed,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        event::parse_body(&text, sent_at, now)
+    };
+    let mut batch = match parsed {
         Ok(batch) => batch,
         Err(event::CaptureError::Malformed(_)) => {
             state.metrics.inc_rejected();

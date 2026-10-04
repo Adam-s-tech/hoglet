@@ -25,7 +25,14 @@ pub fn request_id(headers: &HeaderMap) -> String {
     headers
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
-        .filter(|value| value.len() <= 64)
+        .filter(|value| {
+            // Echoed into bodies and logs: plain identifier characters only.
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
         .map(str::to_owned)
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
 }

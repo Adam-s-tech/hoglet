@@ -477,6 +477,33 @@ async fn delete_share(
     }
 }
 
+/// A share link is a capability held by people outside the project. It shows
+/// what a tile measures, never who made it, internal ids, or SQL text.
+fn redact_public(shared: &mut PublicShare) {
+    fn insight(insight: &mut SavedInsight) {
+        insight.created_by.clear();
+        insight.project_id.clear();
+        if insight.query_ir.get("kind").and_then(|kind| kind.as_str()) == Some("SqlQuery")
+            && let Some(query) = insight.query_ir.get_mut("query")
+        {
+            *query = serde_json::Value::String(String::new());
+        }
+    }
+    shared.share.project_id.clear();
+    if let Some(shared_insight) = shared.insight.as_mut() {
+        insight(shared_insight);
+    }
+    if let Some(dashboard) = shared.dashboard.as_mut() {
+        dashboard.created_by.clear();
+        dashboard.project_id.clear();
+        for tile in &mut dashboard.tiles {
+            if let Some(tile_insight) = tile.insight.as_mut() {
+                insight(tile_insight);
+            }
+        }
+    }
+}
+
 async fn resolve_public_share(
     State(state): State<ResourceState>,
     Extension(request_id): Extension<RequestId>,
@@ -497,11 +524,13 @@ async fn resolve_public_share(
                 Some(resources.get_dashboard(&share.project_id, &share.object_id)?),
             ),
         };
-        Ok(PublicShare {
+        let mut shared = PublicShare {
             share,
             insight,
             dashboard,
-        })
+        };
+        redact_public(&mut shared);
+        Ok(shared)
     })
     .await
     {
