@@ -82,27 +82,30 @@ If `hasFeatureFlags` isn't false, the SDK then calls `/flags/?v=2`. If *that* fa
 
 ## Flags response shapes
 
-| `?v=` | Shape |
+Verified against posthog-node, posthog-js and posthog-python `latest` (the contract suites fail if these drift).
+
+| Endpoint | Shape |
 |---|---|
-| unset | `{feature_flags: {key: bool\|string}, feature_flag_payloads: {key: json}}` |
-| `1` | `{feature_flags: [keys]}` |
-| `2` | `{feature_flags: {key: bool\|string}}` |
-| `/flags` default | `{flags: {key: FlagDetails}}` ← current |
+| `/flags?v=2` (and higher), `/decide?v=4` | `{flags: {key: FlagDetails}, errorsWhileComputingFlags, requestId, quotaLimited: [], evaluatedAt}` |
+| `/flags` (no `v` or `v=1`), `/decide?v=3` | `{featureFlags: {key: bool\|string}, featureFlagPayloads: {key: json-string}, errorsWhileComputingFlags, requestId}` |
+| `/decide?v=2` | `{featureFlags: {key: bool\|string}}` |
+| `/decide?v=1` or none | `{featureFlags: [enabled keys]}` |
 
-`FlagDetails` is camelCase: `{key, enabled, variant|null, reason: {code, condition_index, description}, metadata: {id, version, description, payload, hasExperiment}}`.
+`FlagDetails`: `{key, enabled, variant|null, reason: {code, condition_index, description}, metadata: {id, version, description, payload?}}`. Inactive flags are omitted (the SDK then reads `undefined`, as with PostHog). Payloads travel as JSON strings and the SDKs parse them.
 
-All shapes flatten a `config` object and carry `request_id`, `evaluated_at`, `errors_while_computing_flags`, optional `quota_limited`.
+Every shape also flattens the remote-config fields (`supportedCompression`, `sessionRecording: false`, …). `/flags/definitions?token=…&send_cohorts` (and the older `/api/feature_flag/local_evaluation`) serve local evaluation to server SDKs with a personal API key (`Authorization: Bearer phx_…`).
 
 Flags request body is parsed as **json5** — NaN/Infinity must map to null, and tolerate lossy UTF-8 (Android clients send malformed sequences).
 
-Bucketing: `sha1("{salt}:{hash_id}")`, consistent per user.
+Bucketing: first 15 hex digits of `sha1("{flag_key}.{bucketing_id}{salt}")` over `0xFFFFFFFFFFFFFFF` (salt empty for rollout, `variant` for variants) — verified against posthog-python's consistency vectors. The bucketing id is the person's first-seen key when `ensure_experience_continuity` is set, else the distinct id.
 
 ## Identity
 
 `$identify` fires only on the anonymous → identified transition, carrying `$anon_distinct_id` as an **event property**.
 
 Dispatch:
-- `$create_alias` / `$merge_dangerously` with `properties.alias` → `merge(alias, current_distinct_id)`
+- `$merge_dangerously` with `properties.alias` → `merge(alias, current_distinct_id)`
+- `$create_alias` with `properties.alias` → merge both people unless both are already identified; the identified one survives (posthog-node sends the anonymous id as `alias`, posthog-python the user)
 - `$identify` with `$anon_distinct_id` → `merge($anon_distinct_id, current_distinct_id)`
 
 Rules:

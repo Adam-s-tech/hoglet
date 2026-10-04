@@ -1,6 +1,9 @@
-# Publish the event lake as immutable generations
+# Catalog the event lake as generation-stamped files
 
-Queries acquire a leased Published Generation instead of discovering Parquet
-files directly. Publication, compaction, retention, and erasure all create a
-new generation, so cache validity and file lifetime share one Checkpoint and a
-query can never race deletion of the files it is reading.
+Queries read a leased snapshot of the files catalogued in `projections.db`
+(`lake_files`). Each file records the generation that created it and the one
+that retired it, so publication and compaction cost O(files touched) and a
+query can never race the deletion of a file it is reading: retired files are
+unlinked only after the last lease on them is released. (The first design
+replaced the complete manifest on every publish; it collapsed ingest to 684
+events/s after 280k events.)
