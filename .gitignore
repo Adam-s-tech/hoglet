@@ -29,3 +29,4 @@ web/*.tsbuildinfo
 
 # Local-only study material — never committed
 /reference/
+.claude/

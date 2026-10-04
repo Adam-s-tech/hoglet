@@ -50,6 +50,13 @@ struct NameBody {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateKeyBody {
+    name: String,
+    #[serde(default)]
+    scope: crate::control::KeyScope,
+}
+
 #[derive(Serialize)]
 struct BootstrapResponse {
     setup_required: bool,
@@ -249,7 +256,7 @@ async fn create_key(
     State(state): State<WorkspaceState>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
-    body: Result<Json<NameBody>, JsonRejection>,
+    body: Result<Json<CreateKeyBody>, JsonRejection>,
 ) -> Response {
     let principal = match authenticate(&state.access, &headers).await {
         Ok(principal) => principal,
@@ -264,7 +271,7 @@ async fn create_key(
     }
     match state
         .access
-        .create_personal_key(&principal, &body.name)
+        .create_personal_key(&principal, &body.name, body.scope)
         .await
     {
         Ok(created) => (

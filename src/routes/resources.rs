@@ -20,10 +20,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::{
-    control::{AccessError, Authentication, AuthorizedProject, ProjectAccess, Role},
+    control::{AccessError, AuthorizedProject, ProjectAccess, Role},
     control_resources::{
         ControlResourceError, ControlResources, Dashboard, DashboardDraft, DashboardTileInput,
-        FeatureFlag, InsightDraft, SavedInsight, ShareLink, ShareTarget,
+        InsightDraft, SavedInsight, ShareLink, ShareTarget,
     },
 };
 
@@ -74,14 +74,6 @@ struct ErrorBody {
 /// public share resolver.
 pub fn router(access: Arc<ProjectAccess>, resources: Arc<ControlResources>) -> Router {
     Router::new()
-        .route(
-            "/api/projects/{project_id}/flags",
-            get(list_flags).post(create_flag),
-        )
-        .route(
-            "/api/projects/{project_id}/flags/{key}",
-            put(update_flag).delete(delete_flag),
-        )
         .route(
             "/api/projects/{project_id}/insights",
             get(list_insights).post(create_insight),
@@ -154,8 +146,7 @@ async fn authorize(
         .await
         .map_err(|error| access_error(error, request_id))?;
     if mutation
-        && (project.principal.authentication != Authentication::Session
-            || !matches!(project.role, Role::Owner | Role::Admin))
+        && (!project.principal.may_write() || !matches!(project.role, Role::Owner | Role::Admin))
     {
         return Err(error_response(
             StatusCode::FORBIDDEN,
@@ -205,81 +196,6 @@ where
     let resources = state.resources;
     match invoke(move || operation(resources, project_id)).await {
         Ok(value) => Json(value).into_response(),
-        Err(error) => resource_error(error, &request_id),
-    }
-}
-
-async fn list_flags(
-    State(state): State<ResourceState>,
-    Extension(request_id): Extension<RequestId>,
-    Path(project_id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    read_authorized(
-        state,
-        request_id,
-        project_id,
-        headers,
-        |resources, project| resources.list_flags(&project),
-    )
-    .await
-}
-
-async fn create_flag(
-    State(state): State<ResourceState>,
-    Extension(request_id): Extension<RequestId>,
-    Path(project_id): Path<String>,
-    request: Request,
-) -> Response {
-    let project = match authorize(&state, request.headers(), &project_id, true, &request_id).await {
-        Ok(project) => project,
-        Err(response) => return response,
-    };
-    let flag: FeatureFlag = match parse_body(request, &request_id).await {
-        Ok(flag) => flag,
-        Err(response) => return response,
-    };
-    let resources = state.resources;
-    match invoke(move || resources.create_flag(&project.project_id, &flag)).await {
-        Ok(flag) => (StatusCode::CREATED, Json(flag)).into_response(),
-        Err(error) => resource_error(error, &request_id),
-    }
-}
-
-async fn update_flag(
-    State(state): State<ResourceState>,
-    Extension(request_id): Extension<RequestId>,
-    Path((project_id, key)): Path<(String, String)>,
-    request: Request,
-) -> Response {
-    let project = match authorize(&state, request.headers(), &project_id, true, &request_id).await {
-        Ok(project) => project,
-        Err(response) => return response,
-    };
-    let flag: FeatureFlag = match parse_body(request, &request_id).await {
-        Ok(flag) => flag,
-        Err(response) => return response,
-    };
-    let resources = state.resources;
-    match invoke(move || resources.update_flag(&project.project_id, &key, &flag)).await {
-        Ok(flag) => Json(flag).into_response(),
-        Err(error) => resource_error(error, &request_id),
-    }
-}
-
-async fn delete_flag(
-    State(state): State<ResourceState>,
-    Extension(request_id): Extension<RequestId>,
-    Path((project_id, key)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Response {
-    let project = match authorize(&state, &headers, &project_id, true, &request_id).await {
-        Ok(project) => project,
-        Err(response) => return response,
-    };
-    let resources = state.resources;
-    match invoke(move || resources.delete_flag(&project.project_id, &key)).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => resource_error(error, &request_id),
     }
 }

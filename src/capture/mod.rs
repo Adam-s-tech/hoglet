@@ -49,26 +49,86 @@ pub trait CaptureAuthorizer: Send + Sync {
     async fn authorize(&self, token: &str) -> Result<AuthorizedCapture, CaptureAuthorizationError>;
 }
 
+/// Bound on cached token decisions.
+const TOKEN_CACHE_ENTRIES: usize = 10_000;
+/// How long a known token stays trusted without asking control state.
+const TOKEN_CACHE_ACCEPT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long an unknown token is remembered as unknown.
+const TOKEN_CACHE_REJECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Fail-closed adapter for authoritative `control.db` project access.
+///
+/// Every capture request names a token, so decisions are cached briefly:
+/// otherwise each request would queue behind the single control-plane worker.
 pub struct ProjectAccessCaptureAuthorizer {
     access: crate::control::ProjectAccess,
+    cache: std::sync::Mutex<
+        std::collections::HashMap<String, (Option<String>, std::time::Instant)>,
+    >,
 }
 
 impl ProjectAccessCaptureAuthorizer {
     pub fn new(access: crate::control::ProjectAccess) -> Self {
-        Self { access }
+        Self {
+            access,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn cached(&self, token: &str) -> Option<Option<String>> {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (decision, at) = cache.get(token)?;
+        let ttl = if decision.is_some() {
+            TOKEN_CACHE_ACCEPT_TTL
+        } else {
+            TOKEN_CACHE_REJECT_TTL
+        };
+        (at.elapsed() < ttl).then(|| decision.clone())
+    }
+
+    fn remember(&self, token: &str, decision: Option<String>) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= TOKEN_CACHE_ENTRIES {
+            cache.retain(|_, (decision, at)| {
+                at.elapsed()
+                    < if decision.is_some() {
+                        TOKEN_CACHE_ACCEPT_TTL
+                    } else {
+                        TOKEN_CACHE_REJECT_TTL
+                    }
+            });
+            if cache.len() >= TOKEN_CACHE_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(token.to_owned(), (decision, std::time::Instant::now()));
     }
 }
 
 #[async_trait::async_trait]
 impl CaptureAuthorizer for ProjectAccessCaptureAuthorizer {
     async fn authorize(&self, token: &str) -> Result<AuthorizedCapture, CaptureAuthorizationError> {
+        if let Some(decision) = self.cached(token) {
+            return decision
+                .map(|project_id| AuthorizedCapture { project_id })
+                .ok_or(CaptureAuthorizationError::Rejected);
+        }
         match self.access.authorize_capture(token).await {
-            Ok(project) => Ok(AuthorizedCapture {
-                project_id: project.project_id,
-            }),
+            Ok(project) => {
+                self.remember(token, Some(project.project_id.clone()));
+                Ok(AuthorizedCapture {
+                    project_id: project.project_id,
+                })
+            }
             Err(crate::control::AccessError::InvalidToken)
             | Err(crate::control::AccessError::Unauthorized) => {
+                self.remember(token, None);
                 Err(CaptureAuthorizationError::Rejected)
             }
             Err(error) => {
@@ -120,6 +180,7 @@ pub struct CaptureState {
     pub authorizer: Arc<dyn CaptureAuthorizer>,
     pub limiter: Arc<RateLimiter>,
     pub metrics: Arc<Metrics>,
+    pub enricher: Arc<crate::enrichment::Enricher>,
 }
 
 /// Body limit for browser-SDK endpoints (/e and friends).
@@ -182,7 +243,7 @@ async fn capture(
     let now = Utc::now();
     let sent_at = query.sent_at.as_deref().and_then(event::parse_sent_at_ms);
 
-    let batch = match event::parse_body(&text, sent_at, now) {
+    let mut batch = match event::parse_body(&text, sent_at, now) {
         Ok(batch) => batch,
         Err(event::CaptureError::Malformed(_)) => {
             state.metrics.inc_rejected();
@@ -193,6 +254,15 @@ async fn capture(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+
+    // Server SDKs send no `$browser`/`$os`; fill what the client did not set.
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    let client_ip = client_ip(&headers);
+    for event in &mut batch.events {
+        state.enricher.enrich(event, client_ip.as_deref(), user_agent);
+    }
 
     // Empty after filtering is still success — never make clients retry.
     if !batch.events.is_empty() {
@@ -259,6 +329,22 @@ async fn capture(
     }
 }
 
+/// The client address as reported by the reverse proxy in front of Hoglet.
+/// Without a proxy header there is no trustworthy address to use.
+fn client_ip(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +403,7 @@ mod tests {
             authorizer: open_authorizer(),
             limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
             metrics: Arc::new(Metrics::default()),
+            enricher: Arc::new(crate::enrichment::Enricher::new(Default::default())),
         };
         (router(state), sink)
     }
@@ -387,6 +474,7 @@ mod tests {
             }),
             limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
             metrics: Arc::new(Metrics::default()),
+            enricher: Arc::new(crate::enrichment::Enricher::new(Default::default())),
         };
         let body = r#"[{"event":"known","distinct_id":"u1","token":"phc_known"},{"event":"unknown","distinct_id":"u2","token":"phc_unknown"}]"#;
 
@@ -404,6 +492,7 @@ mod tests {
             authorizer: open_authorizer(),
             limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
             metrics: Arc::new(Metrics::default()),
+            enricher: Arc::new(crate::enrichment::Enricher::new(Default::default())),
         };
         let body = r#"{"api_key":"phc_t","historical_migration":true,"batch":[{"event":"a","distinct_id":"u1"}]}"#;
 

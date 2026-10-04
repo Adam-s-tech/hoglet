@@ -171,7 +171,7 @@ async fn personal_keys_authenticate_the_same_principal_and_are_user_scoped() {
     let owner = access.validate_session(&setup.session_id).await.unwrap();
 
     let created = access
-        .create_personal_key(&owner, "automation")
+        .create_personal_key(&owner, "automation", hoglet::control::KeyScope::Read)
         .await
         .unwrap();
     assert!(created.secret.starts_with("phx_"));

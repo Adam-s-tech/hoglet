@@ -174,6 +174,7 @@ pub struct SetupResult {
 pub struct PersonalApiKey {
     pub id: String,
     pub name: String,
+    pub scope: KeyScope,
     pub key_prefix: String,
     pub last_used: Option<i64>,
     pub created_at: i64,
@@ -222,6 +223,36 @@ pub enum Authentication {
 pub struct Principal {
     pub user_id: String,
     pub authentication: Authentication,
+    /// Sessions always may write; personal keys only with `write` scope.
+    pub write_scope: bool,
+}
+
+impl Principal {
+    /// Whether this principal may mutate project resources, subject to the
+    /// user's project role.
+    pub fn may_write(&self) -> bool {
+        self.authentication == Authentication::Session || self.write_scope
+    }
+}
+
+/// What a personal API key may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyScope {
+    /// Read analytics and resources.
+    #[default]
+    Read,
+    /// Also create, change and delete resources, like the user's session.
+    Write,
+}
+
+impl KeyScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +292,7 @@ enum Command {
     CreatePersonalKey {
         principal: Principal,
         name: String,
+        scope: KeyScope,
         response: oneshot::Sender<Result<CreatedPersonalApiKey, AccessError>>,
     },
     ValidatePersonalKey {
@@ -376,12 +408,14 @@ impl ProjectAccess {
         &self,
         principal: &Principal,
         name: &str,
+        scope: KeyScope,
     ) -> Result<CreatedPersonalApiKey, AccessError> {
         let (response, receive) = oneshot::channel();
         self.tx
             .send(Command::CreatePersonalKey {
                 principal: principal.clone(),
                 name: name.into(),
+                scope,
                 response,
             })
             .await
@@ -587,6 +621,15 @@ fn open_connection(path: PathBuf) -> Result<Connection, AccessError> {
         });
     }
     connection.execute_batch(SCHEMA)?;
+    let has_scope: bool = connection
+        .prepare("SELECT 1 FROM pragma_table_info('personal_api_keys') WHERE name='scope'")?
+        .exists([])?;
+    if !has_scope {
+        connection.execute_batch(
+            "ALTER TABLE personal_api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'read'
+             CHECK (scope IN ('read', 'write'))",
+        )?;
+    }
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(connection)
 }
@@ -623,9 +666,10 @@ fn worker_loop(mut connection: Connection, mut rx: mpsc::Receiver<Command>) {
             Command::CreatePersonalKey {
                 principal,
                 name,
+                scope,
                 response,
             } => {
-                let _ = response.send(create_personal_key(&connection, &principal, &name));
+                let _ = response.send(create_personal_key(&connection, &principal, &name, scope));
             }
             Command::ValidatePersonalKey { secret, response } => {
                 let _ = response.send(validate_personal_key(&connection, &secret));
@@ -847,6 +891,7 @@ fn validate_session(connection: &Connection, session_id: &str) -> Result<Princip
         .map(|user_id| Principal {
             user_id,
             authentication: Authentication::Session,
+            write_scope: true,
         })
         .ok_or(AccessError::Unauthorized)
 }
@@ -855,6 +900,7 @@ fn create_personal_key(
     connection: &Connection,
     principal: &Principal,
     name: &str,
+    scope: KeyScope,
 ) -> Result<CreatedPersonalApiKey, AccessError> {
     require_session(principal)?;
     let name = name.trim();
@@ -864,20 +910,22 @@ fn create_personal_key(
     let key = PersonalApiKey {
         id: Uuid::new_v4().to_string(),
         name: name.into(),
+        scope,
         key_prefix: secret.chars().take(12).collect(),
         last_used: None,
         created_at: Utc::now().timestamp(),
     };
     connection.execute(
-        "INSERT INTO personal_api_keys(id,user_id,name,key_hash,key_prefix,last_used,created_at)
-         VALUES (?1,?2,?3,?4,?5,NULL,?6)",
+        "INSERT INTO personal_api_keys(id,user_id,name,key_hash,key_prefix,last_used,created_at,scope)
+         VALUES (?1,?2,?3,?4,?5,NULL,?6,?7)",
         rusqlite::params![
             key.id,
             principal.user_id,
             key.name,
             key_hash,
             key.key_prefix,
-            key.created_at
+            key.created_at,
+            scope.as_str()
         ],
     )?;
     Ok(CreatedPersonalApiKey { key, secret })
@@ -888,14 +936,14 @@ fn validate_personal_key(connection: &Connection, secret: &str) -> Result<Princi
         return Err(AccessError::Unauthorized);
     }
     let key_hash = hex::encode(Sha256::digest(secret.as_bytes()));
-    let user_id: Option<String> = connection
+    let found: Option<(String, String)> = connection
         .query_row(
-            "SELECT user_id FROM personal_api_keys WHERE key_hash=?1",
+            "SELECT user_id, scope FROM personal_api_keys WHERE key_hash=?1",
             [&key_hash],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let user_id = user_id.ok_or(AccessError::Unauthorized)?;
+    let (user_id, scope) = found.ok_or(AccessError::Unauthorized)?;
     connection.execute(
         "UPDATE personal_api_keys SET last_used=?1 WHERE key_hash=?2",
         rusqlite::params![Utc::now().timestamp(), key_hash],
@@ -903,6 +951,7 @@ fn validate_personal_key(connection: &Connection, secret: &str) -> Result<Princi
     Ok(Principal {
         user_id,
         authentication: Authentication::PersonalKey,
+        write_scope: scope == "write",
     })
 }
 
@@ -912,14 +961,20 @@ fn list_personal_keys(
 ) -> Result<Vec<PersonalApiKey>, AccessError> {
     require_session(principal)?;
     let mut statement = connection.prepare(
-        "SELECT id,name,key_prefix,last_used,created_at FROM personal_api_keys
+        "SELECT id,name,key_prefix,last_used,created_at,scope FROM personal_api_keys
          WHERE user_id=?1 ORDER BY created_at DESC,id",
     )?;
     statement
         .query_map([&principal.user_id], |row| {
+            let scope: String = row.get(5)?;
             Ok(PersonalApiKey {
                 id: row.get(0)?,
                 name: row.get(1)?,
+                scope: if scope == "write" {
+                    KeyScope::Write
+                } else {
+                    KeyScope::Read
+                },
                 key_prefix: row.get(2)?,
                 last_used: row.get(3)?,
                 created_at: row.get(4)?,

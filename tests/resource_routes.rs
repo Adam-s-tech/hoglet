@@ -140,7 +140,7 @@ async fn project_resources_are_scoped_and_mutations_require_privileged_sessions(
     let project_id = setup.workspace.organizations[0].projects[0].id.clone();
     let principal = access.validate_session(&setup.session_id).await.unwrap();
     let personal_key = access
-        .create_personal_key(&principal, "Read-only route test")
+        .create_personal_key(&principal, "Read-only route test", hoglet::control::KeyScope::Read)
         .await
         .unwrap();
     let (other_project_id, other_session_id) = seed_unrelated_owner(&control_path);
@@ -151,52 +151,6 @@ async fn project_resources_are_scoped_and_mutations_require_privileged_sessions(
     let owner_cookie = format!("hoglet_sid={}", setup.session_id);
     let other_cookie = format!("hoglet_sid={other_session_id}");
     let personal_bearer = format!("Bearer {}", personal_key.secret);
-
-    let flag = json!({
-        "key": "checkout",
-        "active": true,
-        "rollout_percentage": 100.0,
-        "variants": [],
-        "payload": null
-    });
-    let flags_uri = format!("/api/projects/{project_id}/flags");
-    let (status, _, _) = response(
-        app.clone(),
-        request(
-            "POST",
-            &flags_uri,
-            Some((header::COOKIE.as_str(), &owner_cookie)),
-            &flag.to_string(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-
-    let (status, _, flags) = response(
-        app.clone(),
-        request(
-            "GET",
-            &flags_uri,
-            Some((header::AUTHORIZATION.as_str(), &personal_bearer)),
-            "",
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(flags[0]["key"], "checkout");
-
-    let (status, _, error) = response(
-        app.clone(),
-        request(
-            "POST",
-            &flags_uri,
-            Some((header::AUTHORIZATION.as_str(), &personal_bearer)),
-            &flag.to_string(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(error["error"]["code"], "forbidden");
 
     let insights_uri = format!("/api/projects/{project_id}/insights");
     let insight_draft = json!({
@@ -216,6 +170,32 @@ async fn project_resources_are_scoped_and_mutations_require_privileged_sessions(
     .await;
     assert_eq!(status, StatusCode::CREATED);
     let insight_id = insight["id"].as_str().unwrap();
+
+    // Personal keys read but never mutate dashboard resources.
+    let (status, _, insights) = response(
+        app.clone(),
+        request(
+            "GET",
+            &insights_uri,
+            Some((header::AUTHORIZATION.as_str(), &personal_bearer)),
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(insights[0]["id"], insight_id);
+    let (status, _, error) = response(
+        app.clone(),
+        request(
+            "POST",
+            &insights_uri,
+            Some((header::AUTHORIZATION.as_str(), &personal_bearer)),
+            &insight_draft.to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["error"]["code"], "forbidden");
 
     let other_insight_uri = format!("/api/projects/{other_project_id}/insights/{insight_id}");
     let (status, _, error) = response(

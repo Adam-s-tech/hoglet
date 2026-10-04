@@ -32,6 +32,10 @@ pub struct CapturedBatch {
     project_ids_by_token: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "is_false")]
     historical_migration: bool,
+    /// When capture accepted the batch (ms since epoch). Publication uses it
+    /// to report how far behind queryable data is.
+    #[serde(default)]
+    pub received_at_ms: i64,
 }
 
 impl CapturedBatch {
@@ -43,6 +47,7 @@ impl CapturedBatch {
             events,
             project_ids_by_token: BTreeMap::new(),
             historical_migration: false,
+            received_at_ms: 0,
         })
     }
 
@@ -69,11 +74,20 @@ impl CapturedBatch {
             events,
             project_ids_by_token,
             historical_migration,
+            received_at_ms: chrono::Utc::now().timestamp_millis(),
         })
     }
 
     pub fn event_count(&self) -> usize {
         self.events.len()
+    }
+
+    /// Project of every event, in order; `None` if any event is unbound.
+    pub fn project_ids(&self) -> Option<Vec<String>> {
+        self.events
+            .iter()
+            .map(|event| self.project_id_for(event).map(str::to_owned))
+            .collect()
     }
 
     pub fn project_id_for(&self, event: &CapturedEvent) -> Option<&str> {

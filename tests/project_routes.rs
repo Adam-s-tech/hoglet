@@ -151,7 +151,7 @@ async fn authorized_query_derives_capture_token_for_session_and_personal_key() {
         .await
         .expect("setup session should authenticate");
     let personal_key = access
-        .create_personal_key(&principal, "Test client")
+        .create_personal_key(&principal, "Test client", hoglet::control::KeyScope::Read)
         .await
         .expect("personal key should be created");
 

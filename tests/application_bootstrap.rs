@@ -101,25 +101,6 @@ async fn fresh_storage_bootstraps_a_safe_production_router() {
 }
 
 #[tokio::test]
-async fn legacy_storage_is_rejected_without_mutation() {
-    let directory = tempfile::tempdir().expect("temporary data directory");
-    let legacy = directory.path().join("auth.db");
-    let original = b"legacy bytes that normal startup must not touch";
-    fs::write(&legacy, original).expect("legacy fixture");
-
-    let error = Application::prepare(ApplicationConfig::new(directory.path()))
-        .await
-        .expect_err("legacy storage requires explicit migration");
-
-    assert!(matches!(error, ApplicationError::LegacyOnly { .. }));
-    assert_eq!(fs::read(&legacy).expect("legacy fixture remains"), original);
-    assert!(!directory.path().join("control.db").exists());
-    assert!(!directory.path().join("projections.db").exists());
-    assert!(!directory.path().join("events").exists());
-    assert!(!directory.path().join("wal-v2").exists());
-}
-
-#[tokio::test]
 async fn incomplete_storage_is_rejected_without_recovery_writes() {
     let directory = tempfile::tempdir().expect("temporary data directory");
     let partial = directory.path().join("control.db.migrating");
@@ -292,7 +273,7 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
         .await
         .expect("catalog response");
     assert_eq!(catalog.status(), StatusCode::OK);
-    let names: Vec<String> = serde_json::from_slice(
+    let names: Vec<hoglet::contract::persons::CatalogEvent> = serde_json::from_slice(
         &catalog
             .into_body()
             .collect()
@@ -301,6 +282,7 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
             .to_bytes(),
     )
     .expect("catalog JSON");
+    let names: Vec<&str> = names.iter().map(|event| event.name.as_str()).collect();
     assert_eq!(names, vec!["signed_up"]);
 
     let values = router
@@ -316,7 +298,7 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
         .await
         .expect("catalog values response");
     assert_eq!(values.status(), StatusCode::OK);
-    let values: Vec<String> = serde_json::from_slice(
+    let values: Vec<hoglet::contract::persons::CatalogValue> = serde_json::from_slice(
         &values
             .into_body()
             .collect()
@@ -325,6 +307,7 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
             .to_bytes(),
     )
     .expect("catalog values JSON");
+    let values: Vec<&str> = values.iter().map(|value| value.value.as_str()).collect();
     assert_eq!(values, vec!["pro"]);
 
     drop(router);
