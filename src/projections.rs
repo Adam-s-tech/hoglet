@@ -696,7 +696,7 @@ impl CatalogBatch {
             std::collections::HashMap::new();
         // Most frequent first, so the cap keeps the values that matter.
         let mut values: Vec<_> = self.values.into_iter().collect();
-        values.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+        values.sort_by_key(|(_, seen)| std::cmp::Reverse(seen.count));
         for ((project_id, key, value), seen) in values {
             let known = existing
                 .query_row(params![project_id, key, value], |row| row.get::<_, i64>(0))
