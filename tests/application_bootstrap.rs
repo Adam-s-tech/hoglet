@@ -233,17 +233,10 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
 
     let query_body = json!({
         "query": {
-            "kind": "Trends",
-            "series": [{
-                "event": { "type": "name", "value": "signed_up" },
-                "math": { "type": "total" }
-            }],
-            "filters": { "op": "AND", "values": [] },
-            "range": {
-                "from": "2026-08-20T00:00:00Z",
-                "to": "2026-08-21T00:00:00Z"
-            },
-            "interval": "Day"
+            "kind": "TrendsQuery",
+            "series": [{"event": "signed_up", "math": "total"}],
+            "date_range": {"date_from": "2026-08-20", "date_to": "2026-08-20"},
+            "interval": "day"
         },
         "refresh": true
     });
@@ -271,13 +264,13 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
                 .to_bytes(),
         )
         .expect("query JSON");
-        if body["results"][0]["data"][0]["count"] == 1 {
+        if body["result"]["series"][0]["aggregated_value"] == 1.0 {
             observed = Some(body);
             break;
         }
     }
     let observed = observed.expect("publisher makes the durable receipt queryable");
-    assert_eq!(observed["meta"]["generation_id"], 1);
+    assert_eq!(observed["meta"]["data_version"], 1);
 
     let catalog = router
         .clone()

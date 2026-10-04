@@ -107,17 +107,10 @@ fn seed_unrelated_owner(control_path: &Path) -> (String, String) {
 
 fn trends_query() -> Value {
     json!({
-        "kind": "Trends",
-        "series": [{
-            "event": {"type": "name", "value": "$pageview"},
-            "math": {"type": "total"}
-        }],
-        "filters": {"op": "AND", "values": []},
-        "range": {
-            "from": "2026-08-01T00:00:00Z",
-            "to": "2026-08-08T00:00:00Z"
-        },
-        "interval": "Day"
+        "kind": "TrendsQuery",
+        "series": [{"event": "$pageview", "math": "total"}],
+        "date_range": {"date_from": "2026-08-01", "date_to": "2026-08-08"},
+        "interval": "day"
     })
 }
 

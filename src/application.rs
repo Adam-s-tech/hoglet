@@ -181,9 +181,26 @@ impl Application {
         let resources = Arc::new(ControlResources::open(&paths.control())?);
         let coordinator = PublicationCoordinator::open(paths.projections(), &event_root)
             .map_err(DurablePipelineError::Publication)?;
+        let persons = Arc::new(
+            crate::persons::PersonStore::open(&paths.projections())
+                .map_err(|error| ApplicationError::Query(error.to_string()))?,
+        );
+        // TODO(integrator): serve queries from `crate::lake::Lake` (it
+        // implements `EventSource`) once publication writes to it, and delete
+        // `query::legacy_source`.
+        let event_source: Arc<dyn crate::source::EventSource> = Arc::new(
+            crate::query::legacy_source::VersionedLakeSource::new(coordinator.event_lake()),
+        );
         let engine = Arc::new(
-            QueryEngine::try_new_versioned(coordinator.event_lake())
-                .map_err(|error| ApplicationError::Query(format!("{error:?}")))?,
+            QueryEngine::new(
+                event_source,
+                persons,
+                crate::query::EngineConfig {
+                    temp_directory: Some(config.data_dir.join("query-tmp")),
+                    ..crate::query::EngineConfig::default()
+                },
+            )
+            .map_err(|error| ApplicationError::Query(error.to_string()))?,
         );
         let projection_catalog = Arc::new(ProjectionCatalog::open(&paths.projections())?);
         let (durable_sink, wal_runtime, recovery) = DurableWalSink::open(wal_root, coordinator)?;

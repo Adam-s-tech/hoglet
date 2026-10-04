@@ -155,17 +155,10 @@ fn sigkill_loses_no_acked_events() {
     wait_until_up(port);
     let query = json!({
         "query": {
-            "kind": "Trends",
-            "series": [{
-                "event": {"type": "name", "value": "crash_test"},
-                "math": {"type": "total"}
-            }],
-            "filters": {"op": "AND", "values": []},
-            "range": {
-                "from": "2026-08-20T00:00:00Z",
-                "to": "2026-08-21T00:00:00Z"
-            },
-            "interval": "Day"
+            "kind": "TrendsQuery",
+            "series": [{"event": "crash_test", "math": "total"}],
+            "date_range": {"date_from": "2026-08-20", "date_to": "2026-08-20"},
+            "interval": "day"
         },
         "refresh": true
     });
@@ -177,12 +170,9 @@ fn sigkill_loses_no_acked_events() {
             && status(&response) == Some(200)
             && let Some(body) = response_body(&response)
         {
-            observed = body["results"][0]["data"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|point| point["count"].as_u64())
-                .sum();
+            observed = body["result"]["series"][0]["aggregated_value"]
+                .as_f64()
+                .unwrap_or(0.0) as u64;
             if observed >= acknowledged {
                 break;
             }
