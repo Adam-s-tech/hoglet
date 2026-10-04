@@ -109,14 +109,7 @@ impl Compactor {
         let copied = self
             .duck
             .execute(
-                &format!(
-                    "COPY (
-                        SELECT * FROM read_parquet([{sources}], union_by_name = true)
-                        QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1
-                        ORDER BY event, timestamp
-                     ) TO {} (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880)",
-                    sql_string(&temporary)
-                ),
+                &merge_sql(&sources, &sql_string(&temporary)),
                 [],
             )
             .map_err(duck_error)?;
@@ -365,6 +358,20 @@ fn retire(
         }
     }
     Ok(())
+}
+
+/// The statement that merges `sources` (a quoted, comma-separated file list)
+/// into one compacted file `destination` (a quoted path): duplicate-free,
+/// sorted by `(event, timestamp)`, zstd, fixed-size row groups. The query
+/// benchmark builds its "compacted" dataset with this same statement.
+pub(crate) fn merge_sql(sources: &str, destination: &str) -> String {
+    format!(
+        "COPY (
+            SELECT * FROM read_parquet([{sources}], union_by_name = true)
+            QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1
+            ORDER BY event, timestamp
+         ) TO {destination} (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880)"
+    )
 }
 
 fn sql_string(path: &Path) -> String {

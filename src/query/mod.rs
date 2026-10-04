@@ -70,6 +70,10 @@ use sql::{EventSchema, Params, Source};
 
 /// Explicit bound on rows any internal result set may return.
 pub const MAX_INTERNAL_ROWS: usize = 5_000_000;
+/// Explicit bound on rows one streamed statement may deliver. Streamed rows
+/// are consumed batch by batch (nothing accumulates here), so the bound only
+/// stops runaway scans; consumers bound their own state.
+pub const MAX_STREAMED_ROWS: usize = 100_000_000;
 /// Explicit bound on actors per page.
 pub const MAX_ACTOR_PAGE: u32 = 1_000;
 /// Explicit bound on actor offsets.
@@ -187,6 +191,16 @@ pub struct EngineConfig {
     /// Rows one ordered per-person partition aims for (funnels, paths,
     /// lifecycle, retention); bounds materialized intermediate results.
     pub partition_rows: u64,
+    /// Rows one funnel partition aims for. Funnels stream their rows (only
+    /// one person's events are held at a time), so a partition is bounded by
+    /// DuckDB's sort, which spills; larger partitions mean fewer rescans.
+    pub funnel_partition_rows: u64,
+    /// Bytes of per-person state a funnel pass may gather in memory before
+    /// the sorted (spilling) paths take over.
+    pub funnel_gather_bytes: usize,
+    /// Persons whose equal-timestamp events differ that a funnel resolves by
+    /// uuid before it orders everything by uuid instead.
+    pub funnel_max_tied: usize,
 }
 
 impl Default for EngineConfig {
@@ -202,6 +216,9 @@ impl Default for EngineConfig {
             sql_memory_limit_mb: 256,
             cache_entries: 256,
             partition_rows: PARTITION_ROWS,
+            funnel_partition_rows: FUNNEL_PARTITION_ROWS,
+            funnel_gather_bytes: 256 * 1024 * 1024,
+            funnel_max_tied: 20_000,
         }
     }
 }
@@ -295,6 +312,11 @@ pub(crate) struct Ctx<'a> {
     pub sql_memory_limit_mb: u32,
     pub threads: u32,
     pub partition_rows: u64,
+    pub funnel_partition_rows: u64,
+    pub funnel_gather_bytes: usize,
+    pub funnel_max_tied: usize,
+    /// Absolute spill directory (`<data dir>/tmp/query`) for the SQL sandbox.
+    pub temp_directory: Option<&'a std::path::Path>,
 }
 
 impl Ctx<'_> {
@@ -313,6 +335,8 @@ impl Ctx<'_> {
         params: &Params,
         mut map: impl FnMut(&duckdb::Row<'_>) -> duckdb::Result<T>,
     ) -> Result<Vec<T>, QueryError> {
+        #[cfg(test)]
+        self.profile(sql, params);
         let mut statement = self.conn.prepare(sql)?;
         let mut rows = statement.query(duckdb::params_from_iter(params.values()))?;
         let mut out = Vec::new();
@@ -327,6 +351,27 @@ impl Ctx<'_> {
         Ok(out)
     }
 
+    /// Test hook: with `HOGLET_QUERY_PROFILE` set, print the statement and
+    /// DuckDB's `EXPLAIN ANALYZE` of it (runs it once more, so only for
+    /// profiling sessions).
+    #[cfg(test)]
+    fn profile(&self, sql: &str, params: &Params) {
+        if std::env::var_os("HOGLET_QUERY_PROFILE").is_none() {
+            return;
+        }
+        println!("---- SQL ----\n{sql}");
+        let plan = (|| -> duckdb::Result<String> {
+            let mut statement = self.conn.prepare(&format!("EXPLAIN ANALYZE {sql}"))?;
+            let mut rows = statement.query(duckdb::params_from_iter(params.values()))?;
+            let mut out = String::new();
+            while let Some(row) = rows.next()? {
+                out.push_str(&row.get::<_, String>(1)?);
+            }
+            Ok(out)
+        })();
+        println!("---- PLAN ----\n{}", plan.unwrap_or_else(|e| e.to_string()));
+    }
+
     /// Stream a statement's result as Arrow batches.
     pub fn arrow(
         &self,
@@ -334,12 +379,52 @@ impl Ctx<'_> {
         params: &Params,
         mut each: impl FnMut(&RecordBatch) -> Result<(), QueryError>,
     ) -> Result<(), QueryError> {
+        #[cfg(test)]
+        self.profile(sql, params);
         let mut statement = self.conn.prepare(sql)?;
         let batches = statement.query_arrow(duckdb::params_from_iter(params.values()))?;
         let mut rows = 0_usize;
         for batch in batches {
             rows += batch.num_rows();
-            if rows > MAX_INTERNAL_ROWS {
+            if rows > MAX_STREAMED_ROWS {
+                return Err(QueryError::too_large(
+                    "the query produced too many intermediate rows; narrow the date range or filters",
+                ));
+            }
+            self.check_deadline()?;
+            each(&batch)?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Ctx::arrow`], but DuckDB streams the result instead of
+    /// materializing it first: a large ordered result never sits in memory
+    /// next to the consumer's own state. `types` are the result columns'
+    /// Arrow types (`Utf8` for VARCHAR, `Int64` for BIGINT).
+    pub fn arrow_streaming(
+        &self,
+        sql: &str,
+        params: &Params,
+        types: &[DataType],
+        mut each: impl FnMut(&RecordBatch) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
+        #[cfg(test)]
+        self.profile(sql, params);
+        let schema = Arc::new(duckdb::arrow::datatypes::Schema::new(
+            types
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| {
+                    duckdb::arrow::datatypes::Field::new(format!("c{index}"), kind.clone(), true)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let mut statement = self.conn.prepare(sql)?;
+        let batches = statement.stream_arrow(duckdb::params_from_iter(params.values()), schema)?;
+        let mut rows = 0_usize;
+        for batch in batches {
+            rows += batch.num_rows();
+            if rows > MAX_STREAMED_ROWS {
                 return Err(QueryError::too_large(
                     "the query produced too many intermediate rows; narrow the date range or filters",
                 ));
@@ -354,6 +439,15 @@ impl Ctx<'_> {
     /// materialized partition stays near [`PARTITION_ROWS`] rows (from the
     /// files' row counts — Parquet metadata, no scan).
     pub fn person_partitions(&self) -> Result<u64, QueryError> {
+        self.partitions_of(self.partition_rows)
+    }
+
+    /// Like [`Ctx::person_partitions`] with the funnel's larger partitions.
+    pub fn funnel_partitions(&self) -> Result<u64, QueryError> {
+        self.partitions_of(self.funnel_partition_rows)
+    }
+
+    fn partitions_of(&self, partition_rows: u64) -> Result<u64, QueryError> {
         if self.source.files.is_empty() {
             return Ok(1);
         }
@@ -370,8 +464,26 @@ impl Ctx<'_> {
             |row| row.get(0),
         )?;
         Ok((rows.max(0) as u64)
-            .div_ceil(self.partition_rows)
+            .div_ceil(partition_rows)
             .clamp(1, MAX_PARTITIONS))
+    }
+
+    /// Replace a connection-local temp table with one VARCHAR column.
+    pub fn temp_text_table(
+        &self,
+        name: &str,
+        column: &str,
+        rows: &[String],
+    ) -> Result<(), QueryError> {
+        self.conn.execute_batch(&format!(
+            "CREATE OR REPLACE TEMP TABLE {name} ({column} VARCHAR)"
+        ))?;
+        let mut appender = self.conn.appender_to_catalog_and_db(name, "temp", "main")?;
+        for row in rows {
+            appender.append_row(duckdb::params![row])?;
+        }
+        appender.flush()?;
+        Ok(())
     }
 
     /// Replace a connection-local temp table of BIGINT columns.
@@ -400,6 +512,8 @@ impl Ctx<'_> {
 
 /// Rows one per-person partition aims for.
 pub const PARTITION_ROWS: u64 = 2_000_000;
+/// Rows one funnel partition aims for (see [`EngineConfig`]).
+pub const FUNNEL_PARTITION_ROWS: u64 = 12_000_000;
 const MAX_PARTITIONS: u64 = 1_024;
 
 /// SQL selecting one person-hash partition (server integers only).
@@ -531,11 +645,19 @@ impl QueryEngine {
              CREATE TABLE person_overrides (project_id VARCHAR NOT NULL, \
                  distinct_id VARCHAR NOT NULL, person_id VARCHAR NOT NULL);",
         );
+        // Absolute, so a relative data dir never becomes a spill directory
+        // relative to the working directory of whichever thread runs a query.
+        let mut config = config;
         if let Some(directory) = &config.temp_directory {
+            let absolute = std::path::absolute(directory)
+                .map_err(|error| QueryError::internal(format!("temp directory: {error}")))?;
+            std::fs::create_dir_all(&absolute)
+                .map_err(|error| QueryError::internal(format!("temp directory: {error}")))?;
             setup.push_str(&format!(
                 "SET temp_directory = {};",
-                sql::string_literal(&directory.to_string_lossy())?
+                sql::string_literal(&absolute.to_string_lossy())?
             ));
+            config.temp_directory = Some(absolute);
         }
         root.execute_batch(&setup)?;
         let mut idle = Vec::with_capacity(config.connections);
@@ -892,6 +1014,10 @@ impl QueryEngine {
             sql_memory_limit_mb: self.config.sql_memory_limit_mb,
             threads: self.config.threads,
             partition_rows: self.config.partition_rows.max(1),
+            funnel_partition_rows: self.config.funnel_partition_rows.max(1),
+            funnel_gather_bytes: self.config.funnel_gather_bytes,
+            funnel_max_tied: self.config.funnel_max_tied,
+            temp_directory: self.config.temp_directory.as_deref(),
         };
         let output = match work {
             Work::Result => Output::Result(run_kind(&ctx, query, &prepared)?),

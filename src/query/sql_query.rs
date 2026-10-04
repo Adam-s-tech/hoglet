@@ -24,6 +24,30 @@ use crate::contract::insight::{InsightResult, SqlQuery};
 use crate::lake::parquet::PROMOTED;
 
 pub const MAX_SQL_ROWS: usize = 10_000;
+/// Longest text one cell may carry; longer values are cut and marked.
+pub const MAX_CELL_BYTES: usize = 64 * 1024;
+/// Most bytes of cells one response may carry; past it `truncated` is set.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const TRUNCATION_MARK: &str = "…[truncated]";
+/// Functions that reveal the host (settings, environment, file paths, view
+/// definitions) or run SQL the validation never saw. Matched on the parsed
+/// statement, case-insensitively; every `duckdb_*` and `pragma_*` table
+/// function is refused too.
+const DENIED_FUNCTIONS: &[&str] = &[
+    "current_setting",
+    "getenv",
+    "glob",
+    "query",
+    "query_table",
+    "json_execute_serialized_sql",
+    "sniff_csv",
+    "parquet_metadata",
+    "parquet_schema",
+    "parquet_file_metadata",
+    "parquet_kv_metadata",
+    "parquet_bloom_probe",
+    "which_secret",
+];
 /// Explicit bound on one cell's JSON rendering.
 const MAX_CELL_DEPTH: usize = 16;
 
@@ -34,6 +58,15 @@ fn sandbox(ctx: &Ctx<'_>) -> Result<Connection, QueryError> {
         .enable_autoload_extension(false)?;
     let conn = Connection::open_in_memory_with_flags(config)?;
     super::set_utc(&conn);
+    // Spill under the data directory's `tmp/query` (absolute), or nowhere:
+    // never DuckDB's default of a relative `.tmp`.
+    match ctx.temp_directory {
+        Some(directory) => conn.execute_batch(&format!(
+            "SET temp_directory = {};",
+            string_literal(&directory.to_string_lossy())?
+        ))?,
+        None => conn.execute_batch("SET temp_directory = '';")?,
+    }
     conn.execute_batch(
         "SET autoinstall_known_extensions = false; \
          CREATE TEMP TABLE person_overrides (distinct_id VARCHAR, person_id VARCHAR); \
@@ -140,12 +173,51 @@ fn validate(conn: &Connection, sql: &str) -> Result<String, QueryError> {
             message
         }));
     }
+    if let Some(name) = denied_function(&parsed) {
+        return Err(QueryError::invalid(format!(
+            "the function `{name}` is not available in SQL queries"
+        )));
+    }
     match parsed["statements"].as_array() {
         Some(statements) if statements.len() == 1 => Ok(trimmed.to_owned()),
         _ => Err(QueryError::invalid(
             "only a single SELECT statement is allowed",
         )),
     }
+}
+
+/// The first denied function (or table function) named anywhere in a parsed
+/// statement.
+fn denied_function(node: &Json) -> Option<String> {
+    match node {
+        Json::Object(map) => {
+            if let Some(Json::String(name)) = map.get("function_name") {
+                let lower = name.to_ascii_lowercase();
+                if DENIED_FUNCTIONS.contains(&lower.as_str())
+                    || lower.starts_with("duckdb_")
+                    || lower.starts_with("pragma_")
+                    || lower.starts_with("read_")
+                {
+                    return Some(lower);
+                }
+            }
+            map.values().find_map(denied_function)
+        }
+        Json::Array(items) => items.iter().find_map(denied_function),
+        _ => None,
+    }
+}
+
+fn cap_text(mut text: String) -> String {
+    if text.len() > MAX_CELL_BYTES {
+        let mut end = MAX_CELL_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str(TRUNCATION_MARK);
+    }
+    text
 }
 
 fn to_json(value: Value, depth: usize) -> Json {
@@ -177,9 +249,16 @@ fn to_json(value: Value, depth: usize) -> Json {
             let micros = unit.to_micros(n);
             Json::String(super::range::rfc3339_micros(micros))
         }
-        Value::Text(text) => Json::String(text),
-        Value::Enum(text) => Json::String(text),
-        Value::Blob(bytes) => Json::String(hex::encode(bytes)),
+        Value::Text(text) => Json::String(cap_text(text)),
+        Value::Enum(text) => Json::String(cap_text(text)),
+        Value::Blob(bytes) => {
+            let shown = bytes.len().min(MAX_CELL_BYTES / 2);
+            let mut text = hex::encode(&bytes[..shown]);
+            if shown < bytes.len() {
+                text.push_str(TRUNCATION_MARK);
+            }
+            Json::String(text)
+        }
         Value::Date32(days) => Json::String(
             chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)
                 .map(|date| date.to_string())
@@ -278,6 +357,7 @@ fn execute(conn: &Connection, q: &SqlQuery) -> Result<InsightResult, QueryError>
     let mut rows = statement.query([]).map_err(user_error)?;
     let mut out = Vec::new();
     let mut truncated = false;
+    let mut bytes = 0_usize;
     while let Some(row) = rows.next().map_err(user_error)? {
         if out.len() == MAX_SQL_ROWS {
             truncated = true;
@@ -286,7 +366,13 @@ fn execute(conn: &Connection, q: &SqlQuery) -> Result<InsightResult, QueryError>
         let mut cells = Vec::with_capacity(columns.len());
         for index in 0..columns.len() {
             let value: Value = row.get(index).map_err(user_error)?;
-            cells.push(to_json(value, 0));
+            let cell = to_json(value, 0);
+            bytes = bytes.saturating_add(cell.to_string().len());
+            cells.push(cell);
+        }
+        if bytes > MAX_RESPONSE_BYTES {
+            truncated = true;
+            break;
         }
         out.push(cells);
     }

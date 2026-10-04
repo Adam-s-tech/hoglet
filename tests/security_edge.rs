@@ -1041,7 +1041,6 @@ async fn sessions_per_user_are_bounded() {
 /// SQL result cell is not size-capped, so `repeat('x', 1e9)` makes the server
 /// build and send a 1 GB response. Un-ignore once cells are truncated.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "open finding: SQL result cells are unbounded (src/query/sql_query.rs)"]
 async fn sql_result_cells_are_size_capped() {
     let h = start().await;
     let (status, _, body) = send(

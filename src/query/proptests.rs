@@ -193,6 +193,7 @@ pub(crate) fn test_config() -> EngineConfig {
         timeout: std::time::Duration::from_secs(120),
         // Several person partitions even on small datasets.
         partition_rows: 120,
+        funnel_partition_rows: 120,
         ..EngineConfig::default()
     }
 }
@@ -951,8 +952,33 @@ fn trends_match_the_oracle() {
 
 #[test]
 fn funnels_match_the_oracle() {
-    property_test(
+    funnels_oracle(test_config());
+}
+
+/// Gathering off: every funnel goes through the sorted, spilling path.
+#[test]
+fn funnels_match_the_oracle_when_sorted_by_hash() {
+    funnels_oracle(EngineConfig {
+        funnel_gather_bytes: 0,
+        ..test_config()
+    });
+}
+
+/// Gathering off and no tied person allowed: the uuid-ordered path decides.
+#[test]
+fn funnels_match_the_oracle_when_ordered_by_uuid() {
+    funnels_oracle(EngineConfig {
+        funnel_gather_bytes: 0,
+        funnel_max_tied: 0,
+        ..test_config()
+    });
+}
+
+fn funnels_oracle(config: EngineConfig) {
+    property_test_on(
         2,
+        seeds(),
+        move |events| Fixture::with_config(events, config.clone()),
         |rng| InsightQuery::FunnelsQuery(random_funnel(rng)),
         |world, query| match query {
             InsightQuery::FunnelsQuery(q) => oracle::funnels(world, q),

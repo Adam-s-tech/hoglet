@@ -204,6 +204,208 @@ fn granule(interval: Interval) -> Interval {
     }
 }
 
+/// Most 64-bit words of activity bits one person may need (granules ≤ 64 ×
+/// this); wider queries use the general SQL path.
+const MAX_MASK_WORDS: usize = 4;
+
+type Masked = (Vec<Row>, Vec<(Option<String>, Option<f64>)>);
+
+/// Active-person maths (`dau`, `weekly_active`, `monthly_active`) from one
+/// bit per (person, granule) instead of a DISTINCT or a window function over
+/// person × granule rows.
+///
+/// Per distinct id (before identity is applied, so no join touches the
+/// events) the matching events are folded into a bitmask of the granules
+/// (days, or the interval's own buckets for `dau`) the id was active in;
+/// the masks are then joined to the identity overrides (one row per distinct
+/// id, not per event) and OR-ed per person. Counting persons per bucket is
+/// then `mask & window != 0`, done here. The result is exactly the number of
+/// distinct persons with an event in the bucket (`dau`) or in the trailing
+/// window (`weekly_active`/`monthly_active`).
+///
+/// `None` when the query does not fit (person-property filters or breakdowns
+/// need identity per event; month or hour granules; more than
+/// `MAX_MASK_WORDS * 64` granules): the caller then runs the general SQL.
+fn active_masks(
+    ctx: &Ctx<'_>,
+    q: &TrendsQuery,
+    node: &EventNode,
+    period: &ResolvedRange,
+    buckets: &[i64],
+    top: Option<&Top>,
+) -> Result<Option<Masked>, QueryError> {
+    if !ctx.source.person_keys.is_empty() || !needs_person(node.math) || buckets.is_empty() {
+        return Ok(None);
+    }
+    let days = window_days(node.math);
+    // Events are read from `load_from` (the earliest window start for the
+    // windowed maths); granules are counted from the day or bucket holding it.
+    let mut load_from = period.from;
+    // Granule index of an event: its bucket (dau) or its day (windows).
+    let (granule_interval, base, unit) = match days {
+        None => match period.interval {
+            Interval::Day | Interval::Week => {
+                (period.interval, buckets[0], range::next_bucket(buckets[0], period.interval) - buckets[0])
+            }
+            _ => return Ok(None),
+        },
+        Some(days) => {
+            if period.interval == Interval::Hour {
+                return Ok(None);
+            }
+            load_from = buckets
+                .iter()
+                .map(|bucket| range::next_bucket(*bucket, period.interval) - days * DAY_US)
+                .min()
+                .unwrap_or(period.from)
+                .min(period.from);
+            (Interval::Day, range::trunc(load_from, Interval::Day), DAY_US)
+        }
+    };
+    let granules = ((period.to - base + unit - 1) / unit).max(1) as usize;
+    let words = granules.div_ceil(64);
+    if words > MAX_MASK_WORDS {
+        return Ok(None);
+    }
+    // Window of each bucket as a granule range [lo, hi).
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(buckets.len());
+    for bucket in buckets {
+        let (start, end) = match days {
+            None => (*bucket, range::next_bucket(*bucket, period.interval)),
+            Some(days) => {
+                let end = range::next_bucket(*bucket, period.interval);
+                (end - days * DAY_US, end)
+            }
+        };
+        if (start - base) % unit != 0 || (end - base) % unit != 0 || start < base {
+            return Ok(None);
+        }
+        let lo = ((start - base) / unit) as usize;
+        let hi = (((end - base) / unit) as usize).min(granules);
+        spans.push((lo, hi));
+    }
+
+    let text = breakdown_text(ctx, q)?;
+    let load_to = period.to;
+    let mut params = Params::new();
+    let relation = ctx
+        .source
+        .relation(&mut params, Some(load_from), Some(load_to), false)?;
+    let pred = predicate(ctx, q, node, &mut params)?;
+    let bd = match (&text, top) {
+        (Some(text), Some(top)) => mapped_breakdown(text, top, &mut params),
+        _ => "NULL::VARCHAR".to_owned(),
+    };
+    let index = format!(
+        "(({} - {}) // {unit})",
+        bucket_expr(granule_interval, "ts"),
+        params.int(base)
+    );
+    let in_range = params.int(period.from);
+    let project = params.text(ctx.project_id);
+    let first_words: String = (0..words)
+        .map(|word| {
+            let low = word * 64;
+            if words == 1 {
+                "bit_or(1::UBIGINT << i::UBIGINT) AS m0".to_owned()
+            } else {
+                format!(
+                    "bit_or(CASE WHEN i >= {low} AND i < {} THEN 1::UBIGINT << (i - {low})::UBIGINT \
+                     ELSE 0::UBIGINT END) AS m{word}",
+                    low + 64
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let merged_words: String = (0..words)
+        .map(|word| format!("bit_or(d.m{word}) AS m{word}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let word_names: String = (0..words)
+        .map(|word| format!("m{word}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH ev AS ({relation}), \
+         x AS (SELECT distinct_id, {bd} AS bd, {index} AS i, ts FROM ev WHERE {pred}), \
+         d AS (SELECT distinct_id, bd, {first_words}, \
+                      max(CASE WHEN ts >= {in_range} THEN 1 ELSE 0 END) AS r \
+               FROM x GROUP BY distinct_id, bd), \
+         p AS (SELECT coalesce(o.person_id, d.distinct_id) AS person_id, d.bd AS bd, \
+                      {merged_words}, max(d.r) AS r \
+               FROM d LEFT JOIN (SELECT distinct_id, person_id FROM main.person_overrides \
+                                 WHERE project_id = {project}) o ON o.distinct_id = d.distinct_id \
+               GROUP BY 1, 2) \
+         SELECT bd, {word_names}, r, count(*) FROM p GROUP BY bd, {word_names}, r"
+    );
+    let masks = ctx.rows(&sql, &params, |row| {
+        let mut bits = Vec::with_capacity(words);
+        for word in 0..words {
+            bits.push(row.get::<_, u64>(1 + word)?);
+        }
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            bits,
+            row.get::<_, i64>(1 + words)?,
+            row.get::<_, i64>(2 + words)?,
+        ))
+    })?;
+
+    // Per breakdown value: persons per bucket, and persons in the range.
+    let mut per_bucket: HashMap<Option<String>, Vec<i64>> = HashMap::new();
+    let mut whole: HashMap<Option<String>, i64> = HashMap::new();
+    for (key, bits, in_range, count) in masks {
+        let counts = per_bucket
+            .entry(key.clone())
+            .or_insert_with(|| vec![0; buckets.len()]);
+        for (slot, (lo, hi)) in counts.iter_mut().zip(&spans) {
+            if span_has_bit(&bits, *lo, *hi) {
+                *slot += count;
+            }
+        }
+        if days.is_none() || in_range == 1 {
+            *whole.entry(key).or_insert(0) += count;
+        }
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let mut aggregated: Vec<(Option<String>, Option<f64>)> = Vec::new();
+    for (key, counts) in per_bucket {
+        for (bucket, count) in buckets.iter().zip(counts) {
+            if count > 0 {
+                rows.push((false, Some(*bucket), key.clone(), Some(count as f64)));
+            }
+        }
+        let total = whole.get(&key).copied().unwrap_or(0);
+        if days.is_none() {
+            rows.push((true, None, key, Some(total as f64)));
+        } else {
+            aggregated.push((key, Some(total as f64)));
+        }
+    }
+    Ok(Some((rows, aggregated)))
+}
+
+/// Is any bit in `[lo, hi)` set across the 64-bit words?
+fn span_has_bit(words: &[u64], lo: usize, hi: usize) -> bool {
+    let mut at = lo;
+    while at < hi {
+        let word = at / 64;
+        let offset = at % 64;
+        let take = (64 - offset).min(hi - at);
+        let mask = if take == 64 {
+            u64::MAX
+        } else {
+            ((1_u64 << take) - 1) << offset
+        };
+        if words.get(word).is_some_and(|bits| bits & mask != 0) {
+            return true;
+        }
+        at += take;
+    }
+    false
+}
+
 fn compute(
     ctx: &Ctx<'_>,
     q: &TrendsQuery,
@@ -218,7 +420,11 @@ fn compute(
 
     let rows: Vec<Row>;
     let mut aggregated_rows: Vec<(Option<String>, Option<f64>)> = Vec::new();
-    if let Some(days) = window_days(node.math) {
+    let masked = active_masks(ctx, q, node, period, buckets, top)?;
+    if let Some((mask_rows, mask_aggregated)) = masked {
+        rows = mask_rows;
+        aggregated_rows = mask_aggregated;
+    } else if let Some(days) = window_days(node.math) {
         let windows: Vec<Vec<i64>> = buckets
             .iter()
             .map(|bucket| {
