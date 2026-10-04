@@ -225,7 +225,13 @@ impl Generator<'_> {
             }
             let distinct_id = visitor.distinct_id().to_owned();
             self.push("$pageview", &distinct_id, at, properties);
-            at += Duration::seconds(self.rng.gen_range(8..240));
+            // About half of single-page visits are quick glances (a bounce).
+            let glance = pages.len() == 1 && self.rng.gen_bool(0.5);
+            at += Duration::seconds(if glance {
+                self.rng.gen_range(1..9)
+            } else {
+                self.rng.gen_range(12..240)
+            });
         }
         let mut properties = self.base_properties(visitor, &session_id, pages[pages.len() - 1]);
         properties.insert("$prev_pageview_pathname".into(), json!(pages[pages.len() - 1]));
