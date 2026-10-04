@@ -589,7 +589,7 @@ fn resource_error(error: ControlResourceError, request_id: &RequestId) -> Respon
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_query",
             &message,
-            Some(format!("query_ir.{field}")),
+            Some(field),
             request_id,
         ),
         ControlResourceError::Unavailable | ControlResourceError::InvalidStorage => error_response(

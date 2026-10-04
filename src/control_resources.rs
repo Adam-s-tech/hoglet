@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::query::ir::Query;
-use crate::query::supported::SupportedQuery;
+use crate::contract::insight::InsightQuery;
 use crate::storage_bootstrap::CONTROL_APPLICATION_ID;
 
 const MAX_NAME_BYTES: usize = 512;
@@ -845,36 +844,39 @@ fn validate_tile(tile: &DashboardTileInput) -> Result<(), ControlResourceError> 
     Ok(())
 }
 
+/// Saved insights store the `/query` wire format (`InsightQuery`) and must
+/// pass the engine's validation, so a saved insight always runs.
 fn supported_query_json(query_ir: &Value) -> Result<String, ControlResourceError> {
-    let query: Query = serde_json::from_value(query_ir.clone()).map_err(|error| {
+    let query: InsightQuery = serde_json::from_value(query_ir.clone()).map_err(|error| {
         ControlResourceError::InvalidQuery {
             field: "query_ir".into(),
             message: error.to_string(),
         }
     })?;
-    let supported =
-        SupportedQuery::try_from(query).map_err(|error| ControlResourceError::InvalidQuery {
-            field: error.field,
-            message: error.message,
-        })?;
-    serde_json::to_string(supported.as_query()).map_err(|error| {
-        ControlResourceError::InvalidQuery {
-            field: "query_ir".into(),
-            message: error.to_string(),
-        }
+    crate::query::validate_query(&query).map_err(|error| ControlResourceError::InvalidQuery {
+        field: "query_ir".into(),
+        message: error.public_message(),
+    })?;
+    serde_json::to_string(&query).map_err(|error| ControlResourceError::InvalidQuery {
+        field: "query_ir".into(),
+        message: error.to_string(),
     })
 }
 
+/// Migration seam: historical insights are preserved verbatim; only those
+/// that are valid `InsightQuery`s are marked supported.
 fn imported_query_json(query_ir: &Value) -> Result<(String, bool), ControlResourceError> {
-    let query: Query = serde_json::from_value(query_ir.clone()).map_err(|error| {
-        ControlResourceError::InvalidQuery {
+    if !query_ir.is_object() {
+        return Err(ControlResourceError::InvalidQuery {
             field: "query_ir".into(),
-            message: error.to_string(),
-        }
-    })?;
-    let supported = SupportedQuery::try_from(query.clone()).is_ok();
+            message: "query_ir must be a JSON object".into(),
+        });
+    }
+    let supported = serde_json::from_value::<InsightQuery>(query_ir.clone())
+        .ok()
+        .is_some_and(|query| crate::query::validate_query(&query).is_ok());
     let encoded =
-        serde_json::to_string(&query).map_err(|error| ControlResourceError::InvalidQuery {
+        serde_json::to_string(query_ir).map_err(|error| ControlResourceError::InvalidQuery {
             field: "query_ir".into(),
             message: error.to_string(),
         })?;

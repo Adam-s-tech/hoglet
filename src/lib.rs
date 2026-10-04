@@ -12,7 +12,6 @@ pub mod control;
 pub mod control_resources;
 pub mod demo;
 pub mod enrichment;
-pub mod event_lake;
 pub mod explore;
 pub mod flags;
 pub mod forward;
@@ -30,6 +29,5 @@ pub mod routes;
 pub mod sink;
 pub mod source;
 pub mod storage_bootstrap;
-pub mod store;
 pub mod token;
 

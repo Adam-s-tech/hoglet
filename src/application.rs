@@ -194,8 +194,15 @@ impl Application {
             tracing::warn!("recovered a torn tail from the capture WAL");
         }
         let engine = Arc::new(
-            QueryEngine::try_new(config.data_dir.join("events"))
-                .map_err(|error| ApplicationError::Query(format!("{error:?}")))?,
+            QueryEngine::new(
+                lake.clone() as Arc<dyn crate::source::EventSource>,
+                persons.clone(),
+                crate::query::EngineConfig {
+                    temp_directory: Some(config.data_dir.join("tmp").join("query")),
+                    ..crate::query::EngineConfig::default()
+                },
+            )
+            .map_err(|error| ApplicationError::Query(error.to_string()))?,
         );
         let projection_catalog = Arc::new(ProjectionCatalog::open(&paths.projections())?);
         let event_source: Arc<dyn crate::source::EventSource> = lake.clone();
