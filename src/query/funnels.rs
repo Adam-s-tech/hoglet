@@ -398,7 +398,7 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
     } else {
-        numerator as f64 / denominator as f64
+        100.0 * numerator as f64 / denominator as f64
     }
 }
 

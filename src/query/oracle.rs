@@ -791,7 +791,7 @@ fn funnel_outcomes(world: &World<'_>, q: &FunnelsQuery) -> Vec<Outcome> {
 fn funnel_steps(q: &FunnelsQuery, members: &[&Outcome]) -> Vec<FunnelStepResult> {
     let n = q.series.len();
     let count = |k: usize| members.iter().filter(|o| o.times.len() > k).count() as u64;
-    let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
+    let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
     (0..n)
         .map(|k| {
             let durations: Vec<f64> = if k == 0 {

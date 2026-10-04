@@ -4,4 +4,12 @@ export type FunnelStepResult = {
 /**
  * 0-based.
  */
-order: number, name: string, count: number, conversion_from_previous: number, conversion_from_start: number, dropped_off: number, average_conversion_time_s: number | null, median_conversion_time_s: number | null, };
+order: number, name: string, count: number, 
+/**
+ * Percent, 0–100.
+ */
+conversion_from_previous: number, 
+/**
+ * Percent, 0–100.
+ */
+conversion_from_start: number, dropped_off: number, average_conversion_time_s: number | null, median_conversion_time_s: number | null, };

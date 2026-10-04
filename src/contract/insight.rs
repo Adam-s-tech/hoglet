@@ -433,7 +433,9 @@ pub struct FunnelStepResult {
     pub name: String,
     #[ts(type = "number")]
     pub count: u64,
+    /// Percent, 0–100.
     pub conversion_from_previous: f64,
+    /// Percent, 0–100.
     pub conversion_from_start: f64,
     #[ts(type = "number")]
     pub dropped_off: u64,
