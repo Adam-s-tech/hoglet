@@ -129,7 +129,7 @@ export function HomePage() {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <Panel>
           <CardBar>
-            <h3 className="flex-1">Events and unique users · last 14 days</h3>
+            <h2 className="flex-1 text-sm">Events and unique users · last 14 days</h2>
             <Button variant="ghost" size="sm" nativeButton={false} render={<Link to={path("insights/new")} search={{ kind: "trends" }} />}>
               Explore <Icon name="arrowRight" size={12} />
             </Button>
@@ -140,7 +140,7 @@ export function HomePage() {
         </Panel>
         <Panel>
           <CardBar>
-            <h3>Top events</h3>
+            <h2 className="text-sm">Top events</h2>
           </CardBar>
           {events.error && !events.data ? (
             <CardPad>
@@ -165,7 +165,7 @@ export function HomePage() {
       <div className="mt-4 grid gap-4 md:grid-cols-2">
         <Panel>
           <CardBar>
-            <h3 className="flex-1">Recent insights</h3>
+            <h2 className="flex-1 text-sm">Recent insights</h2>
             <Button variant="ghost" size="sm" nativeButton={false} render={<Link to={path("insights")} />}>
               All insights
             </Button>
@@ -207,7 +207,7 @@ export function HomePage() {
         </Panel>
         <Panel>
           <CardBar>
-            <h3 className="flex-1">Dashboards</h3>
+            <h2 className="flex-1 text-sm">Dashboards</h2>
             <Button variant="ghost" size="sm" nativeButton={false} render={<Link to={path("dashboards")} />}>
               All dashboards
             </Button>

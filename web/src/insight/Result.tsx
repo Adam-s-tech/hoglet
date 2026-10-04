@@ -316,7 +316,7 @@ function TrendsTable({
   slot: (s: TrendSeries) => number;
   onSelect: (s: TrendSeries, i: number) => void;
 }) {
-  const labels = series[0]?.labels ?? [];
+  const labels = useMemo(() => series[0]?.labels ?? [], [series]);
   const rows = useMemo<SeriesRow[]>(() => series.map((s, si) => ({ s, si })), [series]);
   const columns = useMemo(
     () => [
@@ -440,6 +440,7 @@ function TrendsView({ query, series, compact, onSelect }: { query: TrendsQ; seri
       tooltipTitle={(i) => (base.days[i] ? fmtBucket(base.days[i], interval(query)) : labels[i])}
       onPointClick={(si, i) => select(series[si], i)}
       legend={!compact || series.length <= 6}
+      dataTable={!compact}
     />
   );
 }
@@ -448,7 +449,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
   const [target, setTarget] = useState<ActorsTarget | null>(null);
   const [funnelTab, setFunnelTab] = useState<"steps" | "time">("steps");
   const closeActors = useCallback(() => setTarget(null), []);
-  let body: ReactNode = null;
+  let body: ReactNode;
 
   if (result.kind === "Trends" && query.kind === "TrendsQuery") {
     body = <TrendsView query={query} series={result.series} compact={compact} onSelect={setTarget} />;
@@ -489,6 +490,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
               series={[{ key: "ttc", label: "Persons converted", color: "var(--s1)", data: result.time_to_convert.map((b) => b.count) }]}
               tooltipTitle={(i) => `${fmtDuration(result.time_to_convert[i].from_s)} – ${fmtDuration(result.time_to_convert[i].to_s)}`}
               legend={false}
+              dataTable
             />
           )}
         </div>
@@ -520,6 +522,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
       <TimeSeriesChart
         kind="stacked"
         height={compact ? 220 : 340}
+        dataTable={!compact}
         labels={labels}
         series={statuses.map((s, i) => ({ key: s.key, label: s.label, color: seriesColor(i), data: s.data.map(Number) }))}
         onPointClick={(si, i) => {
@@ -538,6 +541,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
         <TimeSeriesChart
           kind="bar"
           height={compact ? 220 : 340}
+          dataTable={!compact}
           labels={labels}
           series={result.series.map((s, i) => ({ key: String(i), label: s.label, color: seriesColor(i), data: s.data.map(Number) }))}
           onPointClick={(si, i) => {
@@ -553,7 +557,7 @@ export function InsightResultView({ query, result, compact = false }: { query: I
           No sequences of {query.kind === "PathsQuery" && query.paths_type === "custom_events" ? "custom events" : "pageviews"} in this range.
         </Empty>
       ) : (
-        <PathsSankey links={result.links} />
+        <PathsSankey links={result.links} compact={compact} />
       );
   } else if (result.kind === "Sql") {
     body = <SqlTable columns={result.columns} types={result.types} rows={result.rows} truncated={result.truncated} compact={compact} />;

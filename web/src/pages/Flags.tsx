@@ -208,7 +208,7 @@ function Section({ title, sub, aside, children }: { title: string; sub?: string;
     <Panel>
       <CardBar>
         <div className="flex min-w-0 flex-1 flex-col">
-          <h3>{title}</h3>
+          <h2 className="text-sm">{title}</h2>
           {sub && <span className="text-xs text-muted-foreground">{sub}</span>}
         </div>
         {aside}

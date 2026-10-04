@@ -14,11 +14,15 @@ import { defineConfig } from "vite";
 // asset URLs must not be relative to the current path.
 const origin = process.env.HOGLET_ORIGIN ?? "http://127.0.0.1:8124";
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   plugins: [react(), tailwindcss()],
   base: "/",
   resolve: {
-    alias: { "@": resolve(import.meta.dirname, "./src") },
+    alias: {
+      "@": resolve(import.meta.dirname, "./src"),
+      // TanStack Form's devtools event client is dead weight in the shipped bundle.
+      ...(command === "build" ? { "@tanstack/devtools-event-client": resolve(import.meta.dirname, "./src/lib/event-client-stub.ts") } : {}),
+    },
   },
   build: {
     outDir: "dist",
@@ -34,4 +38,4 @@ export default defineConfig({
       "/i/v0/e": origin,
     },
   },
-});
+}));

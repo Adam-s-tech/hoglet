@@ -22,7 +22,7 @@ import { navigate } from "@/lib/nav";
 import { personEventsQuery, personQuery, personsQuery, qk } from "@/lib/queries";
 import type { PersonSummary } from "@/types/PersonSummary";
 import { AUTO_PAGES, EventTable, ScrollEnd } from "@/pages/Activity";
-import { LoadDemoButton } from "@/pages/Onboarding";
+import { FirstRunEmpty } from "@/components/first-run";
 
 const personRoute = getRouteApi("/project/$projectId/persons/$id");
 
@@ -39,7 +39,7 @@ export function PersonsPage() {
   const q = useDebounced(search.trim(), 250);
   const { data, error, isPending, isPlaceholderData, refetch, fetchNextPage, hasNextPage, isFetchingNextPage, isFetchNextPageError } = useInfiniteQuery(personsQuery(pid, q));
 
-  const pages = data?.pages ?? [];
+  const pages = useMemo(() => data?.pages ?? [], [data]);
   const persons = useMemo(() => {
     const seen = new Set<string>();
     return pages.flatMap((p) => p.persons).filter((p) => !seen.has(p.id) && seen.add(p.id));
@@ -121,9 +121,9 @@ export function PersonsPage() {
           q ? (
             <Empty icon="search" title={`No one matches “${q}”`} />
           ) : (
-            <Empty icon="users" title="No persons yet" action={<LoadDemoButton />}>
+            <FirstRunEmpty icon="users" title="No persons yet">
               Persons appear when events arrive. Call <code>posthog.identify(userId, {"{ email }"})</code> after login to link anonymous visits to a known user.
-            </Empty>
+            </FirstRunEmpty>
           )
         ) : (
           <ScrollEnd onEnd={() => pages.length < AUTO_PAGES && loadMore()}>
@@ -159,7 +159,7 @@ function str(v: unknown): string {
 function PersonEvents({ personId }: { personId: string }) {
   const pid = useProjectId();
   const { data, error, isPending, refetch, fetchNextPage, hasNextPage, isFetchingNextPage, isFetchNextPageError } = useInfiniteQuery(personEventsQuery(pid, personId));
-  const pages = data?.pages ?? [];
+  const pages = useMemo(() => data?.pages ?? [], [data]);
   const events = useMemo(() => {
     const seen = new Set<string>();
     return pages.flatMap((p) => p.events).filter((e) => !seen.has(e.uuid) && seen.add(e.uuid));
@@ -393,7 +393,7 @@ export function PersonPage() {
         <Panel className="mt-6 ring-destructive/30">
           <CardPad className="flex flex-wrap items-center gap-4">
             <div className="min-w-0 flex-1">
-              <h3>Delete person and all their data</h3>
+              <h2 className="text-sm">Delete person and all their data</h2>
               <p className="text-sm text-muted-foreground">Erases this person, their distinct IDs and every event they sent. For GDPR deletion requests.</p>
             </div>
             <Button variant="destructive" onClick={() => setErasing(true)}>

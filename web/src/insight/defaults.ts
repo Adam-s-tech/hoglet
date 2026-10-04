@@ -156,9 +156,6 @@ export function incomplete(q: InsightQuery): string | null {
   }
 }
 
-export function encodeQuery(q: InsightQuery): string {
-  return encodeURIComponent(JSON.stringify(q));
-}
 export function decodeQuery(s: string): InsightQuery | null {
   try {
     return normalizeQuery(JSON.parse(decodeURIComponent(s)));

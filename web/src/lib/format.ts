@@ -58,7 +58,6 @@ export function toDate(value: string | number | null | undefined): Date | null {
 const dtf = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const df = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" });
 const dShort = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
-const tf = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 const hf = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
 
 export function fmtDateTime(value: string | number | null | undefined): string {
@@ -68,10 +67,6 @@ export function fmtDateTime(value: string | number | null | undefined): string {
 export function fmtDate(value: string | number | null | undefined): string {
   const d = toDate(value);
   return d ? df.format(d) : "–";
-}
-export function fmtTime(value: string | number | null | undefined): string {
-  const d = toDate(value);
-  return d ? tf.format(d) : "–";
 }
 /** Bucket label for an interval: "14:00", "Oct 3", "Oct 2026". */
 export function fmtBucket(value: string, interval: string): string {
@@ -182,10 +177,6 @@ export function autoInterval(date_from: string, date_to: string | null | undefin
   if (days <= 92) return "day";
   if (days <= 366) return "week";
   return "month";
-}
-
-export function plural(n: number, one: string, many = `${one}s`): string {
-  return `${fmtNumber(n)} ${n === 1 ? one : many}`;
 }
 
 export function initials(name: string): string {

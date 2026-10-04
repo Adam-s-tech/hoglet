@@ -5,7 +5,7 @@ import { useMemo, useState, type KeyboardEvent as RKeyboardEvent, type MouseEven
 import { fmtCompact, fmtNumber } from "@/lib/format";
 import { useSize } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
-import { Swatch, Tip, TipFoot, TipRow, TipTitle } from "./parts";
+import { DataTableToggle, Swatch, Tip, TipFoot, TipRow, TipTitle } from "./parts";
 import { barPath, labelStride, linear, niceDomain, textWidth } from "./scale";
 
 export interface ChartSeries {
@@ -31,12 +31,14 @@ interface Props {
   /** Hint shown at the foot of the tooltip. */
   clickHint?: string;
   axisFormat?: (n: number) => string;
+  /** Offer the plotted numbers as a table (the text alternative). Off in dashboard tiles. */
+  dataTable?: boolean;
 }
 
 const M = { top: 10, right: 12, bottom: 26 };
 const KIND_NAME: Record<SeriesKind, string> = { line: "Line chart", area: "Area chart", bar: "Bar chart", stacked: "Stacked bar chart" };
 
-export function TimeSeriesChart({ labels, series, kind, height = 300, format = fmtNumber, tooltipTitle, onPointClick, legend = true, clickHint = "Click or press Enter to see persons", axisFormat = fmtCompact }: Props) {
+export function TimeSeriesChart({ labels, series, kind, height = 300, format = fmtNumber, tooltipTitle, onPointClick, legend = true, clickHint = "Click or press Enter to see persons", axisFormat = fmtCompact, dataTable = false }: Props) {
   const [ref, size] = useSize<HTMLDivElement>();
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [hover, setHover] = useState<{ i: number; s: number; x: number; y: number } | null>(null);
@@ -373,22 +375,13 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
           ))}
         </div>
       )}
+      {dataTable && (
+        <DataTableToggle
+          caption={`${KIND_NAME[kind]} data`}
+          head={["Period", ...series.map((s) => s.label)]}
+          rows={labels.map((l, i) => [tooltipTitle ? tooltipTitle(i) : l, ...series.map((s) => format(s.data[i] ?? 0))])}
+        />
+      )}
     </div>
-  );
-}
-
-/** Tiny inline trend line (KPI tiles, tables). */
-export function Sparkline({ data, color = "var(--s1)", width = 96, height = 28 }: { data: number[]; color?: string; width?: number; height?: number }) {
-  if (data.length < 2) return <svg width={width} height={height} aria-hidden="true" />;
-  const max = Math.max(...data, 1);
-  const min = Math.min(...data, 0);
-  const x = linear(0, data.length - 1, 1, width - 1);
-  const yy = linear(min, max, height - 2, 2);
-  const d = `M${data.map((v, i) => `${x(i).toFixed(1)},${yy(v).toFixed(1)}`).join("L")}`;
-  return (
-    <svg width={width} height={height} aria-hidden="true">
-      <path d={`${d}L${width - 1},${height}L1,${height}Z`} fill={color} opacity={0.1} />
-      <path d={d} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" />
-    </svg>
   );
 }

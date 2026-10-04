@@ -13,7 +13,7 @@ import type { InsightQuery } from "../types/InsightQuery";
 import type { PropertyFilter } from "../types/PropertyFilter";
 import type { QueryRequest } from "../types/QueryRequest";
 import type { WebDimension } from "../types/WebDimension";
-import type { RawRequest, RawResponse, Transport } from "../lib/api";
+import type { ForwardingConfig, RawRequest, RawResponse, Transport } from "../lib/api";
 import { autoInterval } from "../lib/format";
 import { EVENTS, EVENT_PROPS, PERSON_PROPS, VALUES, buckets, funnels, hash, lifecycle, makeEvent, makePersons, paths, retention, rng, sql, stickiness, trends, type MockPerson } from "./data";
 
@@ -40,6 +40,7 @@ interface State {
   dashboards: { id: string; project_id: string; name: string; tiles: { insight_id: string; x: number; y: number; w: number; h: number }[]; created_by: string; created_at: number }[];
   shares: Record<string, unknown>[];
   keys: { id: string; name: string; scope: "read" | "write"; key_prefix: string; last_used: number | null; created_at: number }[];
+  forwarding: { config: ForwardingConfig | null; forwarded: number; dropped: number; failed: number; queued: number; last_error: string | null };
   nextId: number;
 }
 
@@ -155,6 +156,7 @@ function seedState(): State {
         ],
     shares: [],
     keys: FRESH ? [] : [{ id: "key_1", name: "Nightly export", scope: "read" as const, key_prefix: "phx_9f2c", last_used: sec() - 3600 * 5, created_at: sec() - 86_400 * 20 }],
+    forwarding: { config: null, forwarded: 0, dropped: 0, failed: 0, queued: 0, last_error: null },
     nextId: 100,
   };
 }
@@ -505,6 +507,22 @@ async function handle({ method, url, body, signal }: RawRequest): Promise<RawRes
       first_day: has ? new Date(now() - 118 * 86_400_000).toISOString().slice(0, 10) : null,
       last_day: has ? new Date().toISOString().slice(0, 10) : null,
     });
+  }
+  if (rest === "/forwarding") {
+    const f = state.forwarding;
+    if (method === "PUT") {
+      const c = body as ForwardingConfig;
+      if (c.enabled && (!/^https?:\/\//.test(c.host) || !c.posthog_token.startsWith("phc_"))) {
+        return err(400, "invalid_request", "host must be an http(s) URL and posthog_token a phc_ project key.");
+      }
+      f.config = c;
+    } else if (f.config?.enabled) {
+      // Shadow mode in motion: a few events a poll, an occasional retry.
+      f.forwarded += 3 + Math.floor(Math.random() * 9);
+      f.queued = Math.floor(Math.random() * 4);
+      if (Math.random() < 0.15) f.failed += 1;
+    }
+    return ok(f);
   }
   if (rest === "/query" && method === "POST") return runQuery((body as QueryRequest).query);
   if (rest === "/query/actors" && method === "POST") {

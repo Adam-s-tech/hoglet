@@ -79,7 +79,7 @@ function SeriesRow({
             {index + 1}
           </span>
         ) : (
-          <span className="grid size-5 flex-none place-items-center rounded-[5px] text-[11px] font-semibold text-white" style={{ background: seriesColor(index) }} aria-hidden="true">
+          <span className="grid size-5 flex-none place-items-center rounded-[5px] border-2 text-[11px] font-semibold text-foreground" style={{ borderColor: seriesColor(index) }} aria-hidden="true">
             {letter(index)}
           </span>
         )}

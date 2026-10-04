@@ -80,7 +80,7 @@ function NoProjects({ workspace }: { workspace: Workspace }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: bootKey }),
   });
   return (
-    <div className="grid min-h-screen place-items-center p-6">
+    <main className="grid min-h-screen place-items-center p-6">
       <form
         className="flex w-full max-w-sm flex-col gap-4 rounded-xl bg-card p-7 ring-1 ring-foreground/10"
         onSubmit={(e) => {
@@ -103,7 +103,7 @@ function NoProjects({ workspace }: { workspace: Workspace }) {
           <p className="text-muted-foreground">Ask an organization owner to invite you.</p>
         )}
       </form>
-    </div>
+    </main>
   );
 }
 
@@ -121,11 +121,11 @@ function Gate() {
   if (boot.isPending) return <Splash />;
   if (boot.isError)
     return (
-      <div className="grid min-h-screen place-items-center p-6">
+      <main className="grid min-h-screen place-items-center p-6">
         <div className="w-full max-w-md rounded-xl bg-card ring-1 ring-foreground/10">
           <ErrorState error={boot.error} retry={() => void boot.refetch()} />
         </div>
-      </div>
+      </main>
     );
   const state = boot.data;
   if (state.state === "setup") return <SetupPage />;

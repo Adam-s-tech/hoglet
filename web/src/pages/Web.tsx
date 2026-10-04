@@ -2,7 +2,6 @@
 
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -10,13 +9,14 @@ import { columnHelper, DataTable } from "@/components/data-table";
 import { DateRangePicker, type RangeValue } from "@/components/date-range";
 import { AppDialog } from "@/components/dialogs";
 import { Empty, ErrorState, LoadingBar, Skeleton } from "@/components/feedback";
+import { FirstRunEmpty, useFirstRun } from "@/components/first-run";
 import { Icon } from "@/components/icons";
 import { CardBar, Page, PageHeader, Panel, SearchInput, StatLabel, Toolbar } from "@/components/page";
 import { TimeSeriesChart } from "@/charts/TimeSeries";
 import { PropertyFilters } from "@/insight/pickers";
 import { autoInterval, fmtBucket, fmtCompact, fmtDuration, fmtNumber, fmtPercent } from "@/lib/format";
 import { useLocalStorage } from "@/lib/hooks";
-import { useProjectId, usePath } from "@/lib/context";
+import { useProjectId } from "@/lib/context";
 import { describeFilter } from "@/lib/properties";
 import { webBreakdownQuery, webOverviewQuery } from "@/lib/queries";
 import { cn } from "@/lib/utils";
@@ -25,7 +25,6 @@ import type { WebBreakdownRow } from "@/types/WebBreakdownRow";
 import type { WebDimension } from "@/types/WebDimension";
 import type { WebMetric } from "@/types/WebMetric";
 import type { WebQuery } from "@/types/WebQuery";
-import { LoadDemoButton } from "./Onboarding";
 
 const DIM_PROPERTY: Record<WebDimension, string> = {
   page: "$pathname",
@@ -266,7 +265,7 @@ function BreakdownPanel({ panel, query, onFilter }: { panel: PanelDef; query: We
     return (
       <Panel className="min-h-[420px]">
         <CardBar className="min-h-14 border-b-0">
-          <h3 className="flex-1">{panel.title}</h3>
+          <h2 className="flex-1 text-sm">{panel.title}</h2>
         </CardBar>
         <BreakdownList tab={panel.tabs[0]} query={query} onFilter={onFilter} />
       </Panel>
@@ -276,7 +275,7 @@ function BreakdownPanel({ panel, query, onFilter }: { panel: PanelDef; query: We
     <Panel className="min-h-[420px]">
       <Tabs value={dim} onValueChange={(v) => setDim(v as WebDimension)} className="min-h-0 flex-1 gap-0">
         <CardBar className="border-b-0">
-          <h3 className="flex-1">{panel.title}</h3>
+          <h2 className="flex-1 text-sm">{panel.title}</h2>
           <TabsList aria-label={`${panel.title} breakdown`} className="max-w-full overflow-x-auto">
             {panel.tabs.map((t) => (
               <TabsTrigger key={t.dim} value={t.dim} className="flex-none px-2.5 text-xs">
@@ -310,7 +309,6 @@ interface Kpi {
 
 export function WebPage() {
   const projectId = useProjectId();
-  const path = usePath();
   const [range, setRange] = useLocalStorage<RangeValue>("hoglet.web.range", { date_from: "-7d", date_to: null });
   const [filters, setFilters] = useState<PropertyFilter[]>([]);
   const [metric, setMetric] = useState<ChartMetric>("visitors");
@@ -335,7 +333,8 @@ export function WebPage() {
     { key: "bounce", label: "Bounce rate", value: fmtPercent(data?.bounce_rate.value), metric: data?.bounce_rate, invert: true },
     { key: "duration", label: "Session duration", value: fmtDuration(data?.session_duration_s.value), metric: data?.session_duration_s },
   ];
-  const noData = data && data.pageviews.value === 0 && data.pageviews.previous === null && complete.length === 0;
+  const firstRun = useFirstRun();
+  const noPageviews = !!data && data.pageviews.value === 0;
 
   return (
     <Page>
@@ -368,20 +367,31 @@ export function WebPage() {
         <Panel>
           <ErrorState error={error} retry={() => void refetch()} />
         </Panel>
-      ) : noData ? (
+      ) : firstRun ? (
         <Panel>
-          <Empty
-            icon="globe"
-            title="No pageviews yet"
-            action={
-              <div className="flex flex-wrap justify-center gap-2">
-                <LoadDemoButton />
-                <Button nativeButton={false} render={<Link to={path("onboarding")} />}>Connect your site</Button>
-              </div>
-            }
-          >
+          <FirstRunEmpty icon="globe" title="No pageviews yet">
             Add posthog-js to your site with <code>api_host</code> pointing at this server. Pageviews are captured automatically and appear here within seconds.
-          </Empty>
+          </FirstRunEmpty>
+        </Panel>
+      ) : noPageviews ? (
+        <Panel>
+          {complete.length > 0 ? (
+            <Empty
+              icon="search"
+              title="No pageviews match these filters"
+              action={
+                <Button variant="outline" onClick={() => setFilters([])}>
+                  Clear filters
+                </Button>
+              }
+            >
+              Try removing a filter. Filters apply to every number on this page.
+            </Empty>
+          ) : (
+            <Empty icon="calendar" title="No pageviews in this range">
+              This page counts <code>$pageview</code> events. Pick a wider date range, or check that your site sends pageviews.
+            </Empty>
+          )}
         </Panel>
       ) : (
         <>
@@ -435,6 +445,7 @@ export function WebPage() {
                     },
                   ]}
                   legend={false}
+                  dataTable
                 />
               ) : (
                 <Skeleton className="h-[260px]" />

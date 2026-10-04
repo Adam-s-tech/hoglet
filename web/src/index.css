@@ -33,6 +33,7 @@
   --color-ring: var(--ring);
   --color-brand: var(--brand);
   --color-brand-foreground: var(--brand-foreground);
+  --color-on-brand: var(--on-brand);
   --color-brand-wash: var(--brand-wash);
   --color-good: var(--good);
   --color-good-wash: var(--good-wash);
@@ -75,16 +76,17 @@
   --secondary: #eeede7;
   --secondary-foreground: #1b1a17;
   --muted: #efeee8;
-  --muted-foreground: #6b6962;
+  --muted-foreground: #64625b;
   --accent: #eceae3;
   --accent-foreground: #1b1a17;
-  --destructive: #c03434;
+  --destructive: #b82e2e;
   --border: rgba(27, 26, 23, 0.1);
   --input: rgba(27, 26, 23, 0.2);
   --ring: rgba(154, 90, 44, 0.55);
 
   --brand: #9a5a2c;
   --brand-foreground: #7c4520;
+  --on-brand: #ffffff;
   --brand-wash: rgba(154, 90, 44, 0.1);
   --good: #0a7d0a;
   --good-wash: rgba(12, 163, 12, 0.1);
@@ -120,7 +122,7 @@
   --seq-fg-1: var(--foreground);
   --seq-fg-2: var(--foreground);
   --seq-fg-3: #0b0b0b;
-  --seq-fg-4: #fff;
+  --seq-fg-4: #0b0b0b;
   --seq-fg-5: #fff;
   --seq-fg-6: #fff;
 }
@@ -142,13 +144,14 @@
   --muted-foreground: #a09e96;
   --accent: #2c2c2a;
   --accent-foreground: #f4f3ee;
-  --destructive: #ef7272;
+  --destructive: #f28585;
   --border: rgba(255, 255, 255, 0.09);
   --input: rgba(255, 255, 255, 0.16);
   --ring: rgba(214, 145, 92, 0.6);
 
   --brand: #d6915c;
   --brand-foreground: #e3a575;
+  --on-brand: #1b1a17;
   --brand-wash: rgba(214, 145, 92, 0.14);
   --good: #3cc23c;
   --good-wash: rgba(12, 163, 12, 0.16);
@@ -176,13 +179,13 @@
   --seq-1: #184f95;
   --seq-2: #1c5cab;
   --seq-3: #256abf;
-  --seq-4: #2a78d6;
+  --seq-4: #3283e0;
   --seq-5: #5598e7;
   --seq-6: #86b6ef;
   --seq-fg-1: #fff;
   --seq-fg-2: #fff;
   --seq-fg-3: #fff;
-  --seq-fg-4: #fff;
+  --seq-fg-4: #0b0b0b;
   --seq-fg-5: #0b0b0b;
   --seq-fg-6: #0b0b0b;
 }
@@ -306,6 +309,19 @@
 .chart .sankey-link.dim {
   stroke-opacity: 0.07;
 }
+.chart .sankey-node:focus-visible,
+.chart .sankey-link:focus-visible {
+  outline: none;
+}
+.chart .sankey-node:focus-visible rect {
+  stroke: var(--foreground);
+  stroke-width: 2;
+  paint-order: stroke;
+}
+.chart .sankey-link:focus-visible {
+  stroke: var(--foreground);
+  stroke-opacity: 0.6;
+}
 .chart text.node-label {
   fill: var(--foreground);
   font-size: 11.5px;
@@ -313,6 +329,52 @@
 .chart text.node-count {
   fill: var(--muted-foreground);
   font-size: 10.5px;
+}
+
+/* Native range input (components/ui/slider.tsx): a filled track and a round thumb. */
+.hoglet-range {
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.hoglet-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.hoglet-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, var(--primary) var(--fill), var(--muted) var(--fill));
+}
+.hoglet-range::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, var(--primary) var(--fill), var(--muted) var(--fill));
+}
+.hoglet-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -5px;
+  border-radius: 9999px;
+  border: 1px solid var(--ring);
+  background: var(--background);
+}
+.hoglet-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  border: 1px solid var(--ring);
+  background: var(--background);
+}
+.hoglet-range:focus-visible {
+  outline: none;
+}
+.hoglet-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent);
+}
+.hoglet-range:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {

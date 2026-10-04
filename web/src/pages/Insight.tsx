@@ -27,6 +27,7 @@ import { CopyButton } from "@/components/copy";
 import { AppDialog, Confirm } from "@/components/dialogs";
 import { DateRangePicker } from "@/components/date-range";
 import { Empty, ErrorState, LoadingBar, Skeleton } from "@/components/feedback";
+import { FirstRunEmpty, useFirstRun } from "@/components/first-run";
 import { InlineEdit } from "@/components/inline-edit";
 import { CardBar, CardPad, FormField, Page, PageHeader, Panel } from "@/components/page";
 import { toast } from "@/components/toast";
@@ -302,6 +303,8 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [sqlRun, setSqlRun] = useState<InsightQuery | null>(null);
+  /** Below `lg` the builder collapses behind a button; new insights start open, saved ones start on the result. */
+  const [builderOpen, setBuilderOpen] = useState(id === null);
 
   // Load a saved insight into the editor once; later refetches never clobber edits.
   const loadedFor = useRef<string | null>(null);
@@ -324,6 +327,7 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
 
   const isSql = query?.kind === "SqlQuery";
   const run = useInsightQuery(isSql ? sqlRun : query, isSql ? 0 : 350);
+  const firstRun = useFirstRun();
 
   const update = (q: InsightQuery) => {
     setQuery(q);
@@ -432,6 +436,10 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
       <LoadingBar show={run.pending && !!run.data} />
       {run.hint ? (
         <Empty icon="info" title={run.hint} />
+      ) : firstRun && !isSql ? (
+        <FirstRunEmpty icon="trends" title="No events to analyze yet">
+          Insights read the events your app sends. Connect an app, or load demo data to see this chart with real-looking numbers.
+        </FirstRunEmpty>
       ) : isSql && !sqlRun ? (
         <Empty icon="play" title="Run the query to see results">
           Press{" "}
@@ -562,7 +570,19 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
         </div>
       ) : (
         <div className="grid items-start gap-4 lg:grid-cols-[380px_minmax(0,1fr)]">
-          <Panel>
+          <Button
+            variant="outline"
+            className="justify-between lg:hidden"
+            aria-expanded={builderOpen}
+            aria-controls="query-builder"
+            onClick={() => setBuilderOpen((v) => !v)}
+          >
+            <span className="flex items-center gap-2">
+              <Icon name="filter" size={14} /> Edit query
+            </span>
+            <Icon name="chevronDown" size={14} className={builderOpen ? "rotate-180" : undefined} />
+          </Button>
+          <Panel id="query-builder" className={builderOpen ? undefined : "hidden lg:block"}>
             <QueryEditor query={query} onChange={update} />
           </Panel>
           <Panel className="relative">

@@ -1,6 +1,7 @@
 import { cn } from "@/lib/utils";
 
-const COLORS = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s7)", "var(--s5)", "var(--s6)", "var(--s8)", "var(--s4)"];
+// Fixed, dark enough that white initials clear 4.5:1 in both themes.
+const COLORS = ["#1f66c1", "#a64a1d", "#0e7a54", "#5b4fc4", "#b83a6d", "#0f766e", "#c23b3a", "#8f5a00"];
 
 /** Initials on a colour derived from the id, so a person looks the same everywhere. */
 export function Avatar({ name, id, large, className }: { name: string; id: string; large?: boolean; className?: string }) {

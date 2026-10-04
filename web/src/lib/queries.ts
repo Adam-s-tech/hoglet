@@ -11,7 +11,6 @@
 // insight results are minutes.
 
 import { infiniteQueryOptions, keepPreviousData, queryOptions } from "@tanstack/react-query";
-import type { ActorsRequest } from "../types/ActorsRequest";
 import type { QueryRequest } from "../types/QueryRequest";
 import type { WebDimension } from "../types/WebDimension";
 import type { WebQuery } from "../types/WebQuery";
@@ -19,7 +18,8 @@ import { ApiError, api, type Workspace } from "./api";
 
 // ── Session ──────────────────────────────────────────────────────────────
 
-export type Boot = { state: "setup" } | { state: "login" } | { state: "ready"; workspace: Workspace };
+/** `expired`: the session ended while the app was open (a 401 from any call), as opposed to a fresh visit. */
+export type Boot = { state: "setup" } | { state: "login"; expired?: boolean } | { state: "ready"; workspace: Workspace };
 
 export const bootKey = ["boot"] as const;
 
@@ -46,6 +46,7 @@ export const bootQuery = queryOptions({
 export const qk = {
   project: (pid: string) => ["p", pid] as const,
   status: (pid: string) => ["p", pid, "status"] as const,
+  forwarding: (pid: string) => ["p", pid, "forwarding"] as const,
   insights: (pid: string) => ["p", pid, "insights"] as const,
   insight: (pid: string, id: string) => ["p", pid, "insights", id] as const,
   dashboards: (pid: string) => ["p", pid, "dashboards"] as const,
@@ -72,6 +73,15 @@ export const statusQuery = (pid: string, pollMs?: number) =>
     queryFn: ({ signal }) => api.status(pid, signal),
     staleTime: 5_000,
     refetchInterval: pollMs ?? false,
+  });
+
+/** Shadow-mode counters move while events flow, so the settings card polls (only while the tab is visible). */
+export const forwardingQuery = (pid: string) =>
+  queryOptions({
+    queryKey: qk.forwarding(pid),
+    queryFn: ({ signal }) => api.forwarding(pid, signal),
+    staleTime: 2_000,
+    refetchInterval: 5_000,
   });
 
 // ── Saved objects ────────────────────────────────────────────────────────
@@ -154,13 +164,6 @@ export const insightResultQuery = (pid: string, request: QueryRequest) =>
     queryFn: ({ signal }) => api.query(pid, request, signal),
     staleTime: 60_000,
     placeholderData: keepPreviousData,
-  });
-
-export const actorsQuery = (pid: string, request: ActorsRequest) =>
-  queryOptions({
-    queryKey: [...qk.query(pid), "actors", JSON.stringify(request)] as const,
-    queryFn: ({ signal }) => api.actors(pid, request, signal),
-    staleTime: 60_000,
   });
 
 export const webOverviewQuery = (pid: string, q: WebQuery) =>
