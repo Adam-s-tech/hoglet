@@ -62,7 +62,42 @@ fn routes(state: ConfigState) -> Router {
         .route("/array/{token}/config", get(config))
         .route("/array/{token}/config/", get(config))
         .route("/array/{token}/config.js", get(config_js))
+        .route("/static/{file}", get(extension_asset))
+        .route("/static/{version}/{file}", get(versioned_extension_asset))
         .with_state(state)
+}
+
+/// posthog-js loads its surveys extension even when remote config says
+/// `surveys: false` (it decides later whether to show anything). This no-op
+/// extension satisfies that loader: no 404, no console error, no surveys.
+const SURVEYS_EXTENSION: &str = "(function(){var w=window,x=w.__PosthogExtensions__=w.__PosthogExtensions__||{};\
+if(x.generateSurveys)return;var off='Surveys are not enabled on this server';\
+x.generateSurveys=function(){return{\
+getActiveMatchingSurveys:function(cb){if(typeof cb==='function')cb([]);return[];},\
+checkSurveyEligibility:function(){return{eligible:false,reason:off};},\
+checkSurveyRenderability:function(){return{visible:false,disabledReason:off};},\
+renderSurvey:function(){},cancelSurvey:function(){},handlePopoverSurvey:function(){}};};})();\n";
+
+async fn extension_asset(Path(file): Path<String>) -> Response {
+    serve_extension(&file)
+}
+
+async fn versioned_extension_asset(Path((_version, file)): Path<(String, String)>) -> Response {
+    serve_extension(&file)
+}
+
+fn serve_extension(file: &str) -> Response {
+    match file {
+        "surveys.js" => (
+            [
+                (header::CONTENT_TYPE, "application/javascript"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            SURVEYS_EXTENSION,
+        )
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn authorize(state: &ConfigState, token: &str) -> Result<(), StatusCode> {

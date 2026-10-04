@@ -140,7 +140,7 @@ async fn project_resources_are_scoped_and_mutations_require_privileged_sessions(
     let project_id = setup.workspace.organizations[0].projects[0].id.clone();
     let principal = access.validate_session(&setup.session_id).await.unwrap();
     let personal_key = access
-        .create_personal_key(&principal, "Read-only route test")
+        .create_personal_key(&principal, "Read-only route test", hoglet::control::KeyScope::Read)
         .await
         .unwrap();
     let (other_project_id, other_session_id) = seed_unrelated_owner(&control_path);

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::{
-    control::{AccessError, Authentication, AuthorizedProject, ProjectAccess, Role},
+    control::{AccessError, AuthorizedProject, ProjectAccess, Role},
     control_resources::{
         ControlResourceError, ControlResources, Dashboard, DashboardDraft, DashboardTileInput,
         InsightDraft, SavedInsight, ShareLink, ShareTarget,
@@ -146,8 +146,7 @@ async fn authorize(
         .await
         .map_err(|error| access_error(error, request_id))?;
     if mutation
-        && (project.principal.authentication != Authentication::Session
-            || !matches!(project.role, Role::Owner | Role::Admin))
+        && (!project.principal.may_write() || !matches!(project.role, Role::Owner | Role::Admin))
     {
         return Err(error_response(
             StatusCode::FORBIDDEN,

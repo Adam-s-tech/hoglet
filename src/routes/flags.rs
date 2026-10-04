@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::capture::CaptureAuthorizer;
 use crate::contract::common::{ApiError, ApiErrorBody};
 use crate::contract::flags::{FeatureFlag, FeatureFlagInput, FlagEvaluation};
-use crate::control::{AccessError, Authentication, AuthorizedProject, ProjectAccess, Role};
+use crate::control::{AccessError, AuthorizedProject, ProjectAccess, Role};
 use crate::flags::{
     FeatureFlagPatch, FlagStore, FlagStoreError, SubjectHints, needs_person, resolve_subject,
 };
@@ -700,8 +700,7 @@ async fn authorize(
         .await
         .map_err(|error| access_error(error, request_id))?;
     if mutation
-        && (project.principal.authentication != Authentication::Session
-            || !matches!(project.role, Role::Owner | Role::Admin))
+        && (!project.principal.may_write() || !matches!(project.role, Role::Owner | Role::Admin))
     {
         return Err(api_error(
             StatusCode::FORBIDDEN,

@@ -132,7 +132,7 @@ async fn explore_routes_authorize_parse_and_answer() {
         .await
         .expect("session");
     let key = access
-        .create_personal_key(&principal, "explore test")
+        .create_personal_key(&principal, "explore test", hoglet::control::KeyScope::Read)
         .await
         .expect("personal key");
     let second_session = seed_second_user(&fixture.control);

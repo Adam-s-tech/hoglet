@@ -7,8 +7,10 @@ const HELP: &str = "\
 hoglet — PostHog-compatible product analytics. One binary.
 
 USAGE:
-    hoglet            Start the server
-    hoglet --version  Print the version
+    hoglet                  Start the server
+    hoglet import posthog   Copy a PostHog project's history into Hoglet
+                            (see `hoglet import posthog --help`)
+    hoglet --version        Print the version
 
 ENVIRONMENT:
     HOGLET_ADDR                 Listen address            (default 127.0.0.1:8000)
@@ -49,6 +51,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("hoglet {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Some("import") => return run_import().await,
         Some("serve") | None => {}
         Some(other) => return Err(format!("unknown command {other:?}; see `hoglet --help`").into()),
     }
@@ -112,6 +115,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let shutdown_result = application.shutdown().await;
     server_result?;
     shutdown_result?;
+    Ok(())
+}
+
+async fn run_import() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    match args.first().map(String::as_str) {
+        Some("posthog") => {}
+        _ => return Err("usage: hoglet import posthog --help".into()),
+    }
+    if args.len() == 1 || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{}", hoglet::import::HELP);
+        return Ok(());
+    }
+    let config = hoglet::import::parse_args(&args[1..])?;
+    eprintln!(
+        "importing PostHog project {} from {} into {}",
+        config.posthog_project_id, config.posthog_host, config.hoglet_host
+    );
+    let report = tokio::task::spawn_blocking(move || {
+        hoglet::import::Importer::new(config, Box::new(|line| eprintln!("  {line}"))).run()
+    })
+    .await??;
+    eprintln!(
+        "done: {} events, {} persons, {} flags",
+        report.events, report.persons, report.flags
+    );
     Ok(())
 }
 
