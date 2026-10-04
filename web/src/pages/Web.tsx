@@ -16,6 +16,7 @@ import { DateRangePicker, type RangeValue } from "../ui/DateRange";
 import { Icon } from "../ui/icons";
 import { Empty, ErrorState, LoadingBar, Modal, Skeleton } from "../ui/kit";
 import { PropertyFilters } from "../insight/pickers";
+import { LoadDemoButton } from "./Onboarding";
 
 const DIM_PROPERTY: Record<WebDimension, string> = {
   page: "$pathname",
@@ -71,7 +72,7 @@ function countryName(code: string): string {
 }
 
 function displayValue(dim: WebDimension, value: string): string {
-  if (value === "" || value === "$$_none") return dim === "referring_domain" ? "Direct / none" : "(none)";
+  if (value === "" || value === "$$_none" || (dim === "referring_domain" && value === "$direct")) return dim === "referring_domain" ? "Direct / none" : "(none)";
   if (dim === "country") return countryName(value);
   return value;
 }
@@ -278,7 +279,18 @@ export function WebPage() {
         </div>
       ) : noData ? (
         <div className="card">
-          <Empty icon="globe" title="No pageviews yet" action={<Link className="btn primary" to={path("onboarding")}>Connect your site</Link>}>
+          <Empty
+            icon="globe"
+            title="No pageviews yet"
+            action={
+              <div className="row">
+                <LoadDemoButton />
+                <Link className="btn primary" to={path("onboarding")}>
+                  Connect your site
+                </Link>
+              </div>
+            }
+          >
             Add posthog-js to your site with <code>api_host</code> pointing at this server. Pageviews are captured automatically and appear here within seconds.
           </Empty>
         </div>

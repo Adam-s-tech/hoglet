@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { ApiError, api, errorMessage } from "../lib/api";
-import { useApp, usePath, useProjectId } from "../lib/context";
+import { projectPath, useApp, usePath, useProjectId } from "../lib/context";
 import { fmtNumber, fmtRelative } from "../lib/format";
-import { useApi } from "../lib/hooks";
+import { invalidate, useApi } from "../lib/hooks";
 import { SNIPPETS, hostOrigin } from "../lib/snippets";
-import { Link } from "../lib/router";
+import { Link, navigate } from "../lib/router";
 import { Icon } from "../ui/icons";
 import { CopyButton, Snippet, Tabs, toast } from "../ui/kit";
 
@@ -30,6 +30,58 @@ export function TokenBox({ token }: { token: string }) {
       <code>{token}</code>
       <CopyButton text={token} />
     </div>
+  );
+}
+
+/**
+ * Fills the project with 90 days of realistic demo data through the real
+ * ingest path. Events become queryable a second or two after it returns.
+ */
+export function LoadDemoButton({ primary = false, small = false, onLoaded }: { primary?: boolean; small?: boolean; onLoaded?: () => void }) {
+  const projectId = useProjectId();
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
+  return (
+    <button
+      className={`btn${primary ? " accent" : ""}${small ? " small" : ""}`}
+      disabled={busy}
+      title="Adds 90 days of sample product data to this project so you can explore every screen"
+      onClick={async () => {
+        setBusy(true);
+        try {
+          setProgress("Generating…");
+          const { events } = await api.loadDemo(projectId);
+          // Events are acknowledged once durable; wait until they are queryable
+          // (the status endpoint reports the publication lag), at most a minute.
+          const deadline = Date.now() + 60_000;
+          while (Date.now() < deadline) {
+            await new Promise((r) => window.setTimeout(r, 1000));
+            try {
+              const s = await api.status(projectId);
+              setProgress(`Publishing… ${fmtNumber(s.stored_events)} stored`);
+              if (s.has_events && s.ingestion_lag_seconds < 2) break;
+            } catch {
+              // Status unavailable: fall back to a fixed pause.
+              await new Promise((r) => window.setTimeout(r, 2500));
+              break;
+            }
+          }
+          invalidate("");
+          toast(`Loaded ${fmtNumber(events)} demo events`);
+          onLoaded?.();
+          window.dispatchEvent(new Event("hoglet:data-changed"));
+          navigate(projectPath(projectId, "web"));
+        } catch (e) {
+          toast(errorMessage(e), true);
+        } finally {
+          setBusy(false);
+          setProgress(null);
+        }
+      }}
+    >
+      {busy ? <span className="spinner" style={{ width: 14, height: 14 }} /> : <Icon name="sparkle" size={14} />}
+      {busy ? (progress ?? "Loading demo data…") : "Load demo data"}
+    </button>
   );
 }
 
@@ -91,6 +143,7 @@ export function FirstEventWatcher() {
       <button className="btn" onClick={sendTest} disabled={sending}>
         <Icon name="bolt" size={14} /> {sending ? "Sending…" : "Send a test event"}
       </button>
+      <LoadDemoButton primary onLoaded={status.reload} />
     </div>
   );
 }
@@ -138,6 +191,9 @@ export function OnboardingPage() {
             <h2>Send an event</h2>
           </div>
           <FirstEventWatcher />
+          <p className="muted small">
+            Just looking around? <b>Load demo data</b> fills this project with 90 days of a sample SaaS product: pageviews, signups, subscriptions, AI generations and errors.
+          </p>
         </div>
       </div>
     </div>

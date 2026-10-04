@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { api, errorMessage, type CreatedKey } from "../lib/api";
+import { api, errorMessage, type CreatedKey, type KeyScope } from "../lib/api";
 import { canEdit, projectPath, useApp, useProjectId } from "../lib/context";
 import { fmtBytes, fmtDate, fmtNumber, fmtRelative } from "../lib/format";
 import { invalidate, useApi } from "../lib/hooks";
@@ -99,6 +99,7 @@ function ProjectSettings() {
 function ApiKeys() {
   const { data, error, loading, reload } = useApi("keys", (s) => api.listKeys(s));
   const [name, setName] = useState("");
+  const [scope, setScope] = useState<KeyScope>("read");
   const [created, setCreated] = useState<CreatedKey | null>(null);
   const [revoking, setRevoking] = useState<{ id: string; name: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -107,8 +108,22 @@ function ApiKeys() {
       <div className="card card-pad col gap-12">
         <h2>Personal API keys</h2>
         <p className="secondary">
-          Read your data from scripts and agents: <code>Authorization: Bearer phx_…</code> against <code>/api/projects/&lt;id&gt;/…</code>. Keys act as you and can't change project settings.
+          Read your data from scripts and agents: <code>Authorization: Bearer phx_…</code> against <code>/api/projects/&lt;id&gt;/…</code>. Keys act as you.
         </p>
+        <div className="row gap-16" role="radiogroup" aria-label="Key scope">
+          <label className="row small">
+            <input type="radio" name="scope" checked={scope === "read"} onChange={() => setScope("read")} />
+            <span>
+              <b>Read only</b> <span className="muted">· query analytics and read resources</span>
+            </span>
+          </label>
+          <label className="row small">
+            <input type="radio" name="scope" checked={scope === "write"} onChange={() => setScope("write")} />
+            <span>
+              <b>Read &amp; write</b> <span className="muted">· also create, change and delete resources</span>
+            </span>
+          </label>
+        </div>
         <div className="row">
           <input className="input grow" placeholder="Key name, e.g. Nightly export" value={name} onChange={(e) => setName(e.target.value)} aria-label="Key name" />
           <button
@@ -117,7 +132,7 @@ function ApiKeys() {
             onClick={async () => {
               setBusy(true);
               try {
-                const k = await api.createKey(name.trim());
+                const k = await api.createKey(name.trim(), scope);
                 setCreated(k);
                 setName("");
                 invalidate("keys");
@@ -145,6 +160,7 @@ function ApiKeys() {
             <thead>
               <tr>
                 <th>Name</th>
+                <th>Scope</th>
                 <th>Key</th>
                 <th>Created</th>
                 <th>Last used</th>
@@ -155,6 +171,7 @@ function ApiKeys() {
               {(data ?? []).map((k) => (
                 <tr key={k.id}>
                   <td style={{ fontWeight: 600 }}>{k.name}</td>
+                  <td>{k.scope === "write" ? <span className="badge warn">read &amp; write</span> : <span className="badge">read only</span>}</td>
                   <td className="mono small muted">{k.key_prefix}…</td>
                   <td className="muted">{fmtDate(k.created_at)}</td>
                   <td className="muted">{k.last_used ? fmtRelative(k.last_used) : "never"}</td>
@@ -175,6 +192,9 @@ function ApiKeys() {
             <div className="notice warn">
               <Icon name="alert" />
               This is the only time the secret is shown. Store it in your secrets manager now.
+            </div>
+            <div className="small secondary">
+              Scope: <b>{created.key.scope === "write" ? "read & write" : "read only"}</b>
             </div>
             <div className="token-box">
               <code>{created.secret}</code>

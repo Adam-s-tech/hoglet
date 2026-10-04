@@ -123,7 +123,7 @@ export function ActorsModal({ query, target, onClose }: { query: InsightQuery; t
                     <td className="mono small muted truncate" style={{ maxWidth: 220 }}>
                       {p.distinct_ids[0]}
                     </td>
-                    <td className="r muted small">{fmtRelative(p.last_seen)}</td>
+                    <td className="r muted small">{p.last_seen ? fmtRelative(p.last_seen) : "–"}</td>
                   </tr>
                 ))}
               </tbody>

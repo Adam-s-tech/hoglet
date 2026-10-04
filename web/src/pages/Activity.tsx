@@ -11,6 +11,7 @@ import { Link, navigate, useLocation } from "../lib/router";
 import { Icon } from "../ui/icons";
 import { CopyButton, Empty, ErrorState, JsonView, Seg, SkeletonRows, Switch } from "../ui/kit";
 import { EventPicker } from "../insight/pickers";
+import { LoadDemoButton } from "./Onboarding";
 
 function str(v: unknown): string {
   if (v === null || v === undefined) return "";
@@ -243,7 +244,18 @@ export function ActivityPage() {
           event || personId ? (
             <Empty icon="search" title="No events match these filters" />
           ) : (
-            <Empty icon="activity" title="No events yet" action={<Link className="btn primary" to={path("onboarding")}>Connect your app</Link>}>
+            <Empty
+              icon="activity"
+              title="No events yet"
+              action={
+                <div className="row">
+                  <LoadDemoButton />
+                  <Link className="btn primary" to={path("onboarding")}>
+                    Connect your app
+                  </Link>
+                </div>
+              }
+            >
               Point a PostHog SDK at this server and events show up here within seconds. This page refreshes on its own.
             </Empty>
           )

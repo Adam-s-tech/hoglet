@@ -48,9 +48,12 @@ export interface Workspace {
   user: User;
   organizations: Organization[];
 }
+export type KeyScope = "read" | "write";
 export interface PersonalApiKey {
   id: string;
   name: string;
+  /** Older servers omit it; treat as read. */
+  scope?: KeyScope;
   key_prefix: string;
   last_used: number | null;
   created_at: number;
@@ -352,7 +355,7 @@ export const api = {
   logout: () => request<{ status: string }>("POST", "/api/auth/logout", { authFlow: true }),
   me: (signal?: AbortSignal) => request<Workspace>("GET", "/api/auth/me", { signal, authFlow: true }),
   listKeys: (signal?: AbortSignal) => request<PersonalApiKey[]>("GET", "/api/auth/keys", { signal }),
-  createKey: (name: string) => request<CreatedKey>("POST", "/api/auth/keys", { body: { name } }),
+  createKey: (name: string, scope: KeyScope) => request<CreatedKey>("POST", "/api/auth/keys", { body: { name, scope } }),
   revokeKey: (id: string) => request<null>("DELETE", `/api/auth/keys/${encodeURIComponent(id)}`),
   createOrganization: (name: string) => request<Organization>("POST", "/api/organizations", { body: { name } }),
   createProject: (organizationId: string, name: string) =>
@@ -369,6 +372,12 @@ export const api = {
     request<WebBreakdown>("GET", `${p(projectId)}/web/breakdown`, { query: { ...webParams(q), dimension, limit }, signal }),
   status: (projectId: string, signal?: AbortSignal) => request<ProjectStatus>("GET", `${p(projectId)}/status`, { signal }),
 
+  /** Fill the project with 90 days of realistic demo events. */
+  loadDemo: (projectId: string) => request<{ events: number }>("POST", `${p(projectId)}/demo`),
+  /** GDPR erase: the person, every distinct id, every event. Owner/admin only. */
+  erasePerson: (projectId: string, personId: string) =>
+    request<{ distinct_ids: number; events: number }>("POST", `${p(projectId)}/persons/${encodeURIComponent(personId)}/erase`),
+
   // Persons & events
   persons: (projectId: string, q: { search?: string; cursor?: string | null; limit?: number }, signal?: AbortSignal) =>
     request<PersonListResponse>("GET", `${p(projectId)}/persons`, { query: q, signal }),
@@ -379,19 +388,13 @@ export const api = {
   events: (projectId: string, q: { event?: string | null; person_id?: string | null; before?: string | null; limit?: number }, signal?: AbortSignal) =>
     request<EventListResponse>("GET", `${p(projectId)}/events`, { query: q, signal }),
 
-  // Catalog. `prefix`/`source` are sent alongside the contract's
-  // `search`/`type` so pre-contract servers answer too.
+  // Catalog (contract params: search, type, key, limit).
   catalogEvents: async (projectId: string, search: string, signal?: AbortSignal) =>
-    normalizeCatalogEvents(await request<unknown>("GET", `${p(projectId)}/catalog/events`, { query: { search, prefix: search, limit: 200 }, signal })),
+    normalizeCatalogEvents(await request<unknown>("GET", `${p(projectId)}/catalog/events`, { query: { search, limit: 200 }, signal })),
   catalogProperties: async (projectId: string, type: "event" | "person", search: string, signal?: AbortSignal) =>
-    normalizeCatalogProperties(
-      await request<unknown>("GET", `${p(projectId)}/catalog/properties`, { query: { type, source: type, search }, signal }),
-      type,
-    ),
+    normalizeCatalogProperties(await request<unknown>("GET", `${p(projectId)}/catalog/properties`, { query: { type, search }, signal }), type),
   catalogValues: async (projectId: string, key: string, type: "event" | "person", search: string, signal?: AbortSignal) =>
-    normalizeCatalogValues(
-      await request<unknown>("GET", `${p(projectId)}/catalog/values`, { query: { key, type, source: type, search, prefix: search, limit: 50 }, signal }),
-    ),
+    normalizeCatalogValues(await request<unknown>("GET", `${p(projectId)}/catalog/values`, { query: { key, type, search, limit: 50 }, signal })),
 
   // Feature flags
   flags: (projectId: string, signal?: AbortSignal) => request<FeatureFlag[]>("GET", `${p(projectId)}/feature_flags`, { signal }),

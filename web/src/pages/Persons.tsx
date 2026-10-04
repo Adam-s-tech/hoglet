@@ -2,13 +2,14 @@ import { Fragment, useState } from "react";
 import type { EventRow } from "../types/EventRow";
 import type { PersonSummary } from "../types/PersonSummary";
 import { api, errorMessage } from "../lib/api";
-import { usePath, useProjectId } from "../lib/context";
+import { canEdit, useApp, usePath, useProjectId } from "../lib/context";
 import { fmtDateTime, fmtNumber, fmtRelative } from "../lib/format";
-import { useApi, useDebounced } from "../lib/hooks";
+import { invalidate, useApi, useDebounced } from "../lib/hooks";
 import { Link, navigate } from "../lib/router";
 import { Icon } from "../ui/icons";
-import { Avatar, CopyButton, Empty, ErrorState, Skeleton, SkeletonRows, Tabs } from "../ui/kit";
+import { Avatar, CopyButton, Empty, ErrorState, Modal, Skeleton, SkeletonRows, Tabs, toast } from "../ui/kit";
 import { EventTable } from "./Activity";
+import { LoadDemoButton } from "./Onboarding";
 
 export function PersonsPage() {
   const projectId = useProjectId();
@@ -54,7 +55,7 @@ export function PersonsPage() {
           q ? (
             <Empty icon="search" title={`No one matches “${q}”`} />
           ) : (
-            <Empty icon="users" title="No persons yet">
+            <Empty icon="users" title="No persons yet" action={<LoadDemoButton />}>
               Persons appear when events arrive. Call <code>posthog.identify(userId, {"{ email }"})</code> after login to link anonymous visits to a known user.
             </Empty>
           )
@@ -86,7 +87,7 @@ export function PersonsPage() {
                       {p.distinct_ids.length > 1 && <span className="badge" style={{ marginLeft: 6 }}>+{p.distinct_ids.length - 1}</span>}
                     </td>
                     <td className="muted nowrap">{fmtRelative(p.created_at)}</td>
-                    <td className="r muted nowrap">{fmtRelative(p.last_seen)}</td>
+                    <td className="r muted nowrap">{p.last_seen ? fmtRelative(p.last_seen) : "–"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -155,11 +156,74 @@ function PersonEvents({ personId }: { personId: string }) {
   );
 }
 
+function ErasePerson({ personId, name, onClose }: { personId: string; name: string; onClose: () => void }) {
+  const projectId = useProjectId();
+  const path = usePath();
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const ok = typed.trim() === name.trim();
+  return (
+    <Modal
+      title="Delete person and all their data"
+      onClose={onClose}
+      footer={
+        <>
+          <button className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn danger solid"
+            disabled={!ok || busy}
+            onClick={async () => {
+              setBusy(true);
+              setError(null);
+              try {
+                const r = await api.erasePerson(projectId, personId);
+                invalidate(`person`);
+                invalidate(`persons:${projectId}`);
+                invalidate(`events:${projectId}`);
+                toast(`Erased ${fmtNumber(r.events)} events and ${fmtNumber(r.distinct_ids)} distinct IDs`);
+                onClose();
+                navigate(path("persons"));
+              } catch (e) {
+                setError(errorMessage(e));
+                setBusy(false);
+              }
+            }}
+          >
+            {busy ? "Erasing…" : "Erase permanently"}
+          </button>
+        </>
+      }
+    >
+      <div className="col gap-12">
+        <div className="notice bad">
+          <Icon name="alert" />
+          <div>
+            This erases <b>{name}</b>, every distinct ID merged into them, and every event they sent, from stored data. It can't be undone. Use it for
+            GDPR and similar deletion requests.
+          </div>
+        </div>
+        <label className="field">
+          <span>
+            Type <code>{name}</code> to confirm
+          </span>
+          <input className="input" value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" spellCheck={false} aria-label="Type the person's name to confirm" />
+        </label>
+        {error && <div className="notice bad">{error}</div>}
+      </div>
+    </Modal>
+  );
+}
+
 export function PersonPage({ id }: { id: string }) {
   const projectId = useProjectId();
   const path = usePath();
   const { data, error, reload } = useApi(`person:${projectId}:${id}`, (s) => api.person(projectId, id, s), { keepPrevious: false });
   const [tab, setTab] = useState<"events" | "properties" | "ids">("events");
+  const [erasing, setErasing] = useState(false);
+  const { organization } = useApp();
   const [propSearch, setPropSearch] = useState("");
 
   if (error) {
@@ -275,6 +339,18 @@ export function PersonPage({ id }: { id: string }) {
           </div>
         )}
       </div>
+      {canEdit(organization) && p && (
+        <div className="card card-pad row mt-24" style={{ boxShadow: "0 0 0 1px var(--bad-wash)" }}>
+          <div className="grow">
+            <h3>Delete person and all their data</h3>
+            <p className="secondary small">Erases this person, their distinct IDs and every event they sent. For GDPR deletion requests.</p>
+          </div>
+          <button className="btn danger" onClick={() => setErasing(true)}>
+            <Icon name="trash" size={14} /> Delete person
+          </button>
+        </div>
+      )}
+      {erasing && p && <ErasePerson personId={p.id} name={p.display_name} onClose={() => setErasing(false)} />}
     </div>
   );
 }

@@ -39,7 +39,7 @@ interface State {
   insights: Record<string, unknown>[];
   dashboards: { id: string; project_id: string; name: string; tiles: { insight_id: string; x: number; y: number; w: number; h: number }[]; created_by: string; created_at: number }[];
   shares: Record<string, unknown>[];
-  keys: { id: string; name: string; key_prefix: string; last_used: number | null; created_at: number }[];
+  keys: { id: string; name: string; scope: "read" | "write"; key_prefix: string; last_used: number | null; created_at: number }[];
   nextId: number;
 }
 
@@ -154,7 +154,7 @@ function seedState(): State {
           { id: "dash_growth", project_id: pid, name: "Growth weekly", tiles: [{ insight_id: "ins_lifecycle", x: 0, y: 0, w: 12, h: 4 }], created_by: "u1", created_at: sec() - 86_400 * 3 },
         ],
     shares: [],
-    keys: FRESH ? [] : [{ id: "key_1", name: "Nightly export", key_prefix: "phx_9f2c", last_used: sec() - 3600 * 5, created_at: sec() - 86_400 * 20 }],
+    keys: FRESH ? [] : [{ id: "key_1", name: "Nightly export", scope: "read" as const, key_prefix: "phx_9f2c", last_used: sec() - 3600 * 5, created_at: sec() - 86_400 * 20 }],
     nextId: 100,
   };
 }
@@ -453,7 +453,8 @@ async function handle({ method, url, body, signal }: RawRequest): Promise<RawRes
     if (method === "POST") {
       const id = `key_${state.nextId++}`;
       const secret = `phx_${Array.from({ length: 40 }, () => "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 36)]).join("")}`;
-      const key = { id, name: (body as { name: string }).name, key_prefix: secret.slice(0, 8), last_used: null, created_at: sec() };
+      const b = body as { name: string; scope?: "read" | "write" };
+      const key = { id, name: b.name, scope: b.scope ?? ("read" as const), key_prefix: secret.slice(0, 8), last_used: null, created_at: sec() };
       state.keys.push(key);
       return ok({ key, secret }, 201);
     }
@@ -478,6 +479,20 @@ async function handle({ method, url, body, signal }: RawRequest): Promise<RawRes
   if (!state.projects.some((p) => p.id === pid)) return err(404, "not_found", "The requested resource was not found.");
   const otherProject = pid !== state.projects[0]?.id;
 
+  if (rest === "/demo" && method === "POST") {
+    await wait(1800, signal);
+    state.firstEventAt = 0;
+    return ok({ events: 184_532 });
+  }
+  if ((m = /^\/persons\/([^/]+)\/erase$/.exec(rest)) && method === "POST") {
+    const id = decodeURIComponent(m[1]);
+    const p = state.persons.find((x) => x.id === id || x.allIds.includes(id));
+    if (!p) return err(404, "not_found", "The requested resource was not found.");
+    state.persons = state.persons.filter((x) => x !== p);
+    const before = state.events.length;
+    state.events = state.events.filter((e) => e.person_id !== p.id);
+    return ok({ distinct_ids: p.allIds.length, events: p.events + (before - state.events.length) });
+  }
   if (rest === "/status") {
     const has = hasEvents() && !otherProject;
     const lag = Math.random() < 0.03 ? 7 + Math.random() * 10 : Math.random() * 1.5;
@@ -534,7 +549,8 @@ async function handle({ method, url, body, signal }: RawRequest): Promise<RawRes
     return ok({ persons: list.slice(offset, offset + limit).map(summary), next_cursor: offset + limit < list.length ? String(offset + limit) : null });
   }
   if ((m = /^\/persons\/([^/]+)$/.exec(rest))) {
-    const p = state.persons.find((x) => x.id === decodeURIComponent(m![1]));
+    const key = decodeURIComponent(m[1]);
+    const p = state.persons.find((x) => x.id === key || x.allIds.includes(key));
     if (!p) return err(404, "not_found", "The requested resource was not found.");
     return ok({ person: summary(p), distinct_ids: p.allIds, event_count: p.events, first_seen: p.created_at, last_seen: p.last_seen, session_count: p.sessions });
   }
