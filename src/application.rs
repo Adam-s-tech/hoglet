@@ -146,6 +146,7 @@ pub struct Application {
     persons: Arc<PersonStore>,
     access: Arc<ProjectAccess>,
     sink: Arc<dyn crate::sink::EventSink>,
+    forwarder: Arc<crate::forward::Forwarder>,
 }
 
 impl fmt::Debug for Application {
@@ -214,6 +215,8 @@ impl Application {
             ProjectAccessCaptureAuthorizer::new(access.as_ref().clone()),
         );
         let sink: Arc<dyn crate::sink::EventSink> = durable_sink;
+        let forwarder = crate::forward::Forwarder::open(&paths.control())
+            .map_err(|error| ApplicationError::LocalStore(format!("forwarding: {error}")))?;
         let capture = CaptureState {
             sink: sink.clone(),
             authorizer: authorizer.clone(),
@@ -222,6 +225,7 @@ impl Application {
             )),
             metrics: metrics.clone(),
             enricher: Arc::new(crate::enrichment::Enricher::new(config.enrichment.clone())),
+            forwarder: Some(forwarder.clone()),
         };
         let readiness = Readiness::new();
         let wire = crate::capture::router(capture)
@@ -248,6 +252,7 @@ impl Application {
                 wal_runtime.stats(),
             ))
             .merge(crate::routes::demo::router(access.clone(), sink.clone()))
+            .merge(crate::routes::forwarding::router(access.clone(), forwarder.clone()))
             .merge(crate::routes::erasure::router(
                 access.clone(),
                 wal_runtime.eraser(),
@@ -277,6 +282,7 @@ impl Application {
             persons,
             access,
             sink,
+            forwarder,
         })
     }
 
@@ -316,6 +322,7 @@ impl Application {
 
     pub async fn shutdown(self) -> Result<(), ApplicationError> {
         self.readiness.mark_not_ready();
+        self.forwarder.stop();
         drop(self.router);
         let wal_result = self.wal_runtime.shutdown().await;
         self.control_runtime.close();

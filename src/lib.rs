@@ -15,6 +15,7 @@ pub mod enrichment;
 pub mod event_lake;
 pub mod explore;
 pub mod flags;
+pub mod forward;
 pub mod import;
 pub mod lake;
 pub mod metrics;

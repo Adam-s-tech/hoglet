@@ -6,6 +6,7 @@ pub mod docs;
 pub mod erasure;
 pub mod events;
 pub mod flags;
+pub mod forwarding;
 pub mod health;
 pub mod metrics;
 pub mod persons;

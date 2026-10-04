@@ -181,6 +181,8 @@ pub struct CaptureState {
     pub limiter: Arc<RateLimiter>,
     pub metrics: Arc<Metrics>,
     pub enricher: Arc<crate::enrichment::Enricher>,
+    /// Shadow mode: forward acknowledged events to PostHog.
+    pub forwarder: Option<Arc<crate::forward::Forwarder>>,
 }
 
 /// Body limit for browser-SDK endpoints (/e and friends).
@@ -300,6 +302,8 @@ async fn capture(
         let historical_migration = false;
         let events = batch.events;
         let n = events.len() as u64;
+        let forwarded = state.forwarder.as_ref().map(|_| events.clone());
+        let bindings = project_ids_by_token.clone();
         state.metrics.inc_captured(n);
         match state
             .sink
@@ -310,7 +314,20 @@ async fn capture(
             })
             .await
         {
-            Ok(()) => state.metrics.inc_acked(n),
+            Ok(()) => {
+                state.metrics.inc_acked(n);
+                if let (Some(forwarder), Some(events)) = (&state.forwarder, forwarded) {
+                    let mut by_project: BTreeMap<&str, Vec<event::CapturedEvent>> = BTreeMap::new();
+                    for event in events {
+                        if let Some(project_id) = bindings.get(&event.token) {
+                            by_project.entry(project_id).or_default().push(event);
+                        }
+                    }
+                    for (project_id, events) in by_project {
+                        forwarder.offer(project_id, &events);
+                    }
+                }
+            }
             Err(crate::sink::SinkError::Retryable) => {
                 state.metrics.inc_sink_errors();
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -404,6 +421,7 @@ mod tests {
             limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
             metrics: Arc::new(Metrics::default()),
             enricher: Arc::new(crate::enrichment::Enricher::new(Default::default())),
+            forwarder: None,
         };
         (router(state), sink)
     }
@@ -475,6 +493,7 @@ mod tests {
             limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
             metrics: Arc::new(Metrics::default()),
             enricher: Arc::new(crate::enrichment::Enricher::new(Default::default())),
+            forwarder: None,
         };
         let body = r#"[{"event":"known","distinct_id":"u1","token":"phc_known"},{"event":"unknown","distinct_id":"u2","token":"phc_unknown"}]"#;
 
@@ -493,6 +512,7 @@ mod tests {
             limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
             metrics: Arc::new(Metrics::default()),
             enricher: Arc::new(crate::enrichment::Enricher::new(Default::default())),
+            forwarder: None,
         };
         let body = r#"{"api_key":"phc_t","historical_migration":true,"batch":[{"event":"a","distinct_id":"u1"}]}"#;
 

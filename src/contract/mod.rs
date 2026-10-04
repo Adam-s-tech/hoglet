@@ -17,6 +17,7 @@
 //! | `GET /persons/{id}/events` | → `EventListResponse` |
 //! | `POST /persons/{id}/erase` | → `{distinct_ids, events}` (owner/admin; physical) |
 //! | `POST /demo` | → `{events}` — fill the project with demo data |
+//! | `GET/PUT /forwarding` | `{enabled, host, posthog_token}` → forwarding status (shadow mode) |
 //! | `GET /events` | → `EventListResponse` |
 //! | `GET /web/overview` | `WebQuery` (query string) → `WebOverview` |
 //! | `GET /web/breakdown` | `WebQuery` + `dimension`, `limit` → `WebBreakdown` |
