@@ -80,6 +80,8 @@ Nothing here is proven until its evidence exists. Until then, do not make the cl
 
 **Measured locally (not the published number):** via `scripts/loadtest.sh` on a dev machine (not the 1 GB VPS), with a query racing ingest: peak RSS ~146 MB across 200k events at 64 concurrent connections; throughput ~10k events/s at 64 conns, ~1.5k at 8 (fsync/group-commit bound — scales with concurrency, exactly as designed). These clear the SPEC targets (<400 MB, ≥5k/s) but are dev-box numbers. The published claim still requires the stated 1 vCPU / 1 GB hardware.
 
+**Measured under an emulated 1 vCPU / 1.5 GB cgroup (2026-10, not the published number):** sustained ingest 18k events/s at 343 MB peak RSS (`scripts/loadtest.sh`, 400k events, 32 connections, a dashboard query racing it). Queries over 10M events / 300k persons / 50k identity overrides on one CPU (`cargo test --release bench_ten_million -- --ignored`): trends total 0.21 s, daily active users 1.2 s, weekly active users 3.5 s, three-step funnel 7.8 s. The funnel and weekly-active figures miss the design targets (2 s) and are being optimized; the machine was shared with other work (load average ~17), so treat the figures as upper bounds.
+
 **Outside the claim:** any specific *published* throughput figure. We do not publish an events-per-second number until we have measured one on the stated hardware.
 
 ---
