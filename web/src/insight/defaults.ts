@@ -162,11 +162,52 @@ export function encodeQuery(q: InsightQuery): string {
 }
 export function decodeQuery(s: string): InsightQuery | null {
   try {
-    const q = JSON.parse(decodeURIComponent(s)) as InsightQuery;
-    return KINDS.some((k) => k.kind === q.kind) ? q : null;
+    return normalizeQuery(JSON.parse(decodeURIComponent(s)));
   } catch {
     return null;
   }
+}
+
+type Loose = Record<string, unknown>;
+const isObject = (v: unknown): v is Loose => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** Fill an event node's omitted fields (hand-written links, imported insights). */
+function normalizeNode(raw: unknown): EventNode {
+  const n = isObject(raw) ? raw : {};
+  return {
+    event: typeof n.event === "string" ? n.event : null,
+    custom_name: typeof n.custom_name === "string" ? n.custom_name : null,
+    properties: Array.isArray(n.properties) ? (n.properties as PropertyFilter[]) : [],
+    math: typeof n.math === "string" ? (n.math as MathKind) : "total",
+    math_property: typeof n.math_property === "string" ? n.math_property : null,
+  };
+}
+
+/**
+ * A complete query of a known kind from anything shaped like one: every
+ * omitted field takes the kind's default, so the editor never meets a hole.
+ * Returns null for unknown kinds.
+ */
+export function normalizeQuery(raw: unknown): InsightQuery | null {
+  if (!isObject(raw) || typeof raw.kind !== "string") return null;
+  const kind = raw.kind as QueryKind;
+  if (!KINDS.some((k) => k.kind === kind)) return null;
+  const base = defaultQuery(kind) as unknown as Loose;
+  const merged: Loose = { ...base };
+  for (const [key, value] of Object.entries(raw)) {
+    if (value !== undefined && value !== null && key in base) merged[key] = value;
+    else if (value === null && key in base) merged[key] = base[key] === null ? null : base[key];
+  }
+  if (Array.isArray(merged.series)) merged.series = (merged.series as unknown[]).map(normalizeNode);
+  else if ("series" in base && !Array.isArray(base.series)) merged.series = normalizeNode(merged.series);
+  for (const key of ["target", "returning"]) if (key in base) merged[key] = normalizeNode(merged[key]);
+  if (isObject(merged.date_range)) {
+    merged.date_range = { ...(base.date_range as Loose), ...merged.date_range };
+  }
+  for (const key of ["properties", "exclusions"]) {
+    if (key in base && !Array.isArray(merged[key])) merged[key] = base[key];
+  }
+  return merged as unknown as InsightQuery;
 }
 
 /** Describe a query in a few words (insight list subtitle). */

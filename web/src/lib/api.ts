@@ -1,3 +1,4 @@
+import { normalizeQuery } from "../insight/defaults";
 // The one typed client for Hoglet's dashboard API.
 //
 // Contract shapes come from src/types (generated from src/contract by ts-rs).
@@ -272,7 +273,7 @@ function normalizeInsight(raw: unknown): SavedInsight {
     project_id: String(r.project_id ?? ""),
     name: String(r.name ?? "Untitled"),
     description: String(r.description ?? ""),
-    query: isRecord(q) && typeof q.kind === "string" && QUERY_KINDS.has(q.kind) ? (q as unknown as InsightQuery) : null,
+    query: isRecord(q) && typeof q.kind === "string" && QUERY_KINDS.has(q.kind) ? normalizeQuery(q) : null,
     created_by: String(r.created_by ?? ""),
     created_at: Number(r.created_at ?? 0),
     updated_at: Number(r.updated_at ?? r.created_at ?? 0),
