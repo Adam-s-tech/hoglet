@@ -107,7 +107,14 @@ impl Explorer {
         source: Arc<dyn EventSource>,
         persons: Arc<PersonStore>,
     ) -> Result<Self, ExploreError> {
-        let root = duckdb::Connection::open_in_memory()?;
+        // A static binary cannot load extensions; everything needed is
+        // compiled in, so never try to fetch or load one.
+        let root = duckdb::Connection::open_in_memory_with_flags(
+            duckdb::Config::default().enable_autoload_extension(false)?,
+        )?;
+        root.execute_batch("SET autoinstall_known_extensions = false;")?;
+        // `TimeZone` needs the ICU extension; without it TIMESTAMPTZ is UTC.
+        let _ = root.execute_batch("SET GLOBAL TimeZone='UTC';");
         // Large web-analytics ranges may exceed the memory limit; they spill
         // to a bounded scratch directory instead of failing.
         let spill = std::env::temp_dir().join(format!("hoglet-explore-{}", std::process::id()));
@@ -119,7 +126,6 @@ impl Explorer {
             "SET temp_directory='{spill}';
              SET max_temp_directory_size='{MAX_SPILL}';
              SET memory_limit='{MEMORY_LIMIT}';
-             SET GLOBAL TimeZone='UTC';
              SET threads={MAX_THREADS};
              SET enable_progress_bar=false;
              CREATE TABLE explore_overrides (

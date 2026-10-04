@@ -68,7 +68,7 @@ fn session_ctes(source: &str, dimension: &str, filter_sql: &str) -> String {
             LEFT JOIN (SELECT distinct_id, person_id FROM explore_overrides
                        WHERE project_id = ?) o
               ON o.distinct_id = e.distinct_id
-            WHERE e.timestamp >= make_timestamptz(?) AND e.timestamp < make_timestamptz(?)
+            WHERE e.timestamp >= make_timestamp(?::BIGINT)::TIMESTAMPTZ AND e.timestamp < make_timestamp(?::BIGINT)::TIMESTAMPTZ
                   {filter_sql}
         ),
         p AS (SELECT *, CASE WHEN ts >= ? THEN 1 ELSE 0 END AS period FROM ev),
@@ -336,8 +336,8 @@ fn live_visitors(
          LEFT JOIN (SELECT distinct_id, person_id FROM explore_overrides
                     WHERE project_id = ?) o
            ON o.distinct_id = e.distinct_id
-         WHERE e.event = '$pageview' AND e.timestamp >= make_timestamptz(?)
-               AND e.timestamp <= make_timestamptz(?) {filters}",
+         WHERE e.event = '$pageview' AND e.timestamp >= make_timestamp(?::BIGINT)::TIMESTAMPTZ
+               AND e.timestamp <= make_timestamp(?::BIGINT)::TIMESTAMPTZ {filters}",
         filters = compiled.sql
     );
     let mut params = vec![

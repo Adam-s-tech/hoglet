@@ -51,9 +51,16 @@ pub struct Compactor {
 impl Compactor {
     pub fn new(lake: Arc<Lake>, tmp_dir: &Path, retention_days: Option<u32>) -> Result<Self, LakeError> {
         std::fs::create_dir_all(tmp_dir).map_err(super::io_error(tmp_dir))?;
-        let duck = duckdb::Connection::open_in_memory().map_err(duck_error)?;
+        // No extension may be fetched or loaded (a static binary cannot).
+        let duck = duckdb::Connection::open_in_memory_with_flags(
+            duckdb::Config::default()
+                .enable_autoload_extension(false)
+                .map_err(duck_error)?,
+        )
+        .map_err(duck_error)?;
         duck.execute_batch(&format!(
-            "SET memory_limit='{COMPACTION_MEMORY}'; SET threads=1; SET TimeZone='UTC';
+            "SET autoinstall_known_extensions = false;
+             SET memory_limit='{COMPACTION_MEMORY}'; SET threads=1;
              SET preserve_insertion_order=false; SET temp_directory='{}';",
             tmp_dir.display().to_string().replace('\'', "''")
         ))

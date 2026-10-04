@@ -183,7 +183,7 @@ fn read_window(
     );
     let mut params: Vec<Db> = Vec::new();
     if let Some(before) = query.before {
-        sql.push_str(" AND e.timestamp < make_timestamptz(?)");
+        sql.push_str(" AND e.timestamp < make_timestamp(?::BIGINT)::TIMESTAMPTZ");
         params.push(Db::BigInt(before.timestamp_micros()));
     }
     if let Some(event) = &query.event {

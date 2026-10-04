@@ -90,12 +90,16 @@ pub fn run(config: &ReconcileConfig) -> Result<Vec<Row>, String> {
             config.hoglet_host.trim_end_matches('/'),
             config.hoglet_project_id
         );
+        // Computed here: DuckDB's date arithmetic on TIMESTAMPTZ needs ICU,
+        // which the static binary does not ship.
+        let cutoff = (chrono::Utc::now().date_naive()
+            - chrono::Duration::days(i64::from(days - 1)))
+        .format("%Y-%m-%d 00:00:00+00");
         let query = format!(
             "SELECT strftime(timestamp, '%Y-%m-%d') AS day, event, count(*) AS events, \
              count(DISTINCT person_id) AS persons FROM events \
-             WHERE timestamp >= date_trunc('day', now()) - INTERVAL {} DAY \
-             GROUP BY 1, 2 ORDER BY 1, 2",
-            days - 1
+             WHERE timestamp >= TIMESTAMPTZ '{cutoff}' \
+             GROUP BY 1, 2 ORDER BY 1, 2"
         );
         let body = post(
             &agent,
