@@ -6,7 +6,8 @@
 # RSS and query latency. Run it under a resource cap to emulate the target box:
 #
 #   scripts/loadtest.sh 400000 32                      # dev box
-#   systemd-run --user --scope -p CPUQuota=100% -p MemoryMax=1G \
+#   cargo build --release && cargo build --release --example loadgen
+#   SKIP_BUILD=1 systemd-run --user --scope -p CPUQuota=100% -p MemoryMax=1G \
 #       scripts/loadtest.sh 400000 32                  # ~1 vCPU / 1 GB
 #
 # Usage: scripts/loadtest.sh [total_events] [connections]
@@ -19,9 +20,11 @@ DATA="$(mktemp -d)"
 BIN="./target/release/hoglet"
 BASE="http://127.0.0.1:$PORT"
 
-echo "building release binary + loadgen..."
-cargo build --release >/dev/null 2>&1
-cargo build --release --example loadgen >/dev/null 2>&1
+if [ -z "${SKIP_BUILD:-}" ]; then
+    echo "building release binary + loadgen..."
+    cargo build --release >/dev/null 2>&1
+    cargo build --release --example loadgen >/dev/null 2>&1
+fi
 
 HOGLET_ADDR="127.0.0.1:$PORT" HOGLET_DATA="$DATA" HOGLET_MAX_EVENTS_PER_SEC=100000000 \
     "$BIN" >/dev/null 2>&1 &
@@ -51,7 +54,7 @@ RESULT="$(./target/release/examples/loadgen "$PORT" "$TOTAL" "$CONNECTIONS" "$TO
 
 kill "$SAMPLER" "$QUERIES" 2>/dev/null || true
 PEAK_KB="$(sort -n "$DATA/rss.log" | tail -1)"
-PEAK_MB="$(echo "scale=1; ${PEAK_KB:-0} / 1024" | bc)"
+PEAK_MB="$(awk -v kb="${PEAK_KB:-0}" 'BEGIN {printf "%.1f", kb / 1024}')"
 Q_P50="$(sort -n "$DATA/q.log" | awk '{a[NR]=$1} END {if (NR) print a[int(NR*0.5)+1]; else print "n/a"}')"
 Q_P95="$(sort -n "$DATA/q.log" | awk '{a[NR]=$1} END {if (NR) print a[int(NR*0.95)+1]; else print "n/a"}')"
 FILES="$(find "$DATA/events" -name '*.parquet' | wc -l)"
