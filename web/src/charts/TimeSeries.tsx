@@ -1,9 +1,11 @@
 // Line / area / grouped bar / stacked bar over an ordinal x axis.
 // One y axis, recessive grid, crosshair + tooltip, click-through to persons.
 
-import { useMemo, useState, type MouseEvent as RMouseEvent, type PointerEvent as RPointerEvent } from "react";
-import { fmtCompact, fmtNumber } from "../lib/format";
-import { useSize } from "../lib/hooks";
+import { useMemo, useState, type KeyboardEvent as RKeyboardEvent, type MouseEvent as RMouseEvent, type PointerEvent as RPointerEvent } from "react";
+import { fmtCompact, fmtNumber } from "@/lib/format";
+import { useSize } from "@/lib/hooks";
+import { cn } from "@/lib/utils";
+import { Swatch, Tip, TipFoot, TipRow, TipTitle } from "./parts";
 import { barPath, labelStride, linear, niceDomain, textWidth } from "./scale";
 
 export interface ChartSeries {
@@ -32,11 +34,13 @@ interface Props {
 }
 
 const M = { top: 10, right: 12, bottom: 26 };
+const KIND_NAME: Record<SeriesKind, string> = { line: "Line chart", area: "Area chart", bar: "Bar chart", stacked: "Stacked bar chart" };
 
-export function TimeSeriesChart({ labels, series, kind, height = 300, format = fmtNumber, tooltipTitle, onPointClick, legend = true, clickHint = "Click to see persons", axisFormat = fmtCompact }: Props) {
+export function TimeSeriesChart({ labels, series, kind, height = 300, format = fmtNumber, tooltipTitle, onPointClick, legend = true, clickHint = "Click or press Enter to see persons", axisFormat = fmtCompact }: Props) {
   const [ref, size] = useSize<HTMLDivElement>();
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [hover, setHover] = useState<{ i: number; s: number; x: number; y: number } | null>(null);
+  const [kbd, setKbd] = useState(false);
 
   const visible = series.map((s, idx) => ({ s, idx })).filter(({ s }) => !hidden.has(s.key));
   const n = labels.length;
@@ -115,6 +119,62 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
     return { i, s, x: px, y: py };
   };
 
+  // Keyboard: arrows move between points (left/right) and series (up/down),
+  // Enter/Space opens the persons behind the point, Escape clears.
+  const onKey = (e: RKeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    if (n === 0 || visible.length === 0) return;
+    const move = (i: number, s: number) => {
+      const ni = Math.max(0, Math.min(n - 1, i));
+      const ser = series[s];
+      const cx = xAt(ni);
+      const cy = y(ser?.data[ni] ?? 0);
+      setKbd(true);
+      setHover({ i: ni, s, x: cx, y: cy });
+    };
+    const cur = hover ?? { i: n - 1, s: visible[0].idx, x: 0, y: 0 };
+    const vpos = Math.max(0, visible.findIndex((v) => v.idx === cur.s));
+    switch (e.key) {
+      case "ArrowLeft":
+        e.preventDefault();
+        move(hover ? cur.i - 1 : n - 1, cur.s);
+        break;
+      case "ArrowRight":
+        e.preventDefault();
+        move(hover ? cur.i + 1 : n - 1, cur.s);
+        break;
+      case "Home":
+        e.preventDefault();
+        move(0, cur.s);
+        break;
+      case "End":
+        e.preventDefault();
+        move(n - 1, cur.s);
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        move(cur.i, visible[(vpos - 1 + visible.length) % visible.length].idx);
+        break;
+      case "ArrowDown":
+        e.preventDefault();
+        move(cur.i, visible[(vpos + 1) % visible.length].idx);
+        break;
+      case "Enter":
+      case " ":
+        if (hover && onPointClick) {
+          e.preventDefault();
+          onPointClick(hover.s, hover.i);
+        }
+        break;
+      case "Escape":
+        if (hover) {
+          setHover(null);
+          setKbd(false);
+        }
+        break;
+    }
+  };
+
   const zeroY = y(0);
   const groupW = band * (visible.length > 1 ? 0.78 : 0.62);
   const barW = kind === "bar" ? Math.max(1, groupW / Math.max(1, visible.length) - 2) : Math.max(1, Math.min(band * 0.62, 56));
@@ -145,9 +205,28 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
         .sort((a, b) => (kind === "stacked" ? 0 : b.v - a.v))
     : [];
 
+  const summary = `${KIND_NAME[kind]} of ${n} ${n === 1 ? "period" : "periods"}${labels.length ? `, ${labels[0]} to ${labels[n - 1]}` : ""}. ${series
+    .slice(0, 6)
+    .map((s) => `${s.label}: ${format(s.data[0] ?? 0)} to ${format(s.data[s.data.length - 1] ?? 0)}`)
+    .join("; ")}${series.length > 6 ? `; and ${series.length - 6} more` : ""}.`;
+
   return (
-    <div className="chart" ref={ref}>
-      <svg width={width} height={height} role="img" aria-label={`Chart of ${series.map((s) => s.label).join(", ")}`}>
+    <div
+      className="chart rounded-md focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none"
+      ref={ref}
+      tabIndex={0}
+      role="group"
+      aria-roledescription="interactive chart"
+      aria-label={`${summary} Use arrow keys to inspect points${onPointClick ? ", Enter to see persons" : ""}.`}
+      onKeyDown={onKey}
+      onBlur={() => {
+        if (kbd) {
+          setKbd(false);
+          setHover(null);
+        }
+      }}
+    >
+      <svg width={width} height={height} role="img" aria-label={summary}>
         {width > 0 && (
           <>
             {ticks.map((t) => (
@@ -167,7 +246,7 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
             )}
 
             {hover && !isBar && <line className="crosshair" x1={xAt(hover.i)} x2={xAt(hover.i)} y1={M.top} y2={M.top + innerH} />}
-            {hover && isBar && <rect x={left + band * hover.i} y={M.top} width={band} height={innerH} fill="var(--ink)" opacity={0.04} />}
+            {hover && isBar && <rect x={left + band * hover.i} y={M.top} width={band} height={innerH} fill="var(--foreground)" opacity={0.05} />}
 
             {kind === "bar" &&
               visible.map(({ s, idx }, k) =>
@@ -191,7 +270,7 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
                   height={Math.max(0, h)}
                   rx={2}
                   fill={s.color}
-                  stroke="var(--surface)"
+                  stroke="var(--card)"
                   strokeWidth={1}
                   opacity={hover && hover.i !== b.i ? 0.85 : 1}
                 />
@@ -219,7 +298,7 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
                     />
                     {(n === 1 || (hover && hover.s === idx)) &&
                       s.data.map((v, i) =>
-                        n === 1 || hover?.i === i ? <circle key={i} cx={xAt(i)} cy={y(v)} r={4.5} fill={s.color} stroke="var(--surface)" strokeWidth={2} /> : null,
+                        n === 1 || hover?.i === i ? <circle key={i} cx={xAt(i)} cy={y(v)} r={4.5} fill={s.color} stroke="var(--card)" strokeWidth={2} /> : null,
                       )}
                   </g>
                 );
@@ -231,7 +310,10 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
               y={M.top}
               width={innerW}
               height={innerH}
-              onPointerMove={(e) => setHover(locate(e))}
+              onPointerMove={(e) => {
+                setKbd(false);
+                setHover(locate(e));
+              }}
               onPointerLeave={() => setHover(null)}
               onClick={(e) => {
                 const h = locate(e);
@@ -245,31 +327,33 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
       </svg>
 
       {hover && (
-        <div
-          className="tip"
+        <Tip
           style={{
             left: Math.min(Math.max(0, hover.x + 14), Math.max(0, width - 230)),
             top: Math.max(0, Math.min(hover.y - 20, height - 40 - tipRows.length * 20)),
           }}
         >
-          <div className="tip-title">{tooltipTitle ? tooltipTitle(hover.i) : labels[hover.i]}</div>
+          <TipTitle>{tooltipTitle ? tooltipTitle(hover.i) : labels[hover.i]}</TipTitle>
           {tipRows.slice(0, 12).map(({ s, idx, v }) => (
-            <div className="tip-row" key={idx} style={{ fontWeight: idx === hover.s ? 600 : undefined }}>
-              <span className={`swatch${kind === "line" ? " line" : ""}`} style={{ background: s.color, opacity: s.dashed ? 0.5 : 1 }} />
-              <span className="lab">{s.label}</span>
-              <span className="val">{format(v)}</span>
-            </div>
+            <TipRow key={idx} strong={idx === hover.s} swatch={<Swatch color={s.color} line={kind === "line"} faded={s.dashed} />} label={s.label} value={format(v)} />
           ))}
-          {tipRows.length > 12 && <div className="muted small">+{tipRows.length - 12} more</div>}
-          {onPointClick && <div className="tip-foot">{clickHint}</div>}
+          {tipRows.length > 12 && <div className="text-muted-foreground">+{tipRows.length - 12} more</div>}
+          {onPointClick && <TipFoot>{clickHint}</TipFoot>}
+        </Tip>
+      )}
+
+      {kbd && hover && (
+        <div className="sr-only" aria-live="polite" role="status">
+          {`${tooltipTitle ? tooltipTitle(hover.i) : labels[hover.i]}: ${series[hover.s]?.label} ${format(series[hover.s]?.data[hover.i] ?? 0)}`}
         </div>
       )}
 
       {legend && series.length > 1 && (
-        <div className="legend" role="group" aria-label="Series">
+        <div className="mt-2.5 flex flex-wrap gap-x-3.5 gap-y-1 text-xs text-muted-foreground" role="group" aria-label="Series">
           {series.map((s) => (
             <button
               key={s.key}
+              type="button"
               aria-pressed={!hidden.has(s.key)}
               onClick={() => {
                 const next = new Set(hidden);
@@ -278,8 +362,12 @@ export function TimeSeriesChart({ labels, series, kind, height = 300, format = f
                 setHidden(next);
               }}
               title={s.label}
+              className={cn(
+                "inline-flex max-w-70 items-center gap-1.5 rounded px-1 py-0.5 text-xs hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none",
+                hidden.has(s.key) && "opacity-40",
+              )}
             >
-              <span className={`swatch${kind === "line" ? " line" : ""}`} style={{ background: s.color, opacity: s.dashed ? 0.5 : 1 }} />
+              <Swatch color={s.color} line={kind === "line"} faded={s.dashed} />
               <span className="truncate">{s.label}</span>
             </button>
           ))}

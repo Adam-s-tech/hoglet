@@ -1,55 +1,94 @@
-import { useMemo } from "react";
-import type { InsightQuery } from "../types/InsightQuery";
-import { api } from "../lib/api";
-import { useApp, usePath, useProjectId } from "../lib/context";
-import { fmtCompact, fmtNumber, fmtRelative } from "../lib/format";
-import { useApi } from "../lib/hooks";
-import { eventLabel } from "../lib/properties";
-import { Link } from "../lib/router";
-import { Icon } from "../ui/icons";
-import { Empty, ErrorState, Skeleton, SkeletonRows } from "../ui/kit";
-import { eventNode, kindInfo, summarize } from "../insight/defaults";
-import { ChartSkeleton, InsightResultView, useInsightQuery } from "../insight/Result";
-import { FirstEventWatcher, LoadDemoButton } from "./Onboarding";
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { useMemo, type ReactNode } from "react";
+import { Empty, ErrorState, Skeleton, SkeletonRows } from "@/components/feedback";
+import { Icon } from "@/components/icons";
+import { CardBar, CardPad, IconBadge, Page, PageHeader, Panel } from "@/components/page";
+import { Button } from "@/components/ui/button";
+import { useApp, usePath, useProjectId } from "@/lib/context";
+import { fmtCompact, fmtNumber, fmtRelative } from "@/lib/format";
+import { eventLabel } from "@/lib/properties";
+import { catalogEventsQuery, dashboardsQuery, insightResultQuery, insightsQuery, statusQuery } from "@/lib/queries";
+import { cn } from "@/lib/utils";
+import type { InsightQuery } from "@/types/InsightQuery";
+import { eventNode, kindInfo, summarize } from "@/insight/defaults";
+import { InsightResultView } from "@/insight/Result";
+import { FirstEventWatcher, LoadDemoButton } from "@/pages/Onboarding";
+
+const STATUS_POLL_MS = 15_000;
+
+/** Events and unique users over the last two weeks: the one chart worth a home page. */
+const ACTIVITY_QUERY: InsightQuery = {
+  kind: "TrendsQuery",
+  series: [
+    { ...eventNode(null, "total"), custom_name: "Events" },
+    { ...eventNode(null, "dau"), custom_name: "Unique users" },
+  ],
+  date_range: { date_from: "-14d", date_to: null },
+  interval: "day",
+  properties: [],
+  breakdown: null,
+  formula: null,
+  compare: false,
+  display: "ActionsLineGraph",
+};
+
+function ChartSkeleton({ height }: { height: number }) {
+  return (
+    <div className="flex flex-col justify-end gap-2" style={{ height }} aria-busy="true" aria-label="Loading result">
+      <div className="flex items-end gap-1.5" style={{ height: height - 40 }}>
+        {Array.from({ length: 18 }, (_, i) => (
+          <Skeleton key={i} className="flex-1" style={{ height: `${30 + ((i * 37) % 60)}%` }} />
+        ))}
+      </div>
+      <Skeleton className="h-2.5 w-full" />
+    </div>
+  );
+}
 
 function ActivityChart() {
-  const query: InsightQuery = useMemo(
-    () => ({
-      kind: "TrendsQuery",
-      series: [{ ...eventNode(null, "total"), custom_name: "Events" }, { ...eventNode(null, "dau"), custom_name: "Unique users" }],
-      date_range: { date_from: "-14d", date_to: null },
-      interval: "day",
-      properties: [],
-      breakdown: null,
-      formula: null,
-      compare: false,
-      display: "ActionsLineGraph",
-    }),
-    [],
+  const pid = useProjectId();
+  const request = useMemo(() => ({ query: ACTIVITY_QUERY, refresh: false }), []);
+  const { data, error, refetch } = useQuery(insightResultQuery(pid, request));
+  if (error && !data) return <ErrorState error={error} retry={() => void refetch()} />;
+  if (!data) return <ChartSkeleton height={260} />;
+  return <InsightResultView query={ACTIVITY_QUERY} result={data.result} compact />;
+}
+
+function ListRow({ to, className, children }: { to: string; className?: string; children: ReactNode }) {
+  return (
+    <Link
+      to={to}
+      className={cn(
+        "flex items-center gap-3 border-b px-4 py-2.5 transition-colors outline-none last:border-b-0 hover:bg-accent focus-visible:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+        className,
+      )}
+    >
+      {children}
+    </Link>
   );
-  const run = useInsightQuery(query, 0);
-  if (run.error && !run.data) return <ErrorState error={run.error} retry={run.reload} />;
-  if (!run.data || !run.sent) return <ChartSkeleton height={260} />;
-  return <InsightResultView query={run.sent} result={run.data.result} compact />;
 }
 
 export function HomePage() {
   const { project, workspace } = useApp();
-  const projectId = useProjectId();
+  const pid = useProjectId();
   const path = usePath();
-  const status = useApi(`status:${projectId}`, (s) => api.status(projectId, s), { pollMs: 15_000 });
-  const insights = useApi(`insights:${projectId}`, (s) => api.insights(projectId, s));
-  const dashboards = useApi(`dashboards:${projectId}`, (s) => api.dashboards(projectId, s));
-  const events = useApi(`catalog-events:${projectId}:`, (s) => api.catalogEvents(projectId, "", s));
+  const status = useQuery(statusQuery(pid, STATUS_POLL_MS));
+  const insights = useQuery(insightsQuery(pid));
+  const dashboards = useQuery(dashboardsQuery(pid));
+  const events = useQuery(catalogEventsQuery(pid, ""));
   const empty = status.data && !status.data.has_events;
   const name = workspace.user.name || workspace.user.email.split("@")[0];
 
+  const topEvents = useMemo(() => [...(events.data ?? [])].sort((a, b) => b.count - a.count).slice(0, 8), [events.data]);
+  const recentInsights = useMemo(() => [...(insights.data ?? [])].sort((a, b) => b.updated_at - a.updated_at).slice(0, 6), [insights.data]);
+
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="titles">
-          <h1>{project.name}</h1>
-          <div className="sub">
+    <Page>
+      <PageHeader
+        title={project.name}
+        sub={
+          <>
             Welcome back, {name}.
             {status.data?.has_events && (
               <>
@@ -57,135 +96,147 @@ export function HomePage() {
                 {fmtNumber(status.data.stored_events)} events stored · last one {fmtRelative(status.data.last_event_at)}.
               </>
             )}
-          </div>
-        </div>
-        <div className="actions">
-          <Link className="btn" to={path("activity")}>
-            <Icon name="activity" size={14} /> Live events
-          </Link>
-          <Link className="btn primary" to={`${path("insights/new")}?kind=trends`}>
-            <Icon name="plus" size={14} /> New insight
-          </Link>
-        </div>
-      </div>
+          </>
+        }
+        actions={
+          <>
+            <Button variant="outline" nativeButton={false} render={<Link to={path("activity")} />}>
+              <Icon name="activity" size={14} /> Live events
+            </Button>
+            <Button nativeButton={false} render={<Link to={path("insights/new")} search={{ kind: "trends" }} />}>
+              <Icon name="plus" size={14} /> New insight
+            </Button>
+          </>
+        }
+      />
 
       {empty && (
-        <div className="card card-pad col gap-12" style={{ marginBottom: 16 }}>
-          <div className="row">
-            <h2 className="grow">Get started</h2>
-            <LoadDemoButton />
-            <Link className="btn primary" to={path("onboarding")}>
-              Connect your app <Icon name="arrowRight" size={13} />
-            </Link>
-          </div>
-          <p className="secondary">No events yet. Point any PostHog SDK at this server and they appear within seconds.</p>
-          <FirstEventWatcher />
-        </div>
+        <Panel className="mb-4">
+          <CardPad className="flex flex-col gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="flex-1">Get started</h2>
+              <LoadDemoButton />
+              <Button nativeButton={false} render={<Link to={path("onboarding")} />}>
+                Connect your app <Icon name="arrowRight" size={13} />
+              </Button>
+            </div>
+            <p className="text-muted-foreground">No events yet. Point any PostHog SDK at this server and they appear within seconds.</p>
+            <FirstEventWatcher />
+          </CardPad>
+        </Panel>
       )}
 
-      <div className="grid-2" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)" }}>
-        <div className="card">
-          <div className="card-head">
-            <h3>Events and unique users · last 14 days</h3>
-            <Link className="btn ghost small" to={`${path("insights/new")}?kind=trends`}>
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+        <Panel>
+          <CardBar>
+            <h3 className="flex-1">Events and unique users · last 14 days</h3>
+            <Button variant="ghost" size="sm" nativeButton={false} render={<Link to={path("insights/new")} search={{ kind: "trends" }} />}>
               Explore <Icon name="arrowRight" size={12} />
-            </Link>
-          </div>
-          <div className="card-body" style={{ minHeight: 300 }}>
+            </Button>
+          </CardBar>
+          <CardPad className="min-h-[300px]">
             <ActivityChart />
-          </div>
-        </div>
-        <div className="card list-card">
-          <div className="card-head">
+          </CardPad>
+        </Panel>
+        <Panel>
+          <CardBar>
             <h3>Top events</h3>
-          </div>
+          </CardBar>
           {events.error && !events.data ? (
-            <ErrorState error={events.error} compact />
+            <CardPad>
+              <ErrorState error={events.error} compact />
+            </CardPad>
           ) : !events.data ? (
             <SkeletonRows rows={6} />
-          ) : events.data.length === 0 ? (
+          ) : topEvents.length === 0 ? (
             <Empty icon="bolt" title="No events seen yet" />
           ) : (
-            [...events.data]
-              .sort((a, b) => b.count - a.count)
-              .slice(0, 8)
-              .map((e) => (
-                <Link key={e.name} className="item" to={`${path("activity")}?event=${encodeURIComponent(e.name)}`}>
-                  <Icon name="bolt" size={14} style={{ color: "var(--ink-3)" }} />
-                  <span className="truncate grow">{eventLabel(e.name)}</span>
-                  <span className="muted small num">{e.count ? fmtCompact(e.count) : ""}</span>
-                </Link>
-              ))
+            topEvents.map((e) => (
+              <ListRow key={e.name} to={`${path("activity")}?event=${encodeURIComponent(e.name)}`}>
+                <Icon name="bolt" size={14} className="flex-none text-muted-foreground" />
+                <span className="min-w-0 flex-1 truncate">{eventLabel(e.name)}</span>
+                <span className="num text-xs text-muted-foreground">{e.count ? fmtCompact(e.count) : ""}</span>
+              </ListRow>
+            ))
           )}
-        </div>
+        </Panel>
       </div>
 
-      <div className="grid-2 mt-16">
-        <div className="card list-card">
-          <div className="card-head">
-            <h3>Recent insights</h3>
-            <Link className="btn ghost small" to={path("insights")}>
+      <div className="mt-4 grid gap-4 md:grid-cols-2">
+        <Panel>
+          <CardBar>
+            <h3 className="flex-1">Recent insights</h3>
+            <Button variant="ghost" size="sm" nativeButton={false} render={<Link to={path("insights")} />}>
               All insights
-            </Link>
-          </div>
+            </Button>
+          </CardBar>
           {insights.error && !insights.data ? (
-            <ErrorState error={insights.error} compact />
+            <CardPad>
+              <ErrorState error={insights.error} compact />
+            </CardPad>
           ) : !insights.data ? (
-            <div style={{ padding: 16 }}>
-              <Skeleton height={120} />
-            </div>
-          ) : insights.data.length === 0 ? (
-            <Empty icon="trends" title="No saved insights" action={<Link className="btn small" to={`${path("insights/new")}?kind=funnels`}>Build a funnel</Link>}>
+            <CardPad>
+              <Skeleton className="h-30 w-full" />
+            </CardPad>
+          ) : recentInsights.length === 0 ? (
+            <Empty
+              icon="trends"
+              title="No saved insights"
+              action={
+                <Button variant="outline" size="sm" nativeButton={false} render={<Link to={path("insights/new")} search={{ kind: "funnels" }} />}>
+                  Build a funnel
+                </Button>
+              }
+            >
               Save an insight to find it here.
             </Empty>
           ) : (
-            [...insights.data]
-              .sort((a, b) => b.updated_at - a.updated_at)
-              .slice(0, 6)
-              .map((i) => (
-                <Link key={i.id} className="item" to={path(`insights/${i.id}`)}>
-                  <span className="kind-icon">
-                    <Icon name={i.query ? kindInfo(i.query.kind).icon : "alert"} size={14} />
-                  </span>
-                  <span className="col grow" style={{ gap: 0, minWidth: 0 }}>
-                    <b className="truncate">{i.name}</b>
-                    <span className="muted small truncate">{summarize(i.query)}</span>
-                  </span>
-                  <span className="muted small">{fmtRelative(i.updated_at)}</span>
-                </Link>
-              ))
+            recentInsights.map((i) => (
+              <ListRow key={i.id} to={path(`insights/${i.id}`)}>
+                <IconBadge>
+                  <Icon name={i.query ? kindInfo(i.query.kind).icon : "alert"} size={14} />
+                </IconBadge>
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <b className="truncate">{i.name}</b>
+                  <span className="truncate text-xs text-muted-foreground">{summarize(i.query)}</span>
+                </span>
+                <span className="text-xs whitespace-nowrap text-muted-foreground">{fmtRelative(i.updated_at)}</span>
+              </ListRow>
+            ))
           )}
-        </div>
-        <div className="card list-card">
-          <div className="card-head">
-            <h3>Dashboards</h3>
-            <Link className="btn ghost small" to={path("dashboards")}>
+        </Panel>
+        <Panel>
+          <CardBar>
+            <h3 className="flex-1">Dashboards</h3>
+            <Button variant="ghost" size="sm" nativeButton={false} render={<Link to={path("dashboards")} />}>
               All dashboards
-            </Link>
-          </div>
+            </Button>
+          </CardBar>
           {dashboards.error && !dashboards.data ? (
-            <ErrorState error={dashboards.error} compact />
+            <CardPad>
+              <ErrorState error={dashboards.error} compact />
+            </CardPad>
           ) : !dashboards.data ? (
-            <div style={{ padding: 16 }}>
-              <Skeleton height={120} />
-            </div>
+            <CardPad>
+              <Skeleton className="h-30 w-full" />
+            </CardPad>
           ) : dashboards.data.length === 0 ? (
             <Empty icon="dashboard" title="No dashboards yet">
               Pin insights side by side for a one-glance view.
             </Empty>
           ) : (
             dashboards.data.slice(0, 6).map((d) => (
-              <Link key={d.id} className="item" to={path(`dashboards/${d.id}`)}>
-                <span className="kind-icon">
+              <ListRow key={d.id} to={path(`dashboards/${d.id}`)}>
+                <IconBadge>
                   <Icon name="dashboard" size={14} />
-                </span>
-                <b className="truncate grow">{d.name}</b>
-                <span className="muted small">{d.tiles.length} tiles</span>
-              </Link>
+                </IconBadge>
+                <b className="min-w-0 flex-1 truncate">{d.name}</b>
+                <span className="text-xs text-muted-foreground">{d.tiles.length} {d.tiles.length === 1 ? "tile" : "tiles"}</span>
+              </ListRow>
             ))
           )}
-        </div>
+        </Panel>
       </div>
-    </div>
+    </Page>
   );
 }

@@ -1,388 +1,607 @@
-import { useEffect, useRef, useState } from "react";
-import { api, errorMessage, type Dashboard, type DashboardTile } from "../lib/api";
-import { canEdit, useApp, usePath, useProjectId } from "../lib/context";
-import { fmtDate, fmtRelative } from "../lib/format";
-import { invalidate, useApi } from "../lib/hooks";
-import { Link, navigate } from "../lib/router";
-import { DateRangePicker, type RangeValue } from "../ui/DateRange";
-import { Icon } from "../ui/icons";
-import { Confirm, CopyButton, Empty, ErrorState, InlineEdit, LoadingBar, MenuButton, Modal, Skeleton, SkeletonRows, toast } from "../ui/kit";
-import { kindInfo, summarize, withDateRange } from "../insight/defaults";
-import { ChartSkeleton, InsightResultView, useInsightQuery } from "../insight/Result";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { getRouteApi, Link } from "@tanstack/react-router";
+import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { columnHelper, DataTable } from "@/components/data-table";
+import { AppDialog, Confirm } from "@/components/dialogs";
+import { CopyButton } from "@/components/copy";
+import { DateRangePicker, type RangeValue } from "@/components/date-range";
+import { Empty, ErrorState, LoadingBar, Skeleton, SkeletonRows } from "@/components/feedback";
+import { Icon } from "@/components/icons";
+import { InlineEdit } from "@/components/inline-edit";
+import { FormField, Page, PageHeader, Panel, SearchInput } from "@/components/page";
+import { toast } from "@/components/toast";
+import { ChartSkeleton, InsightResultView } from "@/insight/Result";
+import { incomplete, kindInfo, sanitize, summarize, withDateRange } from "@/insight/defaults";
+import { api, errorMessage, type Dashboard, type DashboardTile, type SavedInsight, type TileInput } from "@/lib/api";
+import { canEdit, projectPath, useApp, usePath, useProjectId } from "@/lib/context";
+import { fmtDate, fmtRelative } from "@/lib/format";
+import { navigate } from "@/lib/nav";
+import { dashboardQuery, dashboardsQuery, insightsQuery, qk, sharesQuery } from "@/lib/queries";
+import { cn } from "@/lib/utils";
+
+const dashboardRoute = getRouteApi("/project/$projectId/dashboards/$id");
+
+// ── List ─────────────────────────────────────────────────────────────────
+
+const col = columnHelper<Dashboard>();
 
 export function DashboardsPage() {
   const projectId = useProjectId();
   const path = usePath();
   const { organization } = useApp();
-  const { data, error, loading, reload } = useApi(`dashboards:${projectId}`, (s) => api.dashboards(projectId, s));
+  const editable = canEdit(organization);
+  const queryClient = useQueryClient();
+  const { data, error, isPending, refetch } = useQuery(dashboardsQuery(projectId));
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
 
-  const create = async () => {
-    try {
-      const d = await api.createDashboard(projectId, name.trim() || "New dashboard");
-      invalidate(`dashboards:${projectId}`);
+  const create = useMutation({
+    mutationFn: (n: string) => api.createDashboard(projectId, n.trim() || "New dashboard"),
+    onSuccess: async (d) => {
+      await queryClient.invalidateQueries({ queryKey: qk.dashboards(projectId) });
+      setCreating(false);
+      setName("");
       navigate(path(`dashboards/${d.id}`));
-    } catch (e) {
-      toast(errorMessage(e), true);
-    }
-  };
+    },
+    onError: (e) => toast(errorMessage(e), true),
+  });
+
+  const columns = useMemo(
+    () => [
+      col.accessor("name", {
+        header: "Name",
+        cell: (c) => (
+          <div className="flex items-center gap-3">
+            <span className="inline-grid size-7 flex-none place-items-center rounded-md bg-muted text-muted-foreground">
+              <Icon name="dashboard" size={14} />
+            </span>
+            <Link
+              to={projectPath(projectId, `dashboards/${c.row.original.id}`)}
+              onClick={(e) => e.stopPropagation()}
+              className="truncate font-semibold hover:text-brand-foreground hover:underline"
+            >
+              {c.getValue()}
+            </Link>
+          </div>
+        ),
+      }),
+      col.accessor((d) => d.tiles.length, {
+        id: "tiles",
+        header: "Tiles",
+        cell: (c) => <span className="num">{c.getValue()}</span>,
+        meta: { align: "right" },
+      }),
+      col.accessor("created_at", {
+        header: "Created",
+        cell: (c) => <span className="num text-muted-foreground">{fmtDate(c.getValue())}</span>,
+        meta: { align: "right" },
+      }),
+    ],
+    [projectId],
+  );
+
+  const newButton = (label: string) => (
+    <Button onClick={() => setCreating(true)}>
+      <Icon name="plus" size={14} /> {label}
+    </Button>
+  );
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="titles">
-          <h1>Dashboards</h1>
-          <div className="sub">Insights side by side, live, on one screen.</div>
-        </div>
-        <div className="actions">
-          {canEdit(organization) && (
-            <button className="btn primary" onClick={() => setCreating(true)}>
-              <Icon name="plus" size={14} /> New dashboard
-            </button>
-          )}
-        </div>
-      </div>
-      <div className="card">
-        {error ? (
-          <ErrorState error={error} retry={reload} />
-        ) : !data && loading ? (
+    <Page>
+      <PageHeader title="Dashboards" sub="Insights side by side, live, on one screen." actions={editable ? newButton("New dashboard") : null} />
+      <Panel>
+        {error && !data ? (
+          <ErrorState error={error} retry={() => void refetch()} />
+        ) : isPending ? (
           <SkeletonRows rows={4} />
         ) : data && data.length === 0 ? (
-          <Empty icon="dashboard" title="No dashboards yet" action={canEdit(organization) && <button className="btn primary" onClick={() => setCreating(true)}>Create a dashboard</button>}>
+          <Empty icon="dashboard" title="No dashboards yet" action={editable ? newButton("Create a dashboard") : null}>
             Create one, then use “Add to dashboard” on any insight to pin it.
           </Empty>
         ) : (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th className="r">Tiles</th>
-                <th className="r">Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(data ?? []).map((d) => (
-                <tr key={d.id} className="clickable" onClick={() => navigate(path(`dashboards/${d.id}`))}>
-                  <td>
-                    <div className="row gap-12">
-                      <span className="kind-icon">
-                        <Icon name="dashboard" size={14} />
-                      </span>
-                      <Link to={path(`dashboards/${d.id}`)} onClick={(e) => e.stopPropagation()} style={{ fontWeight: 600 }}>
-                        {d.name}
-                      </Link>
-                    </div>
-                  </td>
-                  <td className="r">{d.tiles.length}</td>
-                  <td className="r muted">{fmtDate(d.created_at)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <DataTable
+            label="Dashboards"
+            columns={columns}
+            data={data ?? []}
+            getRowId={(d) => d.id}
+            onRowClick={(d) => navigate(path(`dashboards/${d.id}`))}
+            sortable
+          />
         )}
-      </div>
+      </Panel>
       {creating && (
-        <Modal
+        <AppDialog
           title="New dashboard"
-          onClose={() => setCreating(false)}
+          onClose={() => {
+            if (!create.isPending) setCreating(false);
+          }}
           footer={
             <>
-              <button className="btn" onClick={() => setCreating(false)}>
+              <Button variant="outline" onClick={() => setCreating(false)} disabled={create.isPending}>
                 Cancel
-              </button>
-              <button className="btn primary" onClick={create}>
+              </Button>
+              <Button type="submit" form="new-dashboard-form" disabled={create.isPending}>
                 Create
-              </button>
+              </Button>
             </>
           }
         >
-          <label className="field">
-            <span>Name</span>
-            <input className="input" value={name} placeholder="Product health" onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && create()} />
-          </label>
-        </Modal>
+          <form
+            id="new-dashboard-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!create.isPending) create.mutate(name);
+            }}
+          >
+            <FormField label="Name" htmlFor="new-dashboard-name">
+              <Input id="new-dashboard-name" autoFocus value={name} maxLength={120} placeholder="Product health" onChange={(e) => setName(e.target.value)} />
+            </FormField>
+          </form>
+        </AppDialog>
       )}
-    </div>
+    </Page>
   );
 }
 
-function Tile({ tile, range, onRemove, onResize, editable, refreshKey }: { tile: DashboardTile; range: RangeValue | null; onRemove: () => void; onResize: (w: number, h: number) => void; editable: boolean; refreshKey: number }) {
+// ── Tile ─────────────────────────────────────────────────────────────────
+
+const SIZES = [
+  { label: "Small", w: 4, h: 3 },
+  { label: "Half width", w: 6, h: 3 },
+  { label: "Full width", w: 12, h: 4 },
+];
+
+interface TileProps {
+  tile: DashboardTile;
+  range: RangeValue | null;
+  editable: boolean;
+  refreshKey: number;
+  first: boolean;
+  last: boolean;
+  onRemove: () => void;
+  onResize: (w: number, h: number) => void;
+  onMove: (delta: -1 | 1) => void;
+}
+
+function Tile({ tile, range, editable, refreshKey, first, last, onRemove, onResize, onMove }: TileProps) {
+  const projectId = useProjectId();
   const path = usePath();
   const insight = tile.insight;
   const query = insight?.query ? withDateRange(insight.query, range) : null;
-  const run = useInsightQuery(query, 0);
+  const hint = query ? incomplete(query) : null;
+  const clean = query && !hint ? sanitize(query) : null;
+  const json = clean ? JSON.stringify(clean) : null;
+
+  // Same key as insightResultQuery, so the insight page and its dashboard share one cache entry.
+  const bypassCache = useRef(false);
+  const run = useQuery({
+    queryKey: [...qk.query(projectId), json] as const,
+    queryFn: ({ signal }) => {
+      const refresh = bypassCache.current;
+      bypassCache.current = false;
+      return api.query(projectId, { query: clean!, refresh }, signal);
+    },
+    enabled: clean !== null,
+    staleTime: 60_000,
+    placeholderData: keepPreviousData,
+  });
+  const { refetch } = run;
   const seen = useRef(refreshKey);
   useEffect(() => {
     if (seen.current === refreshKey) return;
     seen.current = refreshKey;
-    run.refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshKey]);
+    bypassCache.current = true;
+    void refetch();
+  }, [refreshKey, refetch]);
+
   const w = Math.max(3, Math.min(12, tile.w));
   const h = Math.max(2, Math.min(8, tile.h));
-  const k = insight?.query ? kindInfo(insight.query.kind) : null;
+  const kind = insight?.query ? kindInfo(insight.query.kind) : null;
+  const sizeValue = SIZES.find((s) => s.w === tile.w && s.h === tile.h)?.label ?? "";
+  const name = insight?.name ?? "Missing insight";
+
   return (
-    <div className="card tile" style={{ gridColumn: `span ${w}`, gridRow: `span ${h}` }}>
-      <div className="card-head">
-        <span className="kind-icon" style={{ width: 24, height: 24 }}>
-          <Icon name={k?.icon ?? "alert"} size={13} />
+    <Panel
+      className="min-h-0 [grid-column:span_12] lg:[grid-column:span_var(--w)] [grid-row:span_var(--h)]"
+      style={{ "--w": w, "--h": h } as CSSProperties}
+    >
+      <div className="flex min-h-11 items-center gap-2.5 py-2 pr-2 pl-4">
+        <span className="inline-grid size-6 flex-none place-items-center rounded-md bg-muted text-muted-foreground">
+          <Icon name={kind?.icon ?? "alert"} size={13} />
         </span>
-        <div className="col grow" style={{ gap: 0, minWidth: 0 }}>
-          <Link to={path(`insights/${tile.insight_id}`)} className="truncate" style={{ fontWeight: 600 }}>
-            {insight?.name ?? "Missing insight"}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <Link to={path(`insights/${tile.insight_id}`)} className="truncate font-semibold hover:text-brand-foreground hover:underline">
+            {name}
           </Link>
-          {insight && <span className="muted small truncate">{summarize(insight.query)}</span>}
+          {insight ? <span className="truncate text-xs text-muted-foreground">{summarize(insight.query)}</span> : null}
         </div>
-        <MenuButton label={<Icon name="more" />} className="btn ghost icon small" align="end" title="Tile actions">
-          {(close) => (
-            <>
-              <button className="menu-item" onClick={() => navigate(path(`insights/${tile.insight_id}`))}>
-                <Icon name="external" size={14} /> Open insight
-              </button>
-              {editable && (
-                <>
-                  <div className="menu-label">Size</div>
-                  {[
-                    { label: "Small", w: 4, h: 3 },
-                    { label: "Half width", w: 6, h: 3 },
-                    { label: "Full width", w: 12, h: 4 },
-                  ].map((s) => (
-                    <button
-                      key={s.label}
-                      className="menu-item"
-                      aria-selected={tile.w === s.w && tile.h === s.h}
-                      onClick={() => {
-                        close();
-                        onResize(s.w, s.h);
-                      }}
-                    >
-                      {s.label}
-                    </button>
-                  ))}
-                  <div className="menu-sep" />
-                  <button
-                    className="menu-item danger"
-                    onClick={() => {
-                      close();
-                      onRemove();
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label={`Actions for ${name}`} />}>
+            <Icon name="more" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-56">
+            <DropdownMenuItem onClick={() => navigate(path(`insights/${tile.insight_id}`))}>
+              <Icon name="external" size={14} /> Open insight
+            </DropdownMenuItem>
+            {editable && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel>Size</DropdownMenuLabel>
+                  <DropdownMenuRadioGroup
+                    value={sizeValue}
+                    onValueChange={(label) => {
+                      const s = SIZES.find((x) => x.label === label);
+                      if (s) onResize(s.w, s.h);
                     }}
                   >
-                    <Icon name="x" size={14} /> Remove from dashboard
-                  </button>
-                </>
-              )}
-            </>
-          )}
-        </MenuButton>
+                    {SIZES.map((s) => (
+                      <DropdownMenuRadioItem key={s.label} value={s.label} closeOnClick>
+                        {s.label}
+                      </DropdownMenuRadioItem>
+                    ))}
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuGroup>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem disabled={first} onClick={() => onMove(-1)}>
+                  <Icon name="arrowUp" size={14} /> Move earlier
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={last} onClick={() => onMove(1)}>
+                  <Icon name="arrowDown" size={14} /> Move later
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem variant="destructive" onClick={onRemove}>
+                  <Icon name="x" size={14} /> Remove from dashboard
+                </DropdownMenuItem>
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
-      <div className="tile-body">
-        <LoadingBar show={run.pending && !!run.data} />
+      <div className="relative min-h-0 flex-1 overflow-hidden border-t px-3.5 pt-2.5 pb-3">
+        <LoadingBar show={run.isFetching && !!run.data} />
         {!insight?.query ? (
           <Empty icon="alert" title="This insight can't be rendered" />
-        ) : run.hint ? (
-          <Empty icon="info" title={run.hint} />
-        ) : run.error && !run.pending ? (
-          <ErrorState error={run.error} retry={run.reload} compact />
-        ) : run.data && run.sent ? (
-          <InsightResultView query={run.sent} result={run.data.result} compact />
+        ) : hint ? (
+          <Empty icon="info" title={hint} />
+        ) : run.error && !run.data ? (
+          <ErrorState error={run.error} retry={() => void refetch()} compact />
+        ) : run.data && clean ? (
+          <InsightResultView query={clean} result={run.data.result} compact />
         ) : (
           <ChartSkeleton height={Math.max(140, h * 110 - 90)} />
         )}
       </div>
-    </div>
+    </Panel>
   );
 }
 
-function ShareModal({ dashboard, onClose }: { dashboard: Dashboard; onClose: () => void }) {
+// ── Add insight ──────────────────────────────────────────────────────────
+
+function AddInsightSheet({ existing, onAdd, onClose }: { existing: Set<string>; onAdd: (i: SavedInsight) => void; onClose: () => void }) {
   const projectId = useProjectId();
-  const shares = useApi(`shares:${projectId}`, (s) => api.shares(projectId, s));
-  const mine = (shares.data ?? []).filter((s) => s.object_type === "dashboard" && s.object_id === dashboard.id);
-  const [busy, setBusy] = useState(false);
-  const url = (token: string) => `${window.location.origin}/share/${token}`;
+  const { data, error, isPending, refetch } = useQuery(insightsQuery(projectId));
+  const [search, setSearch] = useState("");
+  const rows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (data ?? []).filter((i) => !q || `${i.name} ${summarize(i.query)}`.toLowerCase().includes(q));
+  }, [data, search]);
+
   return (
-    <Modal title={`Share “${dashboard.name}”`} onClose={onClose}>
-      <div className="col gap-16">
-        <p className="secondary">Anyone with a share link can view this dashboard without signing in. Revoke a link to cut access immediately.</p>
-        {shares.error ? <ErrorState error={shares.error} compact /> : null}
+    <Sheet
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <SheetContent className="w-full sm:max-w-md">
+        <SheetHeader>
+          <SheetTitle>Add an insight</SheetTitle>
+          <SheetDescription>Pin a saved insight to this dashboard.</SheetDescription>
+        </SheetHeader>
+        <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 pb-4">
+          <SearchInput placeholder="Search insights…" aria-label="Search insights" value={search} onChange={(e) => setSearch(e.target.value)} autoFocus />
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border">
+            {error && !data ? (
+              <ErrorState error={error} retry={() => void refetch()} compact />
+            ) : isPending ? (
+              <SkeletonRows rows={5} />
+            ) : rows.length === 0 ? (
+              <Empty icon="trends" title={data && data.length > 0 ? "No insights match" : "No saved insights yet"} className="py-10">
+                {data && data.length > 0 ? "Try a different search." : "Save an insight first, then pin it here."}
+              </Empty>
+            ) : (
+              <ul className="divide-y">
+                {rows.map((i) => {
+                  const added = existing.has(i.id);
+                  const k = i.query ? kindInfo(i.query.kind) : null;
+                  return (
+                    <li key={i.id} className="flex items-center gap-2.5 px-3 py-2">
+                      <span className="inline-grid size-7 flex-none place-items-center rounded-md bg-muted text-muted-foreground">
+                        <Icon name={k?.icon ?? "alert"} size={14} />
+                      </span>
+                      <div className="flex min-w-0 flex-1 flex-col">
+                        <span className="truncate font-medium">{i.name}</span>
+                        <span className="truncate text-xs text-muted-foreground">{summarize(i.query)}</span>
+                      </div>
+                      <Button variant="outline" size="sm" disabled={added || !i.query} onClick={() => onAdd(i)} aria-label={`Add ${i.name} to dashboard`}>
+                        {added ? (
+                          <>
+                            <Icon name="check" size={14} /> Added
+                          </>
+                        ) : (
+                          <>
+                            <Icon name="plus" size={14} /> Add
+                          </>
+                        )}
+                      </Button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+// ── Share ────────────────────────────────────────────────────────────────
+
+function ShareDialog({ dashboard, onClose }: { dashboard: Dashboard; onClose: () => void }) {
+  const projectId = useProjectId();
+  const queryClient = useQueryClient();
+  const shares = useQuery(sharesQuery(projectId));
+  const mine = (shares.data ?? []).filter((s) => s.object_type === "dashboard" && s.object_id === dashboard.id);
+  const url = (token: string) => `${window.location.origin}/share/${token}`;
+
+  const create = useMutation({
+    mutationFn: () => api.createShare(projectId, "dashboard", dashboard.id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: qk.shares(projectId) }),
+    onError: (e) => toast(errorMessage(e), true),
+  });
+  const revoke = useMutation({
+    mutationFn: (id: string) => api.deleteShare(projectId, id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: qk.shares(projectId) });
+      toast("Share link revoked");
+    },
+    onError: (e) => toast(errorMessage(e), true),
+  });
+
+  return (
+    <AppDialog
+      title={`Share “${dashboard.name}”`}
+      description="Anyone with a share link can view this dashboard without signing in. Revoke a link to cut access immediately."
+      onClose={onClose}
+    >
+      <div className="flex flex-col gap-4">
+        {shares.error && !shares.data ? <ErrorState error={shares.error} retry={() => void shares.refetch()} compact /> : null}
+        {shares.isPending ? <Skeleton className="h-16" /> : null}
         {mine.map((s) => (
-          <div key={s.id} className="col" style={{ gap: 6 }}>
-            <div className="token-box">
-              <code>{url(s.token)}</code>
+          <div key={s.id} className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-2 rounded-lg bg-muted py-1.5 pr-1.5 pl-3">
+              <code className="min-w-0 flex-1 truncate font-mono text-[12.5px]">{url(s.token)}</code>
               <CopyButton text={url(s.token)} />
             </div>
-            <div className="row small muted">
+            <div className="flex items-center text-xs text-muted-foreground">
               Created {fmtRelative(s.created_at)}
-              <span className="spacer" />
-              <button
-                className="btn ghost small danger"
-                onClick={async () => {
-                  try {
-                    await api.deleteShare(projectId, s.id);
-                    invalidate(`shares:${projectId}`);
-                    shares.reload();
-                    toast("Share link revoked");
-                  } catch (e) {
-                    toast(errorMessage(e), true);
-                  }
-                }}
+              <span className="flex-1" />
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-destructive hover:text-destructive"
+                disabled={revoke.isPending}
+                onClick={() => revoke.mutate(s.id)}
+                aria-label="Revoke share link"
               >
                 Revoke
-              </button>
+              </Button>
             </div>
           </div>
         ))}
         {shares.data && mine.length === 0 && (
-          <button
-            className="btn primary"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                await api.createShare(projectId, "dashboard", dashboard.id);
-                invalidate(`shares:${projectId}`);
-                shares.reload();
-              } catch (e) {
-                toast(errorMessage(e), true);
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
+          <Button className="self-start" disabled={create.isPending} onClick={() => create.mutate()}>
             <Icon name="share" size={14} /> Create share link
-          </button>
+          </Button>
         )}
       </div>
-    </Modal>
+    </AppDialog>
   );
 }
 
-export function DashboardPage({ id }: { id: string }) {
+// ── Detail ───────────────────────────────────────────────────────────────
+
+function tileInputs(tiles: DashboardTile[]): TileInput[] {
+  return tiles.map(({ insight_id, x, y, w, h }) => ({ insight_id, x, y, w, h }));
+}
+
+export function DashboardPage() {
+  const { id } = dashboardRoute.useParams();
   const projectId = useProjectId();
   const path = usePath();
   const { organization } = useApp();
   const editable = canEdit(organization);
-  const { data, error, setData, reload } = useApi(`dashboard:${projectId}:${id}`, (s) => api.dashboard(projectId, id, s), { keepPrevious: false });
+  const queryClient = useQueryClient();
+  const [gone, setGone] = useState(false);
+  const { data, error, refetch } = useQuery({ ...dashboardQuery(projectId, id), enabled: !gone });
   const [range, setRange] = useState<RangeValue | null>(null);
   const [sharing, setSharing] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [adding, setAdding] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const detailKey = qk.dashboard(projectId, id);
 
-  if (error) {
+  /** Tile edits: optimistic in the cache, rolled back if the server says no. */
+  const saveTiles = useMutation({
+    mutationFn: (next: DashboardTile[]) => api.replaceTiles(projectId, id, tileInputs(next)),
+    onMutate: async (next) => {
+      await queryClient.cancelQueries({ queryKey: detailKey });
+      const prev = queryClient.getQueryData<Dashboard>(detailKey);
+      if (prev) queryClient.setQueryData<Dashboard>(detailKey, { ...prev, tiles: next });
+      return { prev };
+    },
+    onError: (e, _next, ctx) => {
+      if (ctx?.prev) queryClient.setQueryData(detailKey, ctx.prev);
+      toast(errorMessage(e), true);
+    },
+    onSuccess: (updated, next) => {
+      queryClient.setQueryData<Dashboard>(detailKey, {
+        ...updated,
+        tiles: updated.tiles.map((t) => ({ ...t, insight: t.insight ?? next.find((n) => n.insight_id === t.insight_id)?.insight })),
+      });
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: qk.dashboards(projectId) }),
+  });
+
+  const rename = useMutation({
+    mutationFn: (name: string) => api.renameDashboard(projectId, id, name),
+    onMutate: async (name) => {
+      await queryClient.cancelQueries({ queryKey: detailKey });
+      const prev = queryClient.getQueryData<Dashboard>(detailKey);
+      if (prev) queryClient.setQueryData<Dashboard>(detailKey, { ...prev, name });
+      return { prev };
+    },
+    onError: (e, _name, ctx) => {
+      if (ctx?.prev) queryClient.setQueryData(detailKey, ctx.prev);
+      toast(errorMessage(e), true);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: qk.dashboards(projectId) }),
+  });
+
+  const tiles = useMemo(() => [...(data?.tiles ?? [])].sort((a, b) => a.y - b.y || a.x - b.x), [data]);
+
+  if (error && !data) {
     return (
-      <div className="page">
-        <ErrorState error={error} retry={reload} />
-      </div>
+      <Page>
+        <Panel>
+          <ErrorState error={error} retry={() => void refetch()} />
+        </Panel>
+      </Page>
     );
   }
   if (!data) {
     return (
-      <div className="page">
-        <Skeleton height={28} width={280} />
-        <div className="dash-grid mt-24">
+      <Page>
+        <Skeleton className="mb-6 h-7 w-72" />
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
           {[0, 1, 2].map((i) => (
-            <div key={i} className="card" style={{ gridColumn: "span 4", gridRow: "span 3" }}>
-              <div style={{ padding: 16 }}>
+            <Panel key={i} className="lg:col-span-4">
+              <div className="p-4">
                 <ChartSkeleton height={280} />
               </div>
-            </div>
+            </Panel>
           ))}
         </div>
-      </div>
+      </Page>
     );
   }
 
-  const tiles = [...data.tiles].sort((a, b) => a.y - b.y || a.x - b.x);
-  const saveTiles = async (next: DashboardTile[]) => {
-    const prev = data;
-    setData({ ...data, tiles: next });
-    try {
-      const updated = await api.replaceTiles(
-        projectId,
-        id,
-        next.map(({ insight_id, x, y, w, h }) => ({ insight_id, x, y, w, h })),
-      );
-      setData({ ...updated, tiles: updated.tiles.map((t) => ({ ...t, insight: t.insight ?? next.find((n) => n.insight_id === t.insight_id)?.insight })) });
-      invalidate(`dashboards:${projectId}`);
-    } catch (e) {
-      setData(prev);
-      toast(errorMessage(e), true);
-    }
+  const move = (index: number, delta: -1 | 1) => {
+    const next = [...tiles];
+    const [item] = next.splice(index, 1);
+    next.splice(index + delta, 0, item);
+    // Order is (y, x): renumber so the new order is explicit.
+    saveTiles.mutate(next.map((t, i) => ({ ...t, x: 0, y: i })));
+  };
+  const addInsight = (insight: SavedInsight) => {
+    const y = tiles.reduce((m, t) => Math.max(m, t.y), -1) + 1;
+    saveTiles.mutate([...tiles, { insight_id: insight.id, x: 0, y, w: 6, h: 3, insight }]);
   };
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="titles">
-          <div className="row small muted" style={{ marginBottom: 2 }}>
-            <Link to={path("dashboards")} className="link">
-              Dashboards
-            </Link>
-            <Icon name="chevronRight" size={12} />
-          </div>
-          <h1>
-            {editable ? (
-              <InlineEdit
-                value={data.name}
-                ariaLabel="Dashboard name"
-                onSave={async (name) => {
-                  try {
-                    const d = await api.renameDashboard(projectId, id, name);
-                    setData({ ...data, name: d.name });
-                    invalidate(`dashboards:${projectId}`);
-                  } catch (e) {
-                    toast(errorMessage(e), true);
-                  }
-                }}
-              />
-            ) : (
-              data.name
+    <Page>
+      <Breadcrumb className="mb-1">
+        <BreadcrumbList>
+          <BreadcrumbItem>
+            <BreadcrumbLink render={<Link to={path("dashboards")} />}>Dashboards</BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbPage className="max-w-64 truncate">{data.name}</BreadcrumbPage>
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
+      <PageHeader
+        title={editable ? <InlineEdit value={data.name} ariaLabel="Dashboard name" onSave={(name) => rename.mutate(name)} /> : data.name}
+        actions={
+          <>
+            <DateRangePicker value={range ?? { date_from: "-7d", date_to: null }} onChange={setRange} />
+            {range && (
+              <Button variant="ghost" size="sm" onClick={() => setRange(null)} title="Use each insight's own date range">
+                Reset dates
+              </Button>
             )}
-          </h1>
-        </div>
-        <div className="actions">
-          <DateRangePicker value={range ?? { date_from: "-7d", date_to: null }} onChange={setRange} />
-          {range && (
-            <button className="btn ghost small" onClick={() => setRange(null)} title="Use each insight's own date range">
-              Reset dates
-            </button>
-          )}
-          <button className="btn icon" onClick={() => setRefreshKey((k) => k + 1)} title="Recompute every tile" aria-label="Refresh all">
-            <Icon name="refresh" />
-          </button>
-          {editable && (
-            <button className="btn" onClick={() => setSharing(true)}>
-              <Icon name="share" size={14} /> Share
-            </button>
-          )}
-          {editable && (
-            <MenuButton label={<Icon name="more" />} className="btn icon" align="end" title="More actions">
-              {(close) => (
-                <button
-                  className="menu-item danger"
-                  onClick={() => {
-                    close();
-                    setDeleting(true);
-                  }}
-                >
-                  <Icon name="trash" size={14} /> Delete dashboard
-                </button>
-              )}
-            </MenuButton>
-          )}
-        </div>
-      </div>
+            <Button variant="outline" size="icon" onClick={() => setRefreshKey((k) => k + 1)} title="Recompute every tile" aria-label="Refresh all tiles">
+              <Icon name="refresh" />
+            </Button>
+            {editable && (
+              <Button variant="outline" onClick={() => setAdding(true)}>
+                <Icon name="plus" size={14} /> Add insight
+              </Button>
+            )}
+            {editable && (
+              <Button variant="outline" onClick={() => setSharing(true)}>
+                <Icon name="share" size={14} /> Share
+              </Button>
+            )}
+            {editable && (
+              <DropdownMenu>
+                <DropdownMenuTrigger render={<Button variant="outline" size="icon" aria-label="More dashboard actions" />}>
+                  <Icon name="more" />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem variant="destructive" onClick={() => setDeleting(true)}>
+                    <Icon name="trash" size={14} /> Delete dashboard
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          </>
+        }
+      />
 
-      {!range && tiles.length > 0 && <p className="muted small" style={{ marginTop: -8, marginBottom: 12 }}>Each tile uses its own date range. Pick a range above to override all tiles.</p>}
+      {!range && tiles.length > 0 && <p className="-mt-2 mb-3 text-xs text-muted-foreground">Each tile uses its own date range. Pick a range above to override all tiles.</p>}
 
       {tiles.length === 0 ? (
-        <div className="card">
-          <Empty icon="dashboard" title="This dashboard is empty" action={<Link className="btn primary" to={path("insights")}>Go to insights</Link>}>
-            Open any insight and choose “Add to dashboard” to pin it here.
+        <Panel>
+          <Empty
+            icon="dashboard"
+            title="This dashboard is empty"
+            action={
+              <div className="flex flex-wrap justify-center gap-2">
+                {editable && (
+                  <Button onClick={() => setAdding(true)}>
+                    <Icon name="plus" size={14} /> Add insight
+                  </Button>
+                )}
+                <Button variant="outline" nativeButton={false} render={<Link to={path("insights")} />}>
+                  Go to insights
+                </Button>
+              </div>
+            }
+          >
+            Add a saved insight here, or open any insight and choose “Add to dashboard”.
           </Empty>
-        </div>
+        </Panel>
       ) : (
-        <div className="dash-grid">
+        <div className={cn("grid grid-cols-12 gap-4 [grid-auto-flow:dense] auto-rows-[110px]", saveTiles.isPending && "opacity-95")}>
           {tiles.map((t, i) => (
             <Tile
               key={`${t.insight_id}-${i}`}
@@ -390,14 +609,18 @@ export function DashboardPage({ id }: { id: string }) {
               range={range}
               editable={editable}
               refreshKey={refreshKey}
-              onRemove={() => saveTiles(tiles.filter((_, j) => j !== i))}
-              onResize={(w, h) => saveTiles(tiles.map((x, j) => (j === i ? { ...x, w, h } : x)))}
+              first={i === 0}
+              last={i === tiles.length - 1}
+              onRemove={() => saveTiles.mutate(tiles.filter((_, j) => j !== i))}
+              onResize={(w, h) => saveTiles.mutate(tiles.map((x, j) => (j === i ? { ...x, w, h } : x)))}
+              onMove={(delta) => move(i, delta)}
             />
           ))}
         </div>
       )}
 
-      {sharing && <ShareModal dashboard={data} onClose={() => setSharing(false)} />}
+      {adding && <AddInsightSheet existing={new Set(tiles.map((t) => t.insight_id))} onAdd={addInsight} onClose={() => setAdding(false)} />}
+      {sharing && <ShareDialog dashboard={data} onClose={() => setSharing(false)} />}
       {deleting && (
         <Confirm
           title="Delete dashboard?"
@@ -407,12 +630,14 @@ export function DashboardPage({ id }: { id: string }) {
           onClose={() => setDeleting(false)}
           onConfirm={async () => {
             await api.deleteDashboard(projectId, id);
-            invalidate(`dashboards:${projectId}`);
+            setGone(true);
+            await queryClient.invalidateQueries({ queryKey: qk.dashboards(projectId), exact: true });
             toast("Dashboard deleted");
             navigate(path("dashboards"));
+            queryClient.removeQueries({ queryKey: detailKey, exact: true });
           }}
         />
       )}
-    </div>
+    </Page>
   );
 }

@@ -1,5 +1,7 @@
 import { useState } from "react";
-import { fmtNumber, fmtPercent } from "../lib/format";
+import { fmtNumber, fmtPercent } from "@/lib/format";
+import { cn } from "@/lib/utils";
+import { Swatch } from "./parts";
 
 export interface Slice {
   key: string;
@@ -8,7 +10,10 @@ export interface Slice {
   color: string;
 }
 
-/** Donut with a 2px surface gap between slices and a legend with values. */
+/**
+ * Donut with a 2px card-coloured gap between slices and a legend with values.
+ * The legend rows are real buttons: they are the keyboard path to each slice.
+ */
 export function PieChart({ slices, onSliceClick, size = 220 }: { slices: Slice[]; onSliceClick?: (index: number) => void; size?: number }) {
   const [hover, setHover] = useState<number | null>(null);
   const total = slices.reduce((a, s) => a + Math.max(0, s.value), 0);
@@ -30,28 +35,33 @@ export function PieChart({ slices, onSliceClick, size = 220 }: { slices: Slice[]
     return { d, i, frac };
   });
   const focus = hover !== null ? slices[hover] : null;
+  const summary = `Donut chart, ${fmtNumber(total)} total: ${slices
+    .slice(0, 6)
+    .map((s) => `${s.label} ${fmtPercent(total ? (s.value / total) * 100 : 0)}`)
+    .join(", ")}${slices.length > 6 ? `, and ${slices.length - 6} more` : ""}.`;
   return (
-    <div className="row gap-24 wrap" style={{ alignItems: "center", justifyContent: "center" }}>
+    <div className="flex flex-wrap items-center justify-center gap-6">
       <div className="chart" style={{ width: size }}>
-        <svg width={size} height={size} role="img" aria-label="Pie chart">
+        <svg width={size} height={size} role="img" aria-label={summary}>
           {arcs.map(({ d, i, frac }) =>
             frac > 0 ? (
               <path
                 key={i}
                 d={d}
                 fill={slices[i].color}
-                stroke="var(--surface)"
+                stroke="var(--card)"
                 strokeWidth={2}
                 fillRule="evenodd"
                 opacity={hover === null || hover === i ? 1 : 0.45}
-                style={{ cursor: onSliceClick ? "pointer" : "default", transition: "opacity .12s" }}
+                className="transition-opacity duration-100 motion-reduce:transition-none"
+                style={{ cursor: onSliceClick ? "pointer" : "default" }}
                 onPointerEnter={() => setHover(i)}
                 onPointerLeave={() => setHover(null)}
                 onClick={() => onSliceClick?.(i)}
               />
             ) : null,
           )}
-          <text x={c} y={c - 6} textAnchor="middle" style={{ fontSize: 20, fontWeight: 650, fill: "var(--ink)" }}>
+          <text x={c} y={c - 6} textAnchor="middle" style={{ fontSize: 20, fontWeight: 650, fill: "var(--foreground)" }}>
             {fmtNumber(focus ? focus.value : total)}
           </text>
           <text x={c} y={c + 14} textAnchor="middle">
@@ -59,19 +69,26 @@ export function PieChart({ slices, onSliceClick, size = 220 }: { slices: Slice[]
           </text>
         </svg>
       </div>
-      <div className="col" style={{ gap: 4, minWidth: 200, maxWidth: 360 }}>
+      <div className="flex max-w-90 min-w-50 flex-col gap-1">
         {slices.map((s, i) => (
           <button
             key={s.key}
-            className="menu-item"
-            data-active={hover === i}
+            type="button"
             onPointerEnter={() => setHover(i)}
             onPointerLeave={() => setHover(null)}
+            onFocus={() => setHover(i)}
+            onBlur={() => setHover(null)}
             onClick={() => onSliceClick?.(i)}
+            title={onSliceClick ? `${s.label}: click to see persons` : s.label}
+            className={cn(
+              "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none",
+              onSliceClick ? "hover:bg-muted" : "cursor-default",
+              hover === i && "bg-muted",
+            )}
           >
-            <span className="swatch" style={{ background: s.color }} />
-            <span className="truncate">{s.label}</span>
-            <span className="meta">
+            <Swatch color={s.color} />
+            <span className="min-w-0 flex-1 truncate">{s.label}</span>
+            <span className="num text-xs text-muted-foreground">
               {fmtNumber(s.value)} · {fmtPercent(total ? (s.value / total) * 100 : 0)}
             </span>
           </button>
@@ -85,23 +102,29 @@ export function PieChart({ slices, onSliceClick, size = 220 }: { slices: Slice[]
 export function HBarList({ rows, format = fmtNumber, onClick }: { rows: Slice[]; format?: (n: number) => string; onClick?: (index: number) => void }) {
   const max = Math.max(1, ...rows.map((r) => Math.abs(r.value)));
   return (
-    <div className="col" style={{ gap: 10 }}>
+    <ul className="flex flex-col gap-2.5" aria-label="Values by series">
       {rows.map((r, i) => (
-        <button
-          key={r.key}
-          onClick={() => onClick?.(i)}
-          style={{ border: 0, background: "none", padding: 0, font: "inherit", color: "inherit", textAlign: "left", cursor: onClick ? "pointer" : "default" }}
-        >
-          <div className="row" style={{ marginBottom: 4, fontSize: 13 }}>
-            <span className="swatch" style={{ background: r.color }} />
-            <span className="truncate grow">{r.label}</span>
-            <b className="num">{format(r.value)}</b>
-          </div>
-          <div style={{ height: 14, borderRadius: 4, background: "var(--surface-2)" }}>
-            <div style={{ width: `${(Math.abs(r.value) / max) * 100}%`, height: "100%", borderRadius: "0 4px 4px 0", background: r.color }} />
-          </div>
-        </button>
+        <li key={r.key}>
+          <button
+            type="button"
+            onClick={() => onClick?.(i)}
+            title={onClick ? `${r.label}: click to see persons` : r.label}
+            className={cn(
+              "block w-full rounded-md p-1 text-left focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none",
+              onClick ? "hover:bg-muted/60" : "cursor-default",
+            )}
+          >
+            <div className="mb-1 flex items-center gap-2 text-[13px]">
+              <Swatch color={r.color} />
+              <span className="min-w-0 flex-1 truncate">{r.label}</span>
+              <b className="num">{format(r.value)}</b>
+            </div>
+            <div className="h-3.5 rounded bg-muted">
+              <div className="h-full rounded-r" style={{ width: `${(Math.abs(r.value) / max) * 100}%`, background: r.color }} />
+            </div>
+          </button>
+        </li>
       ))}
-    </div>
+    </ul>
   );
 }

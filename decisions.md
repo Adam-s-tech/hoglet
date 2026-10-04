@@ -133,3 +133,9 @@ params), Query (all API calls), Table, Form, Virtual — client-only, no Start/S
 Bundle budget: ≤ 260 KB gzipped JS with route-level splitting. Charts
 stay hand-written SVG: no charting library, no recharts. `web/dist/` stays
 committed so `cargo build` needs no Node.
+
+Data and routing layer (boss, 2026-10-05): TanStack Router (client-only, code-based,
+lazy pages), Query, Table, Form and Virtual; no Start, no SSR, devtools dev-only.
+Measured after the migration: login/boot paint ~146 KB gz JS + 25 KB gz CSS, all
+chunks ~357 KB gz JS (320 KB as one file). The 260 KB total target was not met; the
+remainder is react-dom, Base UI, the TanStack set and app code, not duplication.

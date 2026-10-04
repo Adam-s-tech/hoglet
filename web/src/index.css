@@ -1,0 +1,322 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* Hoglet — calm, precise, numbers you can trust.
+   shadcn/ui (Base UI) tokens on warm paper neutrals with one chestnut brand
+   colour. Light is the default; `.dark` on <html> switches the whole set. */
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-heading: var(--font-sans);
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-brand-wash: var(--brand-wash);
+  --color-good: var(--good);
+  --color-good-wash: var(--good-wash);
+  --color-warn: var(--warn);
+  --color-warn-wash: var(--warn-wash);
+  --color-bad: var(--destructive);
+  --color-bad-wash: var(--bad-wash);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-chart-1: var(--s1);
+  --color-chart-2: var(--s2);
+  --color-chart-3: var(--s3);
+  --color-chart-4: var(--s4);
+  --color-chart-5: var(--s5);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  color-scheme: light;
+  --radius: 0.5rem;
+
+  --background: #f6f5f1;
+  --foreground: #1b1a17;
+  --card: #fdfdfb;
+  --card-foreground: #1b1a17;
+  --popover: #ffffff;
+  --popover-foreground: #1b1a17;
+  --primary: #1b1a17;
+  --primary-foreground: #fdfdfb;
+  --secondary: #eeede7;
+  --secondary-foreground: #1b1a17;
+  --muted: #efeee8;
+  --muted-foreground: #6b6962;
+  --accent: #eceae3;
+  --accent-foreground: #1b1a17;
+  --destructive: #c03434;
+  --border: rgba(27, 26, 23, 0.1);
+  --input: rgba(27, 26, 23, 0.2);
+  --ring: rgba(154, 90, 44, 0.55);
+
+  --brand: #9a5a2c;
+  --brand-foreground: #7c4520;
+  --brand-wash: rgba(154, 90, 44, 0.1);
+  --good: #0a7d0a;
+  --good-wash: rgba(12, 163, 12, 0.1);
+  --warn: #8f5a00;
+  --warn-wash: rgba(250, 178, 25, 0.16);
+  --bad-wash: rgba(208, 59, 59, 0.1);
+
+  --sidebar: #f6f5f1;
+  --sidebar-foreground: #1b1a17;
+  --sidebar-border: rgba(27, 26, 23, 0.1);
+  --sidebar-accent: #fdfdfb;
+  --sidebar-accent-foreground: #1b1a17;
+
+  /* Chart tokens (src/charts). Categorical series, sequential ramp, grid. */
+  --grid: #e7e5de;
+  --axis: #c3c2b7;
+  --s1: #2a78d6;
+  --s2: #eb6834;
+  --s3: #1baf7a;
+  --s4: #eda100;
+  --s5: #e87ba4;
+  --s6: #008300;
+  --s7: #4a3aa7;
+  --s8: #e34948;
+  --seq-0: #eef4fc;
+  --seq-1: #cde2fb;
+  --seq-2: #9ec5f4;
+  --seq-3: #6da7ec;
+  --seq-4: #3987e5;
+  --seq-5: #256abf;
+  --seq-6: #184f95;
+  --seq-fg-0: var(--foreground);
+  --seq-fg-1: var(--foreground);
+  --seq-fg-2: var(--foreground);
+  --seq-fg-3: #0b0b0b;
+  --seq-fg-4: #fff;
+  --seq-fg-5: #fff;
+  --seq-fg-6: #fff;
+}
+
+.dark {
+  color-scheme: dark;
+
+  --background: #0f0f0e;
+  --foreground: #f4f3ee;
+  --card: #1a1a19;
+  --card-foreground: #f4f3ee;
+  --popover: #20201e;
+  --popover-foreground: #f4f3ee;
+  --primary: #f4f3ee;
+  --primary-foreground: #141413;
+  --secondary: #2a2a28;
+  --secondary-foreground: #f4f3ee;
+  --muted: #222220;
+  --muted-foreground: #a09e96;
+  --accent: #2c2c2a;
+  --accent-foreground: #f4f3ee;
+  --destructive: #ef7272;
+  --border: rgba(255, 255, 255, 0.09);
+  --input: rgba(255, 255, 255, 0.16);
+  --ring: rgba(214, 145, 92, 0.6);
+
+  --brand: #d6915c;
+  --brand-foreground: #e3a575;
+  --brand-wash: rgba(214, 145, 92, 0.14);
+  --good: #3cc23c;
+  --good-wash: rgba(12, 163, 12, 0.16);
+  --warn: #f2b33d;
+  --warn-wash: rgba(250, 178, 25, 0.14);
+  --bad-wash: rgba(230, 103, 103, 0.14);
+
+  --sidebar: #0f0f0e;
+  --sidebar-foreground: #f4f3ee;
+  --sidebar-border: rgba(255, 255, 255, 0.09);
+  --sidebar-accent: #222220;
+  --sidebar-accent-foreground: #f4f3ee;
+
+  --grid: #2c2c2a;
+  --axis: #43433f;
+  --s1: #3987e5;
+  --s2: #d95926;
+  --s3: #199e70;
+  --s4: #c98500;
+  --s5: #d55181;
+  --s6: #008300;
+  --s7: #9085e9;
+  --s8: #e66767;
+  --seq-0: #1e2632;
+  --seq-1: #184f95;
+  --seq-2: #1c5cab;
+  --seq-3: #256abf;
+  --seq-4: #2a78d6;
+  --seq-5: #5598e7;
+  --seq-6: #86b6ef;
+  --seq-fg-1: #fff;
+  --seq-fg-2: #fff;
+  --seq-fg-3: #fff;
+  --seq-fg-4: #fff;
+  --seq-fg-5: #0b0b0b;
+  --seq-fg-6: #0b0b0b;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    scrollbar-gutter: stable;
+  }
+  body {
+    @apply bg-background text-sm leading-[1.45] text-foreground;
+    overflow-y: scroll;
+  }
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply font-semibold tracking-tight;
+  }
+  h1 {
+    @apply text-[22px];
+  }
+  h2 {
+    @apply text-base;
+  }
+  h3 {
+    @apply text-sm;
+  }
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+  code,
+  pre {
+    @apply font-mono text-[12.5px];
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  ::selection {
+    background: var(--brand-wash);
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes hoglet-loading {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
+
+/* ── Charts (hand-written SVG in src/charts) ─────────────────────────────
+   Everything below is driven by the tokens above; no chart library. */
+
+.chart {
+  position: relative;
+  width: 100%;
+  user-select: none;
+}
+.chart svg {
+  display: block;
+  overflow: visible;
+}
+.chart text {
+  fill: var(--muted-foreground);
+  font-size: 11px;
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+}
+.chart .gridline {
+  stroke: var(--grid);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+.chart .baseline {
+  stroke: var(--axis);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+.chart .crosshair {
+  stroke: var(--muted-foreground);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  pointer-events: none;
+}
+.chart .hit {
+  fill: transparent;
+  cursor: pointer;
+}
+
+/* Paths (Sankey) */
+.chart .sankey-node rect {
+  rx: 2;
+}
+.chart .sankey-link {
+  fill: none;
+  stroke-opacity: 0.22;
+  transition: stroke-opacity 0.12s;
+}
+.chart .sankey-link.hot {
+  stroke-opacity: 0.55;
+}
+.chart .sankey-link.dim {
+  stroke-opacity: 0.07;
+}
+.chart text.node-label {
+  fill: var(--foreground);
+  font-size: 11.5px;
+}
+.chart text.node-count {
+  fill: var(--muted-foreground);
+  font-size: 10.5px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chart .sankey-link {
+    transition: none;
+  }
+}

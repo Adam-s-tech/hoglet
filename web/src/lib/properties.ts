@@ -95,3 +95,14 @@ export function describeFilter(f: PropertyFilter): { key: string; op: string; va
   const info = operatorInfo(f.operator);
   return { key: propertyLabel(f.key), op: info.label, value: info.needsValue ? filterValueText(f.value) : "" };
 }
+
+/** Drop half-built filters before a query is sent. */
+export function completeFilters(filters: PropertyFilter[]): PropertyFilter[] {
+  return filters.filter((f) => {
+    if (!f.key) return false;
+    const info = operatorInfo(f.operator);
+    if (!info.needsValue) return true;
+    if (Array.isArray(f.value)) return f.value.length > 0;
+    return f.value !== null && f.value !== "";
+  });
+}

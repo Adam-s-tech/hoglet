@@ -1,29 +1,51 @@
 // The query editor panel, one section per concern, for every InsightQuery kind.
 
-import { useState, type ReactNode } from "react";
-import type { EventNode } from "../types/EventNode";
-import type { FunnelsQuery } from "../types/FunnelsQuery";
-import type { InsightQuery } from "../types/InsightQuery";
-import type { Math as MathKind } from "../types/Math";
-import type { PathsQuery } from "../types/PathsQuery";
-import type { RetentionQuery } from "../types/RetentionQuery";
-import type { WindowUnit } from "../types/WindowUnit";
-import { seriesColor } from "../charts/scale";
-import { eventLabel } from "../lib/properties";
-import { Icon } from "../ui/icons";
-import { Seg } from "../ui/kit";
+import { useId, useState, type ReactNode } from "react";
+import type { EventNode } from "@/types/EventNode";
+import type { FunnelsQuery } from "@/types/FunnelsQuery";
+import type { InsightQuery } from "@/types/InsightQuery";
+import type { Math as MathKind } from "@/types/Math";
+import type { PathsQuery } from "@/types/PathsQuery";
+import type { RetentionQuery } from "@/types/RetentionQuery";
+import type { WindowUnit } from "@/types/WindowUnit";
+import { seriesColor } from "@/charts/scale";
+import { Seg } from "@/components/controls";
+import { Icon, type IconName } from "@/components/icons";
+import { StatLabel } from "@/components/page";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Slider } from "@/components/ui/slider";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { eventLabel } from "@/lib/properties";
 import { MATHS, PROPERTY_MATHS, eventNode, letter } from "./defaults";
-import { BreakdownPicker, EventPicker, PropertyFilters, PropertyPicker } from "./pickers";
+import { BreakdownPicker, EventPicker, OptionSelect, PropertyFilters, PropertyPicker } from "./pickers";
 
 function Section({ label, children, aside }: { label: string; children: ReactNode; aside?: ReactNode }) {
+  const id = useId();
   return (
-    <div className="editor-section">
-      <div className="row" style={{ marginBottom: 8 }}>
-        <span className="label grow">{label}</span>
+    <section aria-labelledby={id} className="border-b px-4 py-3.5 last:border-b-0">
+      <div className="mb-2 flex min-h-6 items-center gap-2">
+        <StatLabel id={id} className="flex-1">
+          {label}
+        </StatLabel>
         {aside}
       </div>
       {children}
-    </div>
+    </section>
+  );
+}
+
+/** Icon-only button with a tooltip (shown on hover and on keyboard focus). */
+function IconAction({ label, icon, onClick, pressed }: { label: string; icon: IconName; onClick: () => void; pressed?: boolean }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={<Button variant={pressed ? "secondary" : "ghost"} size="icon-xs" aria-label={label} aria-pressed={pressed} onClick={onClick} />}
+      >
+        <Icon name={icon} size={13} />
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -50,76 +72,58 @@ function SeriesRow({
   const [renaming, setRenaming] = useState(false);
   const propertyMath = PROPERTY_MATHS.includes(node.math);
   return (
-    <div className="series-row">
-      <div className="row" style={{ gap: 6 }}>
+    <div className="group/series -mx-2 mb-1 flex flex-col gap-1.5 rounded-lg p-2 hover:bg-muted/40 focus-within:bg-muted/40">
+      <div className="flex items-center gap-1.5">
         {mode === "funnel" ? (
-          <span className="letter" style={{ background: "var(--surface-3)", color: "var(--ink-2)", borderRadius: "50%" }}>
+          <span className="num grid size-5 flex-none place-items-center rounded-full bg-muted text-[11px] font-semibold text-muted-foreground" aria-hidden="true">
             {index + 1}
           </span>
         ) : (
-          <span className="letter" style={{ background: seriesColor(index) }}>
+          <span className="grid size-5 flex-none place-items-center rounded-[5px] text-[11px] font-semibold text-white" style={{ background: seriesColor(index) }} aria-hidden="true">
             {letter(index)}
           </span>
         )}
-        <EventPicker value={node.event} onChange={(event) => onChange({ ...node, event })} allowAll={mode !== "funnel" || index > 0} />
-        <div className="row row-actions" style={{ gap: 0 }}>
-          <button className="btn ghost icon small" title="Filter this series" aria-label="Filter this series" onClick={() => setShowFilters((v) => !v)} aria-pressed={showFilters}>
-            <Icon name="filter" size={13} />
-          </button>
-          <button className="btn ghost icon small" title="Rename" aria-label="Rename series" onClick={() => setRenaming((v) => !v)}>
-            <Icon name="edit" size={13} />
-          </button>
-          <button className="btn ghost icon small" title="Duplicate" aria-label="Duplicate series" onClick={onDuplicate}>
-            <Icon name="copy" size={13} />
-          </button>
-          {canRemove && (
-            <button className="btn ghost icon small" title="Remove" aria-label="Remove series" onClick={onRemove}>
-              <Icon name="trash" size={13} />
-            </button>
-          )}
+        <div className="min-w-0 flex-1">
+          <EventPicker value={node.event} onChange={(event) => onChange({ ...node, event })} allowAll={mode !== "funnel" || index > 0} />
+        </div>
+        <div className="flex flex-none items-center opacity-0 transition-opacity group-focus-within/series:opacity-100 group-hover/series:opacity-100 pointer-coarse:opacity-100">
+          <IconAction label="Filter this series" icon="filter" pressed={showFilters} onClick={() => setShowFilters((v) => !v)} />
+          <IconAction label="Rename series" icon="edit" pressed={renaming} onClick={() => setRenaming((v) => !v)} />
+          <IconAction label="Duplicate series" icon="copy" onClick={onDuplicate} />
+          {canRemove && <IconAction label="Remove series" icon="trash" onClick={onRemove} />}
         </div>
       </div>
       {renaming && (
-        <input
-          className="input small"
-          style={{ marginLeft: 26 }}
+        <Input
+          className="ml-[26px] h-7 w-auto"
           autoFocus
           placeholder={eventLabel(node.event)}
           value={node.custom_name ?? ""}
           onChange={(e) => onChange({ ...node, custom_name: e.target.value || null })}
-          onKeyDown={(e) => e.key === "Enter" && setRenaming(false)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === "Escape") setRenaming(false);
+          }}
           aria-label="Series name"
         />
       )}
       {mode === "trends" && (
-        <div className="row" style={{ marginLeft: 26, gap: 6 }}>
-          <select
-            className="select small"
+        <div className="ml-[26px] flex items-center gap-1.5">
+          <OptionSelect<MathKind>
+            label="Aggregation"
+            className={propertyMath ? "flex-none" : "flex-1"}
             value={node.math}
-            aria-label="Aggregation"
-            onChange={(e) => {
-              const math = e.target.value as MathKind;
-              onChange({ ...node, math, math_property: PROPERTY_MATHS.includes(math) ? node.math_property : null });
-            }}
-            style={{ flex: propertyMath ? "0 0 auto" : 1 }}
-          >
-            {(["Events", "Users", "Sessions", "Property"] as const).map((g) => (
-              <optgroup key={g} label={g}>
-                {MATHS.filter((m) => m.group === g).map((m) => (
-                  <option key={m.value} value={m.value}>
-                    {m.label}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
+            options={MATHS.map((m) => ({ value: m.value, label: m.label, group: m.group }))}
+            onChange={(math) => onChange({ ...node, math, math_property: PROPERTY_MATHS.includes(math) ? node.math_property : null })}
+          />
           {propertyMath && (
-            <PropertyPicker value={node.math_property} numericOnly sources={["event"]} placeholder="of property…" onChange={(key) => onChange({ ...node, math_property: key })} />
+            <div className="min-w-0 flex-1">
+              <PropertyPicker value={node.math_property} numericOnly sources={["event"]} placeholder="of property…" onChange={(key) => onChange({ ...node, math_property: key })} />
+            </div>
           )}
         </div>
       )}
       {showFilters && (
-        <div style={{ marginLeft: 26 }}>
+        <div className="ml-[26px]">
           <PropertyFilters value={node.properties} onChange={(properties) => onChange({ ...node, properties })} addLabel="Series filter" />
         </div>
       )}
@@ -144,36 +148,38 @@ function SeriesList({ series, onChange, mode, max = 12, addLabel }: { series: Ev
         />
       ))}
       {series.length < max && (
-        <button className="btn ghost small" onClick={() => onChange([...series, eventNode(mode === "funnel" ? null : "$pageview")])}>
+        <Button variant="ghost" size="sm" onClick={() => onChange([...series, eventNode(mode === "funnel" ? null : "$pageview")])}>
           <Icon name="plus" size={13} /> {addLabel}
-        </button>
+        </Button>
       )}
     </div>
   );
 }
 
+const WINDOW_UNITS = ["minute", "hour", "day", "week"] as const;
+
 function FunnelExtras({ q, set }: { q: FunnelsQuery; set: (q: FunnelsQuery) => void }) {
+  const stepOptions = q.series.map((_, s) => ({ value: s, label: String(s + 1) }));
   return (
     <>
       <Section label="Conversion window">
-        <div className="row">
-          <input
-            className="input"
+        <div className="flex items-center gap-1.5">
+          <Input
+            className="w-20 flex-none"
             type="number"
             min={1}
             max={365}
-            style={{ width: 80 }}
             value={q.funnel_window.interval}
             onChange={(e) => set({ ...q, funnel_window: { ...q.funnel_window, interval: Math.max(1, Math.min(365, Number(e.target.value) || 1)) } })}
             aria-label="Window length"
           />
-          <select className="select grow" value={q.funnel_window.unit} onChange={(e) => set({ ...q, funnel_window: { ...q.funnel_window, unit: e.target.value as WindowUnit } })} aria-label="Window unit">
-            {(["minute", "hour", "day", "week"] as const).map((u) => (
-              <option key={u} value={u}>
-                {u}s
-              </option>
-            ))}
-          </select>
+          <OptionSelect<WindowUnit>
+            label="Window unit"
+            className="flex-1"
+            value={q.funnel_window.unit}
+            options={WINDOW_UNITS.map((u) => ({ value: u, label: `${u}s` }))}
+            onChange={(unit) => set({ ...q, funnel_window: { ...q.funnel_window, unit } })}
+          />
         </div>
       </Section>
       <Section label="Step order">
@@ -189,48 +195,43 @@ function FunnelExtras({ q, set }: { q: FunnelsQuery; set: (q: FunnelsQuery) => v
         />
       </Section>
       <Section label="Exclusion steps">
-        <div className="col" style={{ gap: 8 }}>
+        <div className="flex flex-col gap-2">
           {q.exclusions.map((ex, i) => (
-            <div key={i} className="col" style={{ gap: 6 }}>
-              <div className="row">
-                <EventPicker value={ex.event || undefined} allowAll={false} onChange={(event) => set({ ...q, exclusions: q.exclusions.map((x, j) => (j === i ? { ...x, event: event ?? "" } : x)) })} />
-                <button className="btn ghost icon small" aria-label="Remove exclusion" onClick={() => set({ ...q, exclusions: q.exclusions.filter((_, j) => j !== i) })}>
-                  <Icon name="x" size={13} />
-                </button>
+            <div key={i} className="flex flex-col gap-1.5">
+              <div className="flex items-center gap-1.5">
+                <div className="min-w-0 flex-1">
+                  <EventPicker value={ex.event || undefined} allowAll={false} onChange={(event) => set({ ...q, exclusions: q.exclusions.map((x, j) => (j === i ? { ...x, event: event ?? "" } : x)) })} />
+                </div>
+                <IconAction label="Remove exclusion" icon="x" onClick={() => set({ ...q, exclusions: q.exclusions.filter((_, j) => j !== i) })} />
               </div>
-              <div className="row small secondary">
+              <div className="flex items-center gap-1.5 text-muted-foreground">
                 between step
-                <select
-                  className="select small"
+                <OptionSelect
+                  size="sm"
+                  label="From step"
                   value={ex.from_step}
-                  onChange={(e) => set({ ...q, exclusions: q.exclusions.map((x, j) => (j === i ? { ...x, from_step: Number(e.target.value) } : x)) })}
-                  aria-label="From step"
-                >
-                  {q.series.map((_, s) => (
-                    <option key={s} value={s}>
-                      {s + 1}
-                    </option>
-                  ))}
-                </select>
+                  options={stepOptions}
+                  onChange={(from_step) => set({ ...q, exclusions: q.exclusions.map((x, j) => (j === i ? { ...x, from_step } : x)) })}
+                />
                 and
-                <select
-                  className="select small"
+                <OptionSelect
+                  size="sm"
+                  label="To step"
                   value={ex.to_step}
-                  onChange={(e) => set({ ...q, exclusions: q.exclusions.map((x, j) => (j === i ? { ...x, to_step: Number(e.target.value) } : x)) })}
-                  aria-label="To step"
-                >
-                  {q.series.map((_, s) => (
-                    <option key={s} value={s} disabled={s <= ex.from_step}>
-                      {s + 1}
-                    </option>
-                  ))}
-                </select>
+                  options={stepOptions.map((o) => ({ ...o, disabled: o.value <= ex.from_step }))}
+                  onChange={(to_step) => set({ ...q, exclusions: q.exclusions.map((x, j) => (j === i ? { ...x, to_step } : x)) })}
+                />
               </div>
             </div>
           ))}
-          <button className="btn ghost small" style={{ alignSelf: "flex-start" }} onClick={() => set({ ...q, exclusions: [...q.exclusions, { event: "", from_step: 0, to_step: Math.max(1, q.series.length - 1) }] })}>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="self-start"
+            onClick={() => set({ ...q, exclusions: [...q.exclusions, { event: "", from_step: 0, to_step: Math.max(1, q.series.length - 1) }] })}
+          >
             <Icon name="plus" size={13} /> Add exclusion
-          </button>
+          </Button>
         </div>
       </Section>
     </>
@@ -241,30 +242,41 @@ function RetentionEditor({ q, set }: { q: RetentionQuery; set: (q: RetentionQuer
   return (
     <>
       <Section label="Cohort: persons who performed">
-        <div className="col" style={{ gap: 8 }}>
+        <div className="flex flex-col gap-2">
           <EventPicker value={q.target.event} onChange={(event) => set({ ...q, target: { ...q.target, event } })} />
-          <select className="select" value={q.retention_type} onChange={(e) => set({ ...q, retention_type: e.target.value as RetentionQuery["retention_type"] })} aria-label="Cohort type">
-            <option value="retention_recurring">in each period (recurring)</option>
-            <option value="retention_first_time">for the first time</option>
-          </select>
+          <OptionSelect<RetentionQuery["retention_type"]>
+            label="Cohort type"
+            className="w-full"
+            value={q.retention_type}
+            options={[
+              { value: "retention_recurring", label: "in each period (recurring)" },
+              { value: "retention_first_time", label: "for the first time" },
+            ]}
+            onChange={(retention_type) => set({ ...q, retention_type })}
+          />
         </div>
       </Section>
       <Section label="Came back and performed">
         <EventPicker value={q.returning.event} onChange={(event) => set({ ...q, returning: { ...q.returning, event } })} />
       </Section>
       <Section label="Periods">
-        <div className="row">
-          <select className="select grow" value={q.period} onChange={(e) => set({ ...q, period: e.target.value as RetentionQuery["period"] })} aria-label="Period">
-            <option value="day">Daily</option>
-            <option value="week">Weekly</option>
-            <option value="month">Monthly</option>
-          </select>
-          <input
-            className="input"
+        <div className="flex items-center gap-1.5">
+          <OptionSelect<RetentionQuery["period"]>
+            label="Period"
+            className="flex-1"
+            value={q.period}
+            options={[
+              { value: "day", label: "Daily" },
+              { value: "week", label: "Weekly" },
+              { value: "month", label: "Monthly" },
+            ]}
+            onChange={(period) => set({ ...q, period })}
+          />
+          <Input
+            className="w-20 flex-none"
             type="number"
             min={2}
             max={31}
-            style={{ width: 80 }}
             value={q.total_intervals}
             onChange={(e) => set({ ...q, total_intervals: Math.max(2, Math.min(31, Number(e.target.value) || 8)) })}
             aria-label="Number of periods"
@@ -276,6 +288,7 @@ function RetentionEditor({ q, set }: { q: RetentionQuery; set: (q: RetentionQuer
 }
 
 function PathsEditor({ q, set }: { q: PathsQuery; set: (q: PathsQuery) => void }) {
+  const pointPlaceholder = q.paths_type === "custom_events" ? "Event name (any)" : "/path (any)";
   return (
     <>
       <Section label="Path nodes">
@@ -291,56 +304,57 @@ function PathsEditor({ q, set }: { q: PathsQuery; set: (q: PathsQuery) => void }
         />
       </Section>
       <Section label="Starts at">
-        <input className="input" style={{ width: "100%" }} placeholder={q.paths_type === "custom_events" ? "Event name (any)" : "/path (any)"} value={q.start_point ?? ""} onChange={(e) => set({ ...q, start_point: e.target.value || null })} aria-label="Start point" />
+        <Input placeholder={pointPlaceholder} value={q.start_point ?? ""} onChange={(e) => set({ ...q, start_point: e.target.value || null })} aria-label="Start point" />
       </Section>
       <Section label="Ends at">
-        <input className="input" style={{ width: "100%" }} placeholder={q.paths_type === "custom_events" ? "Event name (any)" : "/path (any)"} value={q.end_point ?? ""} onChange={(e) => set({ ...q, end_point: e.target.value || null })} aria-label="End point" />
+        <Input placeholder={pointPlaceholder} value={q.end_point ?? ""} onChange={(e) => set({ ...q, end_point: e.target.value || null })} aria-label="End point" />
       </Section>
-      <Section label="Steps" aside={<span className="num small secondary">{q.step_limit}</span>}>
-        <input type="range" min={2} max={10} value={q.step_limit} onChange={(e) => set({ ...q, step_limit: Number(e.target.value) })} aria-label="Maximum steps" />
+      <Section label="Steps" aside={<span className="num text-muted-foreground">{q.step_limit}</span>}>
+        <Slider label="Maximum steps" min={2} max={10} value={q.step_limit} onValueChange={(step_limit) => set({ ...q, step_limit })} />
       </Section>
       <Section label="Links shown">
-        <select className="select" style={{ width: "100%" }} value={q.edge_limit} onChange={(e) => set({ ...q, edge_limit: Number(e.target.value) })} aria-label="Maximum links">
-          {[20, 50, 100, 200].map((n) => (
-            <option key={n} value={n}>
-              Strongest {n}
-            </option>
-          ))}
-        </select>
+        <OptionSelect
+          label="Maximum links"
+          className="w-full"
+          value={q.edge_limit}
+          options={[20, 50, 100, 200].map((n) => ({ value: n, label: `Strongest ${n}` }))}
+          onChange={(edge_limit) => set({ ...q, edge_limit })}
+        />
       </Section>
     </>
   );
 }
 
 export function QueryEditor({ query, onChange }: { query: InsightQuery; onChange: (q: InsightQuery) => void }) {
-  const filters = "properties" in query ? (
-    <Section label="Filters">
-      <PropertyFilters value={query.properties} onChange={(properties) => onChange({ ...query, properties })} />
-    </Section>
-  ) : null;
+  const filters =
+    "properties" in query ? (
+      <Section label="Filters">
+        <PropertyFilters value={query.properties} onChange={(properties) => onChange({ ...query, properties })} />
+      </Section>
+    ) : null;
 
   switch (query.kind) {
     case "TrendsQuery":
       return (
-        <div className="editor">
+        <div className="flex flex-col">
           <Section label="Series">
             <SeriesList series={query.series} mode="trends" addLabel="Add series" max={8} onChange={(series) => onChange({ ...query, series })} />
           </Section>
           <Section
             label="Formula"
             aside={
-              <button className="btn ghost small" onClick={() => onChange({ ...query, formula: query.formula === null ? (query.series.length > 1 ? "A / B" : "A * 1") : null })}>
+              <Button variant="ghost" size="xs" onClick={() => onChange({ ...query, formula: query.formula === null ? (query.series.length > 1 ? "A / B" : "A * 1") : null })}>
                 {query.formula === null ? "Add" : "Remove"}
-              </button>
+              </Button>
             }
           >
             {query.formula !== null ? (
-              <div className="col" style={{ gap: 4 }}>
-                <input className="input mono" value={query.formula} onChange={(e) => onChange({ ...query, formula: e.target.value })} placeholder="A / B * 100" aria-label="Formula" />
-                <span className="muted small">Use series letters with + − × ÷ and parentheses.</span>
+              <div className="flex flex-col gap-1">
+                <Input className="font-mono" value={query.formula} onChange={(e) => onChange({ ...query, formula: e.target.value })} placeholder="A / B * 100" aria-label="Formula" />
+                <span className="text-muted-foreground">Use series letters with + − × ÷ and parentheses.</span>
               </div>
             ) : (
-              <span className="muted small">Combine series arithmetically, e.g. conversion rate A / B.</span>
+              <span className="text-muted-foreground">Combine series arithmetically, e.g. conversion rate A / B.</span>
             )}
           </Section>
           {filters}
@@ -351,7 +365,7 @@ export function QueryEditor({ query, onChange }: { query: InsightQuery; onChange
       );
     case "FunnelsQuery":
       return (
-        <div className="editor">
+        <div className="flex flex-col">
           <Section label="Steps">
             <SeriesList series={query.series} mode="funnel" addLabel="Add step" max={20} onChange={(series) => onChange({ ...query, series })} />
           </Section>
@@ -364,26 +378,26 @@ export function QueryEditor({ query, onChange }: { query: InsightQuery; onChange
       );
     case "RetentionQuery":
       return (
-        <div className="editor">
+        <div className="flex flex-col">
           <RetentionEditor q={query} set={(q) => onChange({ ...q, kind: "RetentionQuery" })} />
           {filters}
         </div>
       );
     case "LifecycleQuery":
       return (
-        <div className="editor">
+        <div className="flex flex-col">
           <Section label="Persons who performed">
             <SeriesList series={[query.series]} mode="plain" addLabel="" max={1} onChange={(s) => onChange({ ...query, series: s[0] ?? query.series })} />
           </Section>
           {filters}
-          <div className="editor-section muted small">
+          <div className="px-4 py-3.5 text-muted-foreground">
             New: first time ever. Returning: active this and last period. Resurrecting: back after an inactive period. Dormant: active last period, not this one.
           </div>
         </div>
       );
     case "StickinessQuery":
       return (
-        <div className="editor">
+        <div className="flex flex-col">
           <Section label="Series">
             <SeriesList series={query.series} mode="plain" addLabel="Add series" max={8} onChange={(series) => onChange({ ...query, series })} />
           </Section>
@@ -392,7 +406,7 @@ export function QueryEditor({ query, onChange }: { query: InsightQuery; onChange
       );
     case "PathsQuery":
       return (
-        <div className="editor">
+        <div className="flex flex-col">
           <PathsEditor q={query} set={(q) => onChange({ ...q, kind: "PathsQuery" })} />
           {filters}
         </div>

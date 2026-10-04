@@ -1,30 +1,57 @@
 // Live event feed: newest first, polled, expandable to the full payload.
 
-import { Fragment, useEffect, useRef, useState } from "react";
-import type { EventRow } from "../types/EventRow";
-import { api, errorMessage } from "../lib/api";
-import { usePath, useProjectId } from "../lib/context";
-import { fmtDateTime, fmtRelative } from "../lib/format";
-import { useApi, useNow } from "../lib/hooks";
-import { eventLabel } from "../lib/properties";
-import { Link, navigate, useLocation } from "../lib/router";
-import { Icon } from "../ui/icons";
-import { CopyButton, Empty, ErrorState, JsonView, Seg, SkeletonRows, Switch } from "../ui/kit";
-import { EventPicker } from "../insight/pickers";
-import { LoadDemoButton } from "./Onboarding";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { getRouteApi, Link } from "@tanstack/react-router";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Button } from "@/components/ui/button";
+import { Combobox, ComboboxContent, ComboboxEmpty, ComboboxInput, ComboboxItem, ComboboxList } from "@/components/ui/combobox";
+import { Switch } from "@/components/ui/switch";
+import { Seg } from "@/components/controls";
+import { CopyButton, JsonView } from "@/components/copy";
+import { columnHelper, DataTable } from "@/components/data-table";
+import { Empty, ErrorState, SkeletonRows } from "@/components/feedback";
+import { Icon } from "@/components/icons";
+import { Page, PageHeader, Panel, SearchInput, Toolbar } from "@/components/page";
+import { errorMessage } from "@/lib/api";
+import { usePath, useProjectId } from "@/lib/context";
+import { fmtDateTime, fmtRelative } from "@/lib/format";
+import { useDebounced, useNow } from "@/lib/hooks";
+import { eventLabel } from "@/lib/properties";
+import { catalogEventsQuery, eventsQuery } from "@/lib/queries";
+import { cn } from "@/lib/utils";
+import type { EventRow } from "@/types/EventRow";
+import { LoadDemoButton } from "@/pages/Onboarding";
+import { KV } from "@/components/page";
+
+const route = getRouteApi("/project/$projectId/activity");
+
+/** Rows that arrive by polling stay highlighted this long. */
+const FRESH_MS = 2200;
+/** Scrolling to the end loads older pages on its own up to this many pages; past it, only the button does. */
+export const AUTO_PAGES = 5;
+const POLL_MS = 5000;
 
 function str(v: unknown): string {
   if (v === null || v === undefined) return "";
   return typeof v === "object" ? JSON.stringify(v) : String(v);
 }
 
+function sortedKeys(props: Record<string, unknown>): string[] {
+  return Object.keys(props).sort((a, b) => Number(a.startsWith("$")) - Number(b.startsWith("$")) || a.localeCompare(b));
+}
+
 export function EventDetail({ event }: { event: EventRow }) {
   const [mode, setMode] = useState<"table" | "json">("table");
   const props = event.properties ?? {};
-  const keys = Object.keys(props).sort((a, b) => Number(a.startsWith("$")) - Number(b.startsWith("$")) || a.localeCompare(b));
+  const items: [ReactNode, ReactNode][] = [
+    ["event", event.event],
+    ["distinct_id", event.distinct_id],
+    ["timestamp", event.timestamp],
+    ...sortedKeys(props).map((k): [ReactNode, ReactNode] => [k, str(props[k]) || <span className="text-muted-foreground">""</span>]),
+  ];
   return (
-    <div className="col gap-12" style={{ padding: "8px 4px 12px" }}>
-      <div className="row wrap">
+    <div className="flex flex-col gap-3 px-4 py-3">
+      <div className="flex flex-wrap items-center gap-2">
         <Seg
           label="View"
           value={mode}
@@ -34,225 +61,305 @@ export function EventDetail({ event }: { event: EventRow }) {
             { value: "json", label: "JSON" },
           ]}
         />
-        <span className="spacer" />
-        <span className="muted small mono">{event.uuid}</span>
+        <span className="flex-1" />
+        <span className="font-mono text-xs text-muted-foreground">{event.uuid}</span>
         <CopyButton text={JSON.stringify(event, null, 2)} label="Copy event" />
       </div>
-      {mode === "json" ? (
-        <JsonView value={event} />
-      ) : (
-        <div className="kv">
-          <div>event</div>
-          <div>{event.event}</div>
-          <div>distinct_id</div>
-          <div>{event.distinct_id}</div>
-          <div>timestamp</div>
-          <div>{event.timestamp}</div>
-          {keys.map((k) => (
-            <Fragment key={k}>
-              <div>{k}</div>
-              <div>{str(props[k]) || <span className="muted">""</span>}</div>
-            </Fragment>
-          ))}
-        </div>
-      )}
+      <div className="max-h-96 overflow-auto">{mode === "json" ? <JsonView value={event} /> : <KV items={items} />}</div>
     </div>
   );
 }
 
-export function EventTable({ events, showPerson = true, fresh }: { events: EventRow[]; showPerson?: boolean; fresh?: Set<string> }) {
+/**
+ * Calls `onEnd` when any scroll box inside (the virtualized table) is scrolled near
+ * its bottom. Scroll events don't bubble, so this listens in the capture phase.
+ */
+export function ScrollEnd({ onEnd, children, className }: { onEnd: () => void; children: ReactNode; className?: string }) {
+  return (
+    <div
+      className={className}
+      onScrollCapture={(e) => {
+        const el = e.target;
+        if (!(el instanceof HTMLElement)) return;
+        if (el.scrollHeight - el.scrollTop - el.clientHeight < 240) onEnd();
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+const col = columnHelper<EventRow>();
+
+export function EventTable({
+  events,
+  showPerson = true,
+  fresh,
+  maxHeight = 640,
+}: {
+  events: EventRow[];
+  showPerson?: boolean;
+  fresh?: ReadonlySet<string>;
+  maxHeight?: number;
+}) {
   const path = usePath();
   const [open, setOpen] = useState<string | null>(null);
   const now = useNow(5000);
-  return (
-    <table className="table">
-      <thead>
-        <tr>
-          <th style={{ width: 28 }} />
-          <th>Event</th>
-          {showPerson && <th>Person</th>}
-          <th>URL / screen</th>
-          <th>Library</th>
-          <th className="r">Time</th>
-        </tr>
-      </thead>
-      <tbody>
-        {events.map((e) => {
-          const p = e.properties ?? {};
-          const url = str(p.$pathname) || str(p.$current_url) || str(p.$screen_name);
-          const expanded = open === e.uuid;
+
+  const columns = useMemo(
+    () => [
+      col.display({
+        id: "expand",
+        header: () => <span className="sr-only">Details</span>,
+        cell: ({ row }) => {
+          const expanded = open === row.original.uuid;
           return (
-            <Fragment key={e.uuid}>
-              <tr
-                className={`clickable feed-row${expanded ? " expanded" : ""}${fresh?.has(e.uuid) ? " fresh-row" : ""}`}
-                onClick={() => setOpen(expanded ? null : e.uuid)}
-                aria-expanded={expanded}
-              >
-                <td>
-                  <Icon name={expanded ? "chevronDown" : "chevronRight"} size={13} style={{ color: "var(--ink-3)" }} />
-                </td>
-                <td>
-                  <span className="event-name">
-                    {eventLabel(e.event)}
-                    {eventLabel(e.event) !== e.event && <span className="sys mono small">{e.event}</span>}
-                  </span>
-                </td>
-                {showPerson && (
-                  <td className="truncate" style={{ maxWidth: 220 }}>
-                    <Link to={path(`persons/${encodeURIComponent(e.person_id)}`)} className="link mono small" onClick={(ev) => ev.stopPropagation()}>
-                      {e.distinct_id}
-                    </Link>
-                  </td>
-                )}
-                <td className="truncate secondary" style={{ maxWidth: 320 }} title={url}>
-                  {url || <span className="muted">–</span>}
-                </td>
-                <td className="muted small nowrap">{str(p.$lib) || "–"}</td>
-                <td className="r muted nowrap" title={fmtDateTime(e.timestamp)}>
-                  {fmtRelative(e.timestamp, now)}
-                </td>
-              </tr>
-              {expanded && (
-                <tr>
-                  <td />
-                  <td colSpan={showPerson ? 5 : 4} style={{ background: "var(--surface)" }}>
-                    <EventDetail event={e} />
-                  </td>
-                </tr>
-              )}
-            </Fragment>
+            <>
+              <Icon name={expanded ? "chevronDown" : "chevronRight"} size={13} className="text-muted-foreground" />
+              <span className="sr-only">{expanded ? "Collapse event" : "Expand event"}</span>
+            </>
           );
-        })}
-      </tbody>
-    </table>
+        },
+        meta: { className: "w-7 pr-0" },
+      }),
+      col.accessor("event", {
+        header: "Event",
+        cell: (c) => {
+          const name = c.getValue();
+          const label = eventLabel(name);
+          return (
+            <span className="inline-flex items-baseline gap-2 font-medium">
+              {label}
+              {label !== name && <span className="font-mono text-xs font-normal text-muted-foreground">{name}</span>}
+            </span>
+          );
+        },
+      }),
+      ...(showPerson
+        ? [
+            col.accessor("distinct_id", {
+              header: "Person",
+              cell: ({ row }) => (
+                <Link
+                  to={path(`persons/${encodeURIComponent(row.original.person_id)}`)}
+                  className="block max-w-56 truncate font-mono text-xs text-brand-foreground hover:underline"
+                  onClick={(ev) => ev.stopPropagation()}
+                >
+                  {row.original.distinct_id}
+                </Link>
+              ),
+            }),
+          ]
+        : []),
+      col.display({
+        id: "url",
+        header: "URL / screen",
+        cell: ({ row }) => {
+          const p = row.original.properties ?? {};
+          const url = str(p.$pathname) || str(p.$current_url) || str(p.$screen_name);
+          return (
+            <span className="block max-w-80 truncate text-muted-foreground" title={url}>
+              {url || "–"}
+            </span>
+          );
+        },
+      }),
+      col.display({
+        id: "lib",
+        header: "Library",
+        cell: ({ row }) => <span className="text-xs whitespace-nowrap text-muted-foreground">{str((row.original.properties ?? {}).$lib) || "–"}</span>,
+      }),
+      col.accessor("timestamp", {
+        header: "Time",
+        cell: (c) => (
+          <time dateTime={c.getValue()} className="whitespace-nowrap text-muted-foreground" title={fmtDateTime(c.getValue())}>
+            {fmtRelative(c.getValue(), now)}
+          </time>
+        ),
+        meta: { align: "right" },
+      }),
+    ],
+    [showPerson, open, path, now],
+  );
+
+  return (
+    <DataTable
+      label="Events"
+      columns={columns}
+      data={events}
+      getRowId={(e) => e.uuid}
+      onRowClick={(e) => setOpen((cur) => (cur === e.uuid ? null : e.uuid))}
+      expandedId={open}
+      renderExpanded={(e) => <EventDetail event={e} />}
+      rowClassName={(e) => cn("transition-colors duration-700", fresh?.has(e.uuid) && "bg-brand-wash hover:bg-brand-wash")}
+      virtualize={{ maxHeight, estimateRowHeight: 41 }}
+      dense
+    />
+  );
+}
+
+/** Event-name filter: a Base UI combobox over the catalog (plus the active value, even if the catalog doesn't list it). */
+function EventFilter({ value, onChange }: { value: string | null; onChange: (v: string | null) => void }) {
+  const pid = useProjectId();
+  const { data } = useQuery(catalogEventsQuery(pid, ""));
+  const items = useMemo(() => {
+    const names = [...(data ?? [])].sort((a, b) => b.count - a.count).map((e) => e.name);
+    return value && !names.includes(value) ? [value, ...names] : names;
+  }, [data, value]);
+  return (
+    <Combobox
+      items={items}
+      value={value}
+      onValueChange={(v) => onChange(typeof v === "string" ? v : null)}
+      itemToStringLabel={(v: string) => eventLabel(v)}
+      filter={(item: string, query: string) => {
+        const q = query.trim().toLowerCase();
+        return !q || item.toLowerCase().includes(q) || eventLabel(item).toLowerCase().includes(q);
+      }}
+    >
+      <ComboboxInput placeholder="All events" aria-label="Filter by event" showTrigger={false} showClear={!!value} className="w-64" />
+      <ComboboxContent className="w-96">
+        <ComboboxEmpty>No matching events</ComboboxEmpty>
+        <ComboboxList>
+          {(item: string) => (
+            <ComboboxItem key={item} value={item}>
+              <span className="truncate">{eventLabel(item)}</span>
+              {eventLabel(item) !== item && <span className="truncate font-mono text-xs text-muted-foreground">{item}</span>}
+            </ComboboxItem>
+          )}
+        </ComboboxList>
+      </ComboboxContent>
+    </Combobox>
   );
 }
 
 export function ActivityPage() {
-  const projectId = useProjectId();
+  const pid = useProjectId();
   const path = usePath();
-  const loc = useLocation();
-  const [event, setEvent] = useState<string | null>(loc.search.get("event"));
-  const [personId, setPersonId] = useState(loc.search.get("person_id") ?? "");
+  const search = route.useSearch();
+  const navigate = route.useNavigate();
+  const event = search.event ?? null;
+  const personId = search.person_id ?? null;
   const [live, setLive] = useState(true);
-  const [older, setOlder] = useState<EventRow[]>([]);
-  const [olderCursor, setOlderCursor] = useState<string | null | undefined>(undefined);
-  const [olderError, setOlderError] = useState<string | null>(null);
-  const [fresh, setFresh] = useState<Set<string>>(new Set());
-  const seen = useRef<Set<string> | null>(null);
+  const [personInput, setPersonInput] = useState(personId ?? "");
+  const debouncedPerson = useDebounced(personInput.trim(), 400);
 
-  const key = `events:${projectId}:${event ?? ""}:${personId}`;
-  const { data, error, loading, reload } = useApi(key, (s) => api.events(projectId, { event, person_id: personId || null, limit: 100 }, s), { pollMs: live ? 5000 : undefined });
-
+  // URL to input (links from a person page) and input to URL (debounced).
+  useEffect(() => setPersonInput(personId ?? ""), [personId]);
   useEffect(() => {
-    setOlder([]);
-    setOlderCursor(undefined);
-    seen.current = null;
-  }, [key]);
+    if (debouncedPerson !== (personId ?? "")) void navigate({ search: { event: event ?? undefined, person_id: debouncedPerson || undefined }, replace: true });
+    // Only the debounced input drives the URL; `personId`/`event` changes are handled above and by setEvent.
+  }, [debouncedPerson]);
 
-  // Highlight rows that arrived since the last poll.
-  useEffect(() => {
-    if (!data) return;
-    const ids = data.events.map((e) => e.uuid);
-    if (seen.current) {
-      const added = ids.filter((id) => !seen.current!.has(id));
-      if (added.length) {
-        setFresh(new Set(added));
-        const t = window.setTimeout(() => setFresh(new Set()), 2200);
-        for (const id of ids) seen.current.add(id);
-        return () => window.clearTimeout(t);
+  const setEvent = (e: string | null) => void navigate({ search: { event: e ?? undefined, person_id: personId ?? undefined }, replace: true });
+
+  const q = useInfiniteQuery(eventsQuery(pid, { event, personId }, live ? POLL_MS : false));
+  const { data, error, isPending, isFetching, isPlaceholderData, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } = q;
+
+  const pages = data?.pages ?? [];
+  const events = useMemo(() => {
+    const seen = new Set<string>();
+    const out: EventRow[] = [];
+    for (const p of pages) {
+      for (const e of p.events) {
+        if (!seen.has(e.uuid)) {
+          seen.add(e.uuid);
+          out.push(e);
+        }
       }
-    } else seen.current = new Set(ids);
-    return undefined;
-  }, [data]);
+    }
+    return out;
+  }, [pages]);
 
-  const syncUrl = (ev: string | null, pid: string) => {
-    const q = new URLSearchParams();
-    if (ev) q.set("event", ev);
-    if (pid) q.set("person_id", pid);
-    navigate(`${path("activity")}${q.toString() ? `?${q}` : ""}`, { replace: true });
+  // Highlight rows that arrived since the last poll (first page only: older pages are history).
+  const filterKey = `${event ?? ""}\u0000${personId ?? ""}`;
+  const seenIds = useRef<{ key: string; ids: Set<string> } | null>(null);
+  const [fresh, setFresh] = useState<ReadonlySet<string>>(new Set());
+  const firstPage = pages[0];
+  useEffect(() => {
+    if (!firstPage || isPlaceholderData) return;
+    const ids = firstPage.events.map((e) => e.uuid);
+    const prev = seenIds.current;
+    if (!prev || prev.key !== filterKey) {
+      seenIds.current = { key: filterKey, ids: new Set(ids) };
+      return;
+    }
+    const added = ids.filter((id) => !prev.ids.has(id));
+    if (!added.length) return;
+    for (const id of ids) prev.ids.add(id);
+    setFresh(new Set(added));
+    const t = window.setTimeout(() => setFresh(new Set()), FRESH_MS);
+    return () => window.clearTimeout(t);
+  }, [firstPage, isPlaceholderData, filterKey]);
+
+  const loadOlder = () => {
+    if (hasNextPage && !isFetchingNextPage) void fetchNextPage();
   };
-
-  const events = [...(data?.events ?? []), ...older.filter((o) => !data?.events.some((e) => e.uuid === o.uuid))];
-  const cursor = olderCursor === undefined ? data?.next_before : olderCursor;
+  const filtered = !!(event || personId);
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="titles">
-          <h1>Activity</h1>
-          <div className="sub">Every event as it lands, newest first.</div>
-        </div>
-        <div className="actions">
-          <label className="row small secondary" style={{ gap: 8 }}>
-            <Switch checked={live} onChange={setLive} label="Live updates" />
-            {live ? (
-              <span className="row gap-4">
-                <span className="dot live" /> Live
-              </span>
-            ) : (
-              "Paused"
-            )}
-          </label>
-          <button className="btn icon" onClick={reload} aria-label="Refresh" title="Refresh">
-            <Icon name="refresh" />
-          </button>
-        </div>
-      </div>
+    <Page>
+      <PageHeader
+        title="Activity"
+        sub="Every event as it lands, newest first."
+        actions={
+          <>
+            <label className="flex items-center gap-2 text-muted-foreground">
+              <Switch checked={live} onCheckedChange={setLive} aria-label="Live updates" />
+              {live ? (
+                <span className="flex items-center gap-1.5">
+                  <span className="size-1.5 rounded-full bg-good motion-safe:animate-pulse" aria-hidden="true" /> Live
+                </span>
+              ) : (
+                "Paused"
+              )}
+            </label>
+            <Button variant="outline" size="icon" aria-label="Refresh" title="Refresh" onClick={() => void refetch()} disabled={isFetching && !isPending}>
+              <Icon name="refresh" className={isFetching ? "motion-safe:animate-spin" : undefined} />
+            </Button>
+          </>
+        }
+      />
 
-      <div className="toolbar">
-        <div style={{ width: 260 }} className="row">
-          <EventPicker
-            value={event}
-            onChange={(e) => {
-              setEvent(e);
-              syncUrl(e, personId);
-            }}
-          />
-        </div>
-        <div className="search" style={{ width: 280 }}>
-          <Icon name="person" size={14} />
-          <input
-            className="input"
-            placeholder="Person ID"
-            value={personId}
-            onChange={(e) => setPersonId(e.target.value.trim())}
-            onBlur={() => syncUrl(event, personId)}
-            aria-label="Filter by person ID"
-          />
-        </div>
-        {(event || personId) && (
-          <button
-            className="btn ghost small"
+      <Toolbar>
+        <EventFilter value={event} onChange={setEvent} />
+        <SearchInput
+          wrapperClassName="w-72"
+          placeholder="Person ID"
+          aria-label="Filter by person ID"
+          value={personInput}
+          onChange={(e) => setPersonInput(e.target.value)}
+        />
+        {filtered && (
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => {
-              setEvent(null);
-              setPersonId("");
-              syncUrl(null, "");
+              setPersonInput("");
+              void navigate({ search: {}, replace: true });
             }}
           >
             Clear
-          </button>
+          </Button>
         )}
-      </div>
+      </Toolbar>
 
-      <div className="card">
+      <Panel>
         {error && !data ? (
-          <ErrorState error={error} retry={reload} />
-        ) : !data && loading ? (
+          <ErrorState error={error} retry={() => void refetch()} />
+        ) : isPending ? (
           <SkeletonRows rows={10} />
         ) : events.length === 0 ? (
-          event || personId ? (
+          filtered ? (
             <Empty icon="search" title="No events match these filters" />
           ) : (
             <Empty
               icon="activity"
               title="No events yet"
               action={
-                <div className="row">
+                <div className="flex flex-wrap items-center justify-center gap-2">
                   <LoadDemoButton />
-                  <Link className="btn primary" to={path("onboarding")}>
-                    Connect your app
-                  </Link>
+                  <Button nativeButton={false} render={<Link to={path("onboarding")} />}>Connect your app</Button>
                 </div>
               }
             >
@@ -260,31 +367,19 @@ export function ActivityPage() {
             </Empty>
           )
         ) : (
-          <div className="table-wrap">
+          <ScrollEnd onEnd={() => pages.length < AUTO_PAGES && loadOlder()}>
             <EventTable events={events} fresh={fresh} />
-          </div>
+          </ScrollEnd>
         )}
-      </div>
-      {cursor && events.length > 0 && (
-        <div className="row mt-16" style={{ justifyContent: "center" }}>
-          <button
-            className="btn"
-            onClick={async () => {
-              setOlderError(null);
-              try {
-                const r = await api.events(projectId, { event, person_id: personId || null, before: cursor, limit: 100 });
-                setOlder((o) => [...o, ...r.events]);
-                setOlderCursor(r.next_before);
-              } catch (e) {
-                setOlderError(errorMessage(e));
-              }
-            }}
-          >
-            Load older events
-          </button>
-          {olderError && <span className="small" style={{ color: "var(--bad)" }}>{olderError}</span>}
+      </Panel>
+      {hasNextPage && events.length > 0 && (
+        <div className="mt-4 flex flex-wrap items-center justify-center gap-3">
+          <Button variant="outline" onClick={loadOlder} disabled={isFetchingNextPage}>
+            {isFetchingNextPage ? "Loading…" : "Load older events"}
+          </Button>
         </div>
       )}
-    </div>
+      {q.isFetchNextPageError && <p className="mt-2 text-center text-sm text-destructive">{errorMessage(q.error)}</p>}
+    </Page>
   );
 }

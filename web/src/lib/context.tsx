@@ -5,6 +5,7 @@ export interface AppState {
   workspace: Workspace;
   project: Project;
   organization: Organization;
+  /** Re-fetch the workspace (after creating a project, say). */
   refreshWorkspace: () => Promise<Workspace | null>;
   logout: () => Promise<void>;
 }

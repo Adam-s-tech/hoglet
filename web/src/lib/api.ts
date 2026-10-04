@@ -3,8 +3,8 @@ import { normalizeQuery } from "../insight/defaults";
 //
 // Contract shapes come from src/types (generated from src/contract by ts-rs).
 // Workspace/resource shapes that are not in the contract yet are declared
-// here, once. Cookie auth (same-origin), uniform ApiError, 401 → login,
-// every call abortable.
+// here, once. Cookie auth (same-origin), uniform ApiError, every call
+// abortable. TanStack Query (lib/queries.ts) owns caching and 401 → login.
 
 import type { ActorsRequest } from "../types/ActorsRequest";
 import type { ActorsResponse } from "../types/ActorsResponse";
@@ -126,6 +126,8 @@ export class ApiError extends Error {
   readonly code: string;
   readonly requestId: string | null;
   readonly field: string | null;
+  /** Raised by an auth-flow call (login, bootstrap, public share): a 401 there is an answer, not an expired session. */
+  authFlow = false;
 
   constructor(status: number, code: string, message: string, requestId: string | null = null, field: string | null = null) {
     super(message);
@@ -205,12 +207,6 @@ function transport(): Promise<Transport> {
 }
 export const isMock = MOCK;
 
-let unauthorizedListener: (() => void) | null = null;
-/** The app installs one listener: any 401 outside the auth flow → login. */
-export function onUnauthorized(listener: (() => void) | null): void {
-  unauthorizedListener = listener;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -257,7 +253,8 @@ async function request<T>(
   const { status, body } = await send({ method, url: withQuery(path, options.query), body: options.body, signal: options.signal });
   if (status >= 200 && status < 300) return body as T;
   const error = toApiError(status, body);
-  if (status === 401 && !options.authFlow) unauthorizedListener?.();
+  // The one 401 → login handler lives on the QueryCache/MutationCache (lib/query-client.ts).
+  error.authFlow = options.authFlow === true;
   throw error;
 }
 

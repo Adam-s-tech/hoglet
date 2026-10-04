@@ -1,109 +1,223 @@
 // Catalog-backed pickers: events, properties, values, filters, breakdowns.
+// Search lists are Base UI comboboxes (arrows / Enter / Esc), fed by the
+// debounced catalog queries; popovers return focus to their trigger on Esc.
 
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import type { Breakdown } from "../types/Breakdown";
-import type { CatalogProperty } from "../types/CatalogProperty";
-import type { PropertyFilter } from "../types/PropertyFilter";
-import type { PropertyOperator } from "../types/PropertyOperator";
-import type { PropertySource } from "../types/PropertySource";
-import { api } from "../lib/api";
-import { useProjectId } from "../lib/context";
-import { fmtCompact } from "../lib/format";
-import { useApi, useDebounced } from "../lib/hooks";
-import { OPERATORS, describeFilter, eventLabel, operatorInfo, propertyLabel } from "../lib/properties";
-import { Icon } from "../ui/icons";
-import { ErrorState, Popover } from "../ui/kit";
+import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { Combobox as ComboboxPrimitive } from "@base-ui/react/combobox";
+import { useQuery } from "@tanstack/react-query";
+import type { Breakdown } from "@/types/Breakdown";
+import type { CatalogProperty } from "@/types/CatalogProperty";
+import type { PropertyFilter } from "@/types/PropertyFilter";
+import type { PropertyOperator } from "@/types/PropertyOperator";
+import type { PropertySource } from "@/types/PropertySource";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Combobox,
+  ComboboxChip,
+  ComboboxChips,
+  ComboboxChipsInput,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+  ComboboxValue,
+} from "@/components/ui/combobox";
+import { InputGroupAddon } from "@/components/ui/input-group";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Icon } from "@/components/icons";
+import { ErrorState } from "@/components/feedback";
+import { Seg } from "@/components/controls";
+import { useProjectId } from "@/lib/context";
+import { fmtCompact } from "@/lib/format";
+import { useDebounced } from "@/lib/hooks";
+import { catalogEventsQuery, catalogPropertiesQuery, catalogValuesQuery } from "@/lib/queries";
+import { OPERATORS, completeFilters, describeFilter, eventLabel, operatorInfo, propertyLabel } from "@/lib/properties";
+import { cn } from "@/lib/utils";
 
-// ── Searchable list with keyboard navigation ──────────────────────────────
+// ── Select with a typed option list ──────────────────────────────────────
 
-interface ListItem {
-  key: string;
+export interface Option<T extends string | number> {
+  value: T;
   label: ReactNode;
-  meta?: ReactNode;
-  sub?: ReactNode;
-  selected?: boolean;
+  disabled?: boolean;
+  /** Options sharing a group name render under one heading. */
+  group?: string;
 }
 
-function SearchList({
+/** shadcn Select over a plain option array; the trigger shows the selected option's label. */
+export function OptionSelect<T extends string | number>({
+  value,
+  options,
+  onChange,
+  label,
+  className,
+  size,
+  placeholder,
+}: {
+  value: T;
+  options: Option<T>[];
+  onChange: (v: T) => void;
+  /** Accessible name (there is no visible label). */
+  label: string;
+  className?: string;
+  size?: "sm" | "default";
+  placeholder?: string;
+}) {
+  const grouped = options.some((o) => o.group);
+  const groups = grouped ? [...new Set(options.map((o) => o.group ?? ""))] : [""];
+  const item = (o: Option<T>) => (
+    <SelectItem key={String(o.value)} value={o.value} disabled={o.disabled}>
+      {o.label}
+    </SelectItem>
+  );
+  return (
+    <Select
+      value={value}
+      items={options.map((o) => ({ value: o.value, label: o.label }))}
+      onValueChange={(v) => {
+        if (v !== null) onChange(v as T);
+      }}
+    >
+      <SelectTrigger aria-label={label} size={size} className={className}>
+        <SelectValue placeholder={placeholder} />
+      </SelectTrigger>
+      <SelectContent alignItemWithTrigger={false} align="start" className="min-w-40 w-auto">
+        {grouped
+          ? groups.map((g) => (
+              <SelectGroup key={g}>
+                {g ? <SelectLabel>{g}</SelectLabel> : null}
+                {options.filter((o) => (o.group ?? "") === g).map(item)}
+              </SelectGroup>
+            ))
+          : options.map(item)}
+      </SelectContent>
+    </Select>
+  );
+}
+
+// ── Searchable list (inline combobox) ────────────────────────────────────
+
+interface PickerItem {
+  value: string;
+  label: string;
+  /** Raw key shown under a friendly label. */
+  sub?: string;
+  /** Right-aligned detail: a count or a type. */
+  meta?: string;
+  custom?: boolean;
+}
+
+const sameItem = (a: PickerItem, b: PickerItem) => a.value === b.value;
+const ALL_EVENTS = "\u0000all";
+
+function ItemRow({ item }: { item: PickerItem }) {
+  return (
+    <>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate">{item.label}</span>
+        {item.sub ? <span className="truncate font-mono text-xs text-muted-foreground">{item.sub}</span> : null}
+      </span>
+      {item.meta !== undefined ? <span className="num ml-auto flex-none text-xs text-muted-foreground">{item.meta}</span> : null}
+    </>
+  );
+}
+
+function PickerList({
   items,
+  selected,
   search,
-  setSearch,
+  onSearch,
   onPick,
   placeholder,
   loading,
   error,
-  footer,
   header,
   allowFreeText,
+  inputRef,
 }: {
-  items: ListItem[];
+  items: PickerItem[];
+  selected: PickerItem | null;
   search: string;
-  setSearch: (s: string) => void;
-  onPick: (key: string) => void;
+  onSearch: (s: string) => void;
+  onPick: (value: string) => void;
   placeholder: string;
   loading?: boolean;
   error?: unknown;
-  footer?: ReactNode;
   header?: ReactNode;
   allowFreeText?: boolean;
+  inputRef?: React.Ref<HTMLInputElement>;
 }) {
-  const [active, setActive] = useState(0);
-  const listRef = useRef<HTMLDivElement>(null);
-  const showFree = allowFreeText && search.trim() && !items.some((i) => i.key === search.trim());
-  const all: ListItem[] = showFree ? [...items, { key: search.trim(), label: <>Use “{search.trim()}”</>, meta: "custom" }] : items;
-  useEffect(() => setActive(0), [search]);
-  useEffect(() => {
-    listRef.current?.querySelector<HTMLElement>(`[data-index="${active}"]`)?.scrollIntoView({ block: "nearest" });
-  }, [active]);
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setActive((a) => Math.min(all.length - 1, a + 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setActive((a) => Math.max(0, a - 1));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const item = all[active];
-      if (item) onPick(item.key);
-    }
-  };
+  const typed = search.trim();
+  const showFree = !!allowFreeText && typed !== "" && !items.some((i) => i.value === typed);
+  const all: PickerItem[] = showFree ? [...items, { value: typed, label: `Use “${typed}”`, meta: "custom", custom: true }] : items;
   return (
-    <div className="col" style={{ gap: 4, width: 320 }}>
-      {header}
-      <div className="search" style={{ padding: 4 }}>
-        <Icon name="search" size={14} style={{ left: 13 }} />
-        <input className="input" autoFocus placeholder={placeholder} value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={onKey} aria-label={placeholder} />
-      </div>
-      <div ref={listRef} style={{ maxHeight: 300, overflowY: "auto" }} role="listbox">
+    <Combobox<PickerItem>
+      inline
+      open
+      items={all}
+      filter={null}
+      autoHighlight
+      value={selected}
+      isItemEqualToValue={sameItem}
+      onValueChange={(item) => {
+        if (item) onPick(item.value);
+      }}
+      inputValue={search}
+      onInputValueChange={(v, details) => {
+        if (details.reason === "input-change" || details.reason === "input-clear") onSearch(v);
+      }}
+    >
+      <div className="flex flex-col gap-1">
+        {header}
+        <ComboboxInput ref={inputRef} showTrigger={false} autoFocus placeholder={placeholder} aria-label={placeholder} className="mx-1 mt-1 w-auto">
+          <InputGroupAddon>
+            <Icon name="search" size={14} />
+          </InputGroupAddon>
+        </ComboboxInput>
         {error ? (
-          <div style={{ padding: 8 }}>
+          <div className="p-1">
             <ErrorState error={error} compact />
           </div>
         ) : null}
-        {all.map((item, i) => (
-          <button
-            key={item.key}
-            data-index={i}
-            role="option"
-            className="menu-item"
-            data-active={i === active}
-            aria-selected={item.selected}
-            onPointerMove={() => setActive(i)}
-            onClick={() => onPick(item.key)}
-          >
-            <span className="col" style={{ gap: 0, minWidth: 0 }}>
-              <span className="truncate">{item.label}</span>
-              {item.sub && <span className="muted small mono truncate">{item.sub}</span>}
-            </span>
-            {item.meta !== undefined && <span className="meta">{item.meta}</span>}
-          </button>
-        ))}
-        {!loading && !error && all.length === 0 && <div className="muted small" style={{ padding: "10px 12px" }}>No matches.</div>}
-        {loading && all.length === 0 && <div className="muted small" style={{ padding: "10px 12px" }}>Loading…</div>}
+        <ComboboxList className="max-h-72">
+          {(item: PickerItem) => (
+            <ComboboxItem key={item.value} value={item}>
+              <ItemRow item={item} />
+            </ComboboxItem>
+          )}
+        </ComboboxList>
+        {!loading && !error && all.length === 0 ? <div className="px-3 py-2.5 text-sm text-muted-foreground">No matches.</div> : null}
+        {loading && all.length === 0 ? <div className="px-3 py-2.5 text-sm text-muted-foreground">Loading…</div> : null}
       </div>
-      {footer}
-    </div>
+    </Combobox>
+  );
+}
+
+/** Popover shell shared by the picker buttons: ArrowDown opens, Esc closes and returns focus to the button. */
+function PickerPopover({ trigger, children, label, width = "w-80" }: { trigger: ReactNode; children: (close: () => void) => ReactNode; label: string; width?: string }) {
+  const [open, setOpen] = useState(false);
+  const body = useRef<HTMLDivElement>(null);
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "ArrowDown" && !open) {
+      e.preventDefault();
+      setOpen(true);
+    }
+  };
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger render={<Button variant="outline" className="w-full min-w-0 justify-start bg-transparent font-normal" />} aria-label={label} onKeyDown={onKeyDown}>
+        {trigger}
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        className={cn(width, "max-w-[calc(100vw-1rem)] gap-0 p-0")}
+        initialFocus={() => body.current?.querySelector<HTMLElement>("input") ?? true}
+      >
+        <div ref={body}>{children(() => setOpen(false))}</div>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -113,27 +227,25 @@ export function EventPickerList({ value, onPick, allowAll = true }: { value: str
   const projectId = useProjectId();
   const [search, setSearch] = useState("");
   const q = useDebounced(search.trim(), 150);
-  const { data, error, loading } = useApi(`catalog-events:${projectId}:${q}`, (signal) => api.catalogEvents(projectId, q, signal));
-  const items: ListItem[] = [];
-  if (allowAll && !q) items.push({ key: "\u0000all", label: <b>All events</b>, selected: value === null });
+  const { data, error, isPending } = useQuery(catalogEventsQuery(projectId, q));
+  const live = search.trim().toLowerCase();
+  const items: PickerItem[] = [];
+  if (allowAll && !live) items.push({ value: ALL_EVENTS, label: "All events" });
   for (const e of data ?? []) {
-    if (q && !e.name.toLowerCase().includes(q.toLowerCase()) && !eventLabel(e.name).toLowerCase().includes(q.toLowerCase())) continue;
-    items.push({
-      key: e.name,
-      label: eventLabel(e.name),
-      sub: eventLabel(e.name) !== e.name ? e.name : undefined,
-      meta: e.count ? fmtCompact(e.count) : undefined,
-      selected: e.name === value,
-    });
+    const friendly = eventLabel(e.name);
+    if (live && !e.name.toLowerCase().includes(live) && !friendly.toLowerCase().includes(live)) continue;
+    items.push({ value: e.name, label: friendly, sub: friendly !== e.name ? e.name : undefined, meta: e.count ? fmtCompact(e.count) : undefined });
   }
+  const selected: PickerItem | null = value === null ? (allowAll ? { value: ALL_EVENTS, label: "All events" } : null) : { value, label: eventLabel(value) };
   return (
-    <SearchList
+    <PickerList
       items={items}
+      selected={selected}
       search={search}
-      setSearch={setSearch}
-      onPick={(k) => onPick(k === "\u0000all" ? null : k)}
+      onSearch={setSearch}
+      onPick={(k) => onPick(k === ALL_EVENTS ? null : k)}
       placeholder="Search events…"
-      loading={loading}
+      loading={isPending}
       error={error}
       allowFreeText
     />
@@ -141,26 +253,28 @@ export function EventPickerList({ value, onPick, allowAll = true }: { value: str
 }
 
 export function EventPicker({ value, onChange, allowAll = true, placeholder = "Select an event" }: { value: string | null | undefined; onChange: (e: string | null) => void; allowAll?: boolean; placeholder?: string }) {
-  const ref = useRef<HTMLButtonElement>(null);
-  const [open, setOpen] = useState(false);
   return (
-    <>
-      <button ref={ref} className="picker-btn" onClick={() => setOpen((o) => !o)} aria-haspopup="listbox" aria-expanded={open}>
-        <Icon name="bolt" size={14} style={{ color: "var(--ink-3)", flex: "none" }} />
-        {value === undefined ? <span className="ph">{placeholder}</span> : <span>{eventLabel(value)}</span>}
-        <Icon name="chevronDown" size={12} style={{ marginLeft: "auto", flex: "none", color: "var(--ink-3)" }} />
-      </button>
-      <Popover anchor={ref} open={open} onClose={() => setOpen(false)}>
+    <PickerPopover
+      label={value === undefined ? placeholder : `Event: ${eventLabel(value)}`}
+      trigger={
+        <>
+          <Icon name="bolt" size={14} className="flex-none text-muted-foreground" />
+          <span className={cn("truncate", value === undefined && "text-muted-foreground")}>{value === undefined ? placeholder : eventLabel(value)}</span>
+          <Icon name="chevronDown" size={12} className="ml-auto flex-none text-muted-foreground" />
+        </>
+      }
+    >
+      {(close) => (
         <EventPickerList
           value={value ?? null}
           allowAll={allowAll}
           onPick={(e) => {
             onChange(e);
-            setOpen(false);
+            close();
           }}
         />
-      </Popover>
-    </>
+      )}
+    </PickerPopover>
   );
 }
 
@@ -178,40 +292,47 @@ export function PropertyPickerList({
   selected?: string;
 }) {
   const projectId = useProjectId();
+  const input = useRef<HTMLInputElement>(null);
   const [source, setSource] = useState<PropertySource>(sources[0]);
   const [search, setSearch] = useState("");
-  const { data, error, loading } = useApi(`catalog-props:${projectId}:${source}`, (signal) => api.catalogProperties(projectId, source, "", signal));
-  const q = search.trim().toLowerCase();
-  const items: ListItem[] = (data ?? [])
+  const q = useDebounced(search.trim(), 150);
+  const { data, error, isPending } = useQuery({
+    ...catalogPropertiesQuery(projectId, source, q),
+    // Keep the previous results while typing, but never show the other source's list.
+    placeholderData: (prev, prevQuery) => (prevQuery?.queryKey[4] === source ? prev : undefined),
+  });
+  const live = search.trim().toLowerCase();
+  const items: PickerItem[] = (data ?? [])
     .filter((p: CatalogProperty) => !numericOnly || p.property_type === "number")
-    .filter((p) => !q || p.key.toLowerCase().includes(q) || propertyLabel(p.key).toLowerCase().includes(q))
+    .filter((p) => !live || p.key.toLowerCase().includes(live) || propertyLabel(p.key).toLowerCase().includes(live))
     .slice(0, 200)
-    .map((p) => ({
-      key: p.key,
-      label: propertyLabel(p.key),
-      sub: propertyLabel(p.key) !== p.key ? p.key : undefined,
-      meta: p.property_type,
-      selected: p.key === selected,
-    }));
+    .map((p) => ({ value: p.key, label: propertyLabel(p.key), sub: propertyLabel(p.key) !== p.key ? p.key : undefined, meta: p.property_type }));
   return (
-    <SearchList
+    <PickerList
+      inputRef={input}
       header={
         sources.length > 1 ? (
-          <div className="seg" style={{ margin: "4px 4px 0" }} role="group" aria-label="Property type">
-            {sources.map((s) => (
-              <button key={s} aria-pressed={source === s} onClick={() => setSource(s)}>
-                {s === "event" ? "Event properties" : "Person properties"}
-              </button>
-            ))}
+          <div className="px-1 pt-1">
+            <Seg
+              label="Property type"
+              value={source}
+              onChange={(s) => {
+                setSource(s);
+                input.current?.focus();
+              }}
+              className="w-full"
+              options={sources.map((s) => ({ value: s, label: s === "event" ? "Event properties" : "Person properties" }))}
+            />
           </div>
         ) : undefined
       }
       items={items}
+      selected={selected ? { value: selected, label: propertyLabel(selected) } : null}
       search={search}
-      setSearch={setSearch}
+      onSearch={setSearch}
       onPick={(k) => onPick(k, source)}
       placeholder={numericOnly ? "Search numeric properties…" : "Search properties…"}
-      loading={loading}
+      loading={isPending}
       error={error}
       allowFreeText
     />
@@ -231,26 +352,28 @@ export function PropertyPicker({
   numericOnly?: boolean;
   sources?: PropertySource[];
 }) {
-  const ref = useRef<HTMLButtonElement>(null);
-  const [open, setOpen] = useState(false);
   return (
-    <>
-      <button ref={ref} className="picker-btn" onClick={() => setOpen((o) => !o)} aria-haspopup="listbox" aria-expanded={open}>
-        {value ? <span>{propertyLabel(value)}</span> : <span className="ph">{placeholder}</span>}
-        <Icon name="chevronDown" size={12} style={{ marginLeft: "auto", flex: "none", color: "var(--ink-3)" }} />
-      </button>
-      <Popover anchor={ref} open={open} onClose={() => setOpen(false)}>
+    <PickerPopover
+      label={value ? `Property: ${propertyLabel(value)}` : placeholder}
+      trigger={
+        <>
+          <span className={cn("truncate", !value && "text-muted-foreground")}>{value ? propertyLabel(value) : placeholder}</span>
+          <Icon name="chevronDown" size={12} className="ml-auto flex-none text-muted-foreground" />
+        </>
+      }
+    >
+      {(close) => (
         <PropertyPickerList
           numericOnly={numericOnly}
           sources={sources}
           selected={value ?? undefined}
           onPick={(k, s) => {
             onChange(k, s);
-            setOpen(false);
+            close();
           }}
         />
-      </Popover>
-    </>
+      )}
+    </PickerPopover>
   );
 }
 
@@ -263,15 +386,12 @@ function ValueEditor({ filter, onChange }: { filter: PropertyFilter; onChange: (
   const info = operatorInfo(filter.operator);
   const [text, setText] = useState("");
   const q = useDebounced(text.trim(), 150);
-  const { data } = useApi(info.multi ? `catalog-values:${projectId}:${filter.type}:${filter.key}:${q}` : null, (signal) =>
-    api.catalogValues(projectId, filter.key, filter.type, q, signal),
-  );
+  const { data } = useQuery({ ...catalogValuesQuery(projectId, filter.key, filter.type, q), enabled: info.multi });
   if (!info.needsValue) return null;
   if (!info.multi) {
     const isDate = filter.operator === "is_date_before" || filter.operator === "is_date_after";
     return (
-      <input
-        className="input"
+      <Input
         type={info.numeric ? "number" : isDate ? "date" : "text"}
         value={filter.value === null || Array.isArray(filter.value) ? "" : String(filter.value)}
         placeholder={info.numeric ? "Number" : "Value"}
@@ -282,58 +402,70 @@ function ValueEditor({ filter, onChange }: { filter: PropertyFilter; onChange: (
     );
   }
   const values: Scalar[] = Array.isArray(filter.value) ? filter.value : filter.value === null || filter.value === "" ? [] : [filter.value];
-  const add = (v: string) => {
-    if (!v.trim() || values.map(String).includes(v)) return;
-    onChange([...values, v]);
-    setText("");
-  };
-  const suggestions = (data ?? []).filter((s) => !values.map(String).includes(s.value)).slice(0, 8);
+  const taken = new Set(values.map(String));
+  const typed = text.trim();
+  const items: PickerItem[] = [];
+  if (typed && !taken.has(typed)) items.push({ value: typed, label: `Add “${typed}”`, custom: true });
+  for (const s of data ?? []) {
+    if (!s.value || taken.has(s.value) || s.value === typed) continue;
+    if (items.length >= 9) break;
+    items.push({ value: s.value, label: s.value, meta: s.count > 0 ? fmtCompact(s.count) : undefined });
+  }
+  const selected: PickerItem[] = values.map((v) => ({ value: String(v), label: String(v) }));
   return (
-    <div className="col" style={{ gap: 6 }}>
-      {values.length > 0 && (
-        <div className="row wrap gap-4">
-          {values.map((v) => (
-            <span key={String(v)} className="chip" style={{ cursor: "default" }}>
-              <b>{String(v)}</b>
-              <span
-                className="x"
-                role="button"
-                tabIndex={0}
-                aria-label={`Remove ${String(v)}`}
-                onClick={() => onChange(values.filter((x) => x !== v))}
-                onKeyDown={(e) => e.key === "Enter" && onChange(values.filter((x) => x !== v))}
-              >
-                <Icon name="x" size={10} />
-              </span>
-            </span>
-          ))}
-        </div>
-      )}
-      <input
-        className="input"
-        value={text}
-        autoFocus
-        placeholder={values.length ? "Add another value (any of)…" : "Type a value and press Enter"}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            add(text.trim());
-          }
-        }}
-        aria-label="Value"
-      />
-      {suggestions.length > 0 && (
-        <div style={{ maxHeight: 180, overflowY: "auto" }}>
-          {suggestions.map((s) => (
-            <button key={s.value} className="menu-item" onClick={() => add(s.value)}>
-              <span className="truncate">{s.value || <span className="muted">(empty)</span>}</span>
-              {s.count > 0 && <span className="meta">{fmtCompact(s.count)}</span>}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
+    <Combobox<PickerItem, true>
+      multiple
+      inline
+      open
+      items={items}
+      filter={null}
+      autoHighlight
+      value={selected}
+      isItemEqualToValue={sameItem}
+      onValueChange={(next) => {
+        onChange(next.map((item) => values.find((v) => String(v) === item.value) ?? item.value));
+        setText("");
+      }}
+      inputValue={text}
+      onInputValueChange={(v, details) => {
+        if (details.reason === "input-change" || details.reason === "input-clear") setText(v);
+      }}
+    >
+      <div className="flex flex-col gap-1.5">
+        <ComboboxChips className="max-h-28 overflow-y-auto">
+          <ComboboxValue>
+            {(chips: PickerItem[]) => (
+              <>
+                {chips.map((c) => (
+                  <ComboboxChip key={c.value} showRemove={false} className="max-w-full">
+                    <span className="truncate">{c.label}</span>
+                    <ComboboxPrimitive.ChipRemove
+                      aria-label={`Remove ${c.label}`}
+                      data-slot="combobox-chip-remove"
+                      render={<Button variant="ghost" size="icon-xs" className="-mr-0.5 size-5 opacity-60 hover:opacity-100" />}
+                    >
+                      <Icon name="x" size={10} />
+                    </ComboboxPrimitive.ChipRemove>
+                  </ComboboxChip>
+                ))}
+                <ComboboxChipsInput
+                  autoFocus
+                  aria-label="Value"
+                  placeholder={chips.length ? "Add another value (any of)…" : "Type a value and press Enter"}
+                />
+              </>
+            )}
+          </ComboboxValue>
+        </ComboboxChips>
+        <ComboboxList className="max-h-44 rounded-md border p-1 data-empty:hidden">
+          {(item: PickerItem) => (
+            <ComboboxItem key={item.value} value={item}>
+              <ItemRow item={item} />
+            </ComboboxItem>
+          )}
+        </ComboboxList>
+      </div>
+    </Combobox>
   );
 }
 
@@ -341,28 +473,23 @@ function ValueEditor({ filter, onChange }: { filter: PropertyFilter; onChange: (
 
 function FilterEditor({ filter, onChange, onRemove, onDone, sources }: { filter: PropertyFilter; onChange: (f: PropertyFilter) => void; onRemove: () => void; onDone: () => void; sources: PropertySource[] }) {
   if (!filter.key) {
-    return (
-      <PropertyPickerList
-        sources={sources}
-        onPick={(key, source) => onChange({ ...filter, key, type: source })}
-      />
-    );
+    return <PropertyPickerList sources={sources} onPick={(key, source) => onChange({ ...filter, key, type: source })} />;
   }
   return (
-    <div className="col" style={{ gap: 10, width: 320, padding: 8 }}>
-      <div className="row">
-        <span className="badge">{filter.type === "person" ? "Person" : "Event"}</span>
-        <b className="truncate grow">{propertyLabel(filter.key)}</b>
-        <button className="btn ghost small" onClick={() => onChange({ ...filter, key: "" })}>
+    <div className="flex flex-col gap-2.5 p-2.5">
+      <div className="flex items-center gap-2">
+        <Badge variant="secondary">{filter.type === "person" ? "Person" : "Event"}</Badge>
+        <b className="min-w-0 flex-1 truncate">{propertyLabel(filter.key)}</b>
+        <Button variant="ghost" size="sm" onClick={() => onChange({ ...filter, key: "" })}>
           Change
-        </button>
+        </Button>
       </div>
-      <select
-        className="select"
+      <OptionSelect<PropertyOperator>
+        label="Operator"
+        className="w-full"
         value={filter.operator}
-        aria-label="Operator"
-        onChange={(e) => {
-          const op = e.target.value as PropertyOperator;
+        options={OPERATORS.map((o) => ({ value: o.value, label: o.label }))}
+        onChange={(op) => {
           const next = operatorInfo(op);
           const prev = operatorInfo(filter.operator);
           let value = filter.value;
@@ -371,68 +498,59 @@ function FilterEditor({ filter, onChange, onRemove, onDone, sources }: { filter:
           else if (!next.multi && Array.isArray(value)) value = value[0] ?? "";
           onChange({ ...filter, operator: op, value });
         }}
-      >
-        {OPERATORS.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
+      />
       <ValueEditor filter={filter} onChange={(value) => onChange({ ...filter, value })} />
-      <div className="row">
-        <button className="btn ghost small danger" onClick={onRemove}>
+      <div className="flex items-center gap-2">
+        <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive" onClick={onRemove}>
           <Icon name="trash" size={13} /> Remove
-        </button>
-        <span className="spacer" />
-        <button className="btn small primary" onClick={onDone}>
+        </Button>
+        <span className="flex-1" />
+        <Button size="sm" onClick={onDone}>
           Done
-        </button>
+        </Button>
       </div>
     </div>
   );
 }
 
 function FilterChip({ filter, onChange, onRemove, sources, initiallyOpen }: { filter: PropertyFilter; onChange: (f: PropertyFilter) => void; onRemove: () => void; sources: PropertySource[]; initiallyOpen?: boolean }) {
-  const ref = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(!!initiallyOpen);
   const d = describeFilter(filter);
+  const summary = `${d.key} ${d.op} ${d.value}`.trim();
   const close = () => {
     setOpen(false);
     if (!filter.key) onRemove();
   };
   return (
-    <>
-      <button ref={ref} className="chip" onClick={() => setOpen(true)} title={`${d.key} ${d.op} ${d.value}`}>
-        {filter.key ? (
-          <span className="truncate">
-            <b>{d.key}</b> {d.op} {d.value && <b>{d.value}</b>}
-          </span>
-        ) : (
-          <span className="muted">New filter</span>
-        )}
-        <span
-          className="x"
-          role="button"
-          tabIndex={0}
-          aria-label="Remove filter"
-          onClick={(e) => {
-            e.stopPropagation();
-            onRemove();
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.stopPropagation();
-              onRemove();
-            }
-          }}
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        if (next) setOpen(true);
+        else close();
+      }}
+    >
+      <span className="inline-flex max-w-full items-center rounded-lg border border-input bg-muted/50">
+        <PopoverTrigger
+          render={<Button variant="ghost" size="sm" className="min-w-0 rounded-r-none px-2 font-normal" />}
+          title={summary}
+          aria-label={filter.key ? `Edit filter: ${summary}` : "Edit new filter"}
         >
-          <Icon name="x" size={10} />
-        </span>
-      </button>
-      <Popover anchor={ref} open={open} onClose={close}>
+          {filter.key ? (
+            <span className="truncate">
+              <b>{d.key}</b> {d.op} {d.value ? <b>{d.value}</b> : null}
+            </span>
+          ) : (
+            <span className="text-muted-foreground">New filter</span>
+          )}
+        </PopoverTrigger>
+        <Button variant="ghost" size="icon-xs" className="mr-0.5 text-muted-foreground" aria-label={filter.key ? `Remove filter: ${summary}` : "Remove filter"} onClick={onRemove}>
+          <Icon name="x" size={12} />
+        </Button>
+      </span>
+      <PopoverContent align="start" className="w-80 max-w-[calc(100vw-1rem)] gap-0 p-0" initialFocus={false}>
         <FilterEditor filter={filter} sources={sources} onChange={onChange} onRemove={onRemove} onDone={close} />
-      </Popover>
-    </>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -449,7 +567,7 @@ export function PropertyFilters({
 }) {
   const [fresh, setFresh] = useState<number | null>(null);
   return (
-    <div className="row wrap gap-4">
+    <div className="flex flex-wrap items-center gap-1.5">
       {value.map((f, i) => (
         <FilterChip
           key={i}
@@ -463,52 +581,47 @@ export function PropertyFilters({
           }}
         />
       ))}
-      <button
-        className="chip add"
+      <Button
+        variant="outline"
+        size="sm"
+        className="border-dashed text-muted-foreground"
         onClick={() => {
           setFresh(value.length);
           onChange([...value, { key: "", type: sources[0], operator: "exact", value: [] }]);
         }}
       >
         <Icon name="plus" size={12} /> {addLabel}
-      </button>
+      </Button>
     </div>
   );
 }
 
-/** Drop half-built filters before a query is sent. */
-export function completeFilters(filters: PropertyFilter[]): PropertyFilter[] {
-  return filters.filter((f) => {
-    if (!f.key) return false;
-    const info = operatorInfo(f.operator);
-    if (!info.needsValue) return true;
-    if (Array.isArray(f.value)) return f.value.length > 0;
-    return f.value !== null && f.value !== "";
-  });
-}
+export { completeFilters };
 
 // ── Breakdown ────────────────────────────────────────────────────────────
 
 export function BreakdownPicker({ value, onChange }: { value: Breakdown | null; onChange: (b: Breakdown | null) => void }) {
   return (
-    <div className="row">
-      <PropertyPicker
-        value={value?.property}
-        placeholder="Add breakdown"
-        onChange={(property, source) => onChange({ property, type: source, limit: value?.limit ?? 10 })}
-      />
+    <div className="flex items-center gap-1.5">
+      <div className="min-w-0 flex-1">
+        <PropertyPicker
+          value={value?.property}
+          placeholder="Add breakdown"
+          onChange={(property, source) => onChange({ property, type: source, limit: value?.limit ?? 10 })}
+        />
+      </div>
       {value && (
         <>
-          <select className="select" style={{ width: 90 }} value={value.limit} onChange={(e) => onChange({ ...value, limit: Number(e.target.value) })} aria-label="Top values">
-            {[5, 10, 25, 50].map((n) => (
-              <option key={n} value={n}>
-                Top {n}
-              </option>
-            ))}
-          </select>
-          <button className="btn ghost icon" onClick={() => onChange(null)} aria-label="Remove breakdown">
+          <OptionSelect
+            label="Top values"
+            className="w-24"
+            value={value.limit}
+            options={[5, 10, 25, 50].map((n) => ({ value: n, label: `Top ${n}` }))}
+            onChange={(limit) => onChange({ ...value, limit })}
+          />
+          <Button variant="ghost" size="icon" onClick={() => onChange(null)} aria-label="Remove breakdown">
             <Icon name="x" />
-          </button>
+          </Button>
         </>
       )}
     </div>
