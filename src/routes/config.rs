@@ -46,20 +46,13 @@ pub fn remote_config_fields() -> serde_json::Map<String, serde_json::Value> {
 
 #[derive(Clone)]
 struct ConfigState {
-    authorizer: Option<Arc<dyn CaptureAuthorizer>>,
-}
-
-/// Compatibility constructor for the legacy monolithic application.
-pub fn router() -> Router {
-    routes(ConfigState { authorizer: None })
+    authorizer: Arc<dyn CaptureAuthorizer>,
 }
 
 /// Builds the public SDK config endpoint with fail-closed project-token
 /// authorization.
 pub fn wire_router(authorizer: Arc<dyn CaptureAuthorizer>) -> Router {
-    routes(ConfigState {
-        authorizer: Some(authorizer),
-    })
+    routes(ConfigState { authorizer })
 }
 
 fn routes(state: ConfigState) -> Router {
@@ -77,9 +70,7 @@ async fn authorize(state: &ConfigState, token: &str) -> Result<(), StatusCode> {
         // Invalid token shape → 401, which posthog-js never retries.
         return Err(StatusCode::UNAUTHORIZED);
     }
-    if let Some(authorizer) = &state.authorizer
-        && authorizer.authorize(token).await.is_err()
-    {
+    if state.authorizer.authorize(token).await.is_err() {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
@@ -121,7 +112,10 @@ mod tests {
     use tower::ServiceExt;
 
     async fn get(uri: &str) -> (StatusCode, serde_json::Value) {
-        let res = crate::app()
+        let authorizer = std::sync::Arc::new(crate::capture::StaticCaptureAuthorizer::new([
+            ("phc_test123", "project-1"),
+        ]));
+        let res = super::wire_router(authorizer)
             .oneshot(Request::get(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();

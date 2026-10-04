@@ -36,12 +36,41 @@ CREATE TABLE IF NOT EXISTS distinct_ids (
     project_id TEXT NOT NULL,
     distinct_id TEXT NOT NULL,
     person_id TEXT NOT NULL,
+    -- Change sequence for identity overrides (see `identity_state`). Rows
+    -- whose person id equals their distinct id and were never repointed keep
+    -- seq 0 and never need syncing.
+    seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, distinct_id),
     FOREIGN KEY (project_id, person_id)
         REFERENCES persons(project_id, id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS distinct_ids_person
     ON distinct_ids(project_id, person_id);
+CREATE INDEX IF NOT EXISTS distinct_ids_seq
+    ON distinct_ids(project_id, seq) WHERE seq > 0;
+
+-- Identity override feed. A person id is the first distinct id ever seen for
+-- that person, so `distinct_id -> person_id` is the identity for every id
+-- that was never merged. Readers therefore only need the rows where
+-- `person_id != distinct_id` ("overrides"). Every write that creates or
+-- changes such a row stamps it with `seq = identity_state.seq + 1`; a reader
+-- that remembers the highest seq it applied can sync incrementally. A
+-- change of `epoch` (erasure, rebuild) means: discard and reload everything.
+CREATE TABLE IF NOT EXISTS identity_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    seq INTEGER NOT NULL DEFAULT 0,
+    epoch INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO identity_state (singleton, seq, epoch) VALUES (1, 0, 0);
+
+CREATE TABLE IF NOT EXISTS groups (
+    project_id TEXT NOT NULL,
+    group_type TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    properties TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(properties)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, group_type, group_key)
+);
 
 CREATE TABLE IF NOT EXISTS event_names (
     project_id TEXT NOT NULL,
@@ -165,31 +194,88 @@ fn apply_identity(
     project_id: &str,
     event: &CapturedEvent,
 ) -> Result<(), ProjectionError> {
-    let winner = ensure_person(transaction, project_id, &event.distinct_id, event)?;
-
-    if event.event == "$identify" {
-        transaction.execute(
-            "UPDATE persons SET is_identified=1 WHERE project_id=?1 AND id=?2",
-            params![project_id, winner],
-        )?;
-
-        if let Some(anonymous_id) = event
+    ensure_person(transaction, project_id, &event.distinct_id, event)?;
+    let other_id = |key: &str| {
+        event
             .properties
-            .get("$anon_distinct_id")
+            .get(key)
             .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
-            merge_persons(
-                transaction,
-                project_id,
-                anonymous_id,
-                &event.distinct_id,
-                event,
-            )?;
+            .filter(|value| !value.is_empty() && *value != event.distinct_id)
+            .map(str::to_owned)
+    };
+
+    match event.event.as_str() {
+        "$identify" => {
+            if let Some(anonymous_id) = other_id("$anon_distinct_id") {
+                merge_persons(
+                    transaction,
+                    project_id,
+                    &anonymous_id,
+                    &event.distinct_id,
+                    event,
+                    MergeGuard::RefuseIdentifiedSource,
+                )?;
+            }
+            mark_identified(transaction, project_id, &event.distinct_id)?;
         }
+        "$create_alias" => {
+            if let Some(alias) = other_id("alias") {
+                merge_persons(
+                    transaction,
+                    project_id,
+                    &alias,
+                    &event.distinct_id,
+                    event,
+                    MergeGuard::RefuseIdentifiedSource,
+                )?;
+            }
+            mark_identified(transaction, project_id, &event.distinct_id)?;
+        }
+        "$merge_dangerously" => {
+            if let Some(alias) = other_id("alias") {
+                merge_persons(
+                    transaction,
+                    project_id,
+                    &alias,
+                    &event.distinct_id,
+                    event,
+                    MergeGuard::Always,
+                )?;
+            }
+        }
+        "$groupidentify" => apply_group(transaction, project_id, event)?,
+        _ => {}
     }
 
     apply_person_properties(transaction, project_id, &event.distinct_id, event)
+}
+
+fn mark_identified(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    distinct_id: &str,
+) -> Result<(), ProjectionError> {
+    transaction.execute(
+        "UPDATE persons SET is_identified = 1
+         WHERE project_id = ?1
+           AND id = (SELECT person_id FROM distinct_ids
+                     WHERE project_id = ?1 AND distinct_id = ?2)",
+        params![project_id, distinct_id],
+    )?;
+    Ok(())
+}
+
+/// Allocate the next identity override sequence number.
+fn next_identity_seq(transaction: &Transaction<'_>) -> Result<i64, ProjectionError> {
+    transaction.execute(
+        "UPDATE identity_state SET seq = seq + 1 WHERE singleton = 1",
+        [],
+    )?;
+    Ok(transaction.query_row(
+        "SELECT seq FROM identity_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn ensure_person(
@@ -220,19 +306,32 @@ fn ensure_person(
         params![project_id, person_id, event.timestamp.to_rfc3339()],
     )?;
     transaction.execute(
-        "INSERT INTO distinct_ids(project_id, distinct_id, person_id)
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO distinct_ids(project_id, distinct_id, person_id, seq)
+         VALUES (?1, ?2, ?3, 0)",
         params![project_id, distinct_id, person_id],
     )?;
     Ok(person_id)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeGuard {
+    /// `$identify` / `$create_alias`: never fold an already identified person
+    /// into another one — two logged-in users sharing a device stay apart.
+    RefuseIdentifiedSource,
+    /// `$merge_dangerously`: the caller asserted these are one human.
+    Always,
+}
+
+/// Fold the person of `losing_distinct_id` into the person of
+/// `winning_distinct_id`. The winner's properties win conflicts; the earliest
+/// `created_at` survives; every distinct id of the loser is repointed.
 fn merge_persons(
     transaction: &Transaction<'_>,
     project_id: &str,
     losing_distinct_id: &str,
     winning_distinct_id: &str,
     event: &CapturedEvent,
+    guard: MergeGuard,
 ) -> Result<(), ProjectionError> {
     let winner = ensure_person(transaction, project_id, winning_distinct_id, event)?;
     let loser = ensure_person(transaction, project_id, losing_distinct_id, event)?;
@@ -240,14 +339,12 @@ fn merge_persons(
         return Ok(());
     }
 
-    // Match the safe PostHog identify behavior: a normal identify does not
-    // silently collapse two already identified people.
     let loser_is_identified: bool = transaction.query_row(
         "SELECT is_identified FROM persons WHERE project_id=?1 AND id=?2",
         params![project_id, loser],
         |row| row.get(0),
     )?;
-    if loser_is_identified {
+    if guard == MergeGuard::RefuseIdentifiedSource && loser_is_identified {
         return Ok(());
     }
 
@@ -258,32 +355,40 @@ fn merge_persons(
             params![project_id, winner],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-    let (loser_json, loser_created): (String, String) = transaction.query_row(
-        "SELECT properties, created_at
-         FROM persons WHERE project_id=?1 AND id=?2",
-        params![project_id, loser],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let (loser_json, loser_created, loser_first_seen): (String, String, String) = transaction
+        .query_row(
+            "SELECT properties, created_at, first_seen_key
+             FROM persons WHERE project_id=?1 AND id=?2",
+            params![project_id, loser],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
 
     let mut merged = decode_properties(&loser_json)?;
     for (key, value) in decode_properties(&winner_json)? {
         merged.insert(key, value);
     }
-    let created_at = std::cmp::min(winner_created, loser_created);
+    // The older person keeps its flag bucketing key, so a flag value seen
+    // while anonymous survives login (experience continuity).
+    let (created_at, first_seen_key) = if loser_created < winner_created {
+        (loser_created, loser_first_seen)
+    } else {
+        (winner_created, winner_first_seen)
+    };
 
+    let seq = next_identity_seq(transaction)?;
     transaction.execute(
-        "UPDATE distinct_ids SET person_id=?1
-         WHERE project_id=?2 AND person_id=?3",
-        params![winner, project_id, loser],
+        "UPDATE distinct_ids SET person_id=?1, seq=?2
+         WHERE project_id=?3 AND person_id=?4",
+        params![winner, seq, project_id, loser],
     )?;
     transaction.execute(
         "UPDATE persons
-         SET properties=?1, created_at=?2, first_seen_key=?3
+         SET properties=?1, created_at=?2, first_seen_key=?3, is_identified=1
          WHERE project_id=?4 AND id=?5",
         params![
             Value::Object(merged).to_string(),
             created_at,
-            winner_first_seen,
+            first_seen_key,
             project_id,
             winner,
         ],
@@ -291,6 +396,54 @@ fn merge_persons(
     transaction.execute(
         "DELETE FROM persons WHERE project_id=?1 AND id=?2",
         params![project_id, loser],
+    )?;
+    Ok(())
+}
+
+fn apply_group(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    event: &CapturedEvent,
+) -> Result<(), ProjectionError> {
+    let (Some(group_type), Some(group_key)) = (
+        event.properties.get("$group_type").and_then(Value::as_str),
+        event.properties.get("$group_key").and_then(|value| match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }),
+    ) else {
+        return Ok(());
+    };
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT properties FROM groups
+             WHERE project_id=?1 AND group_type=?2 AND group_key=?3",
+            params![project_id, group_type, group_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut properties = match &existing {
+        Some(encoded) => decode_properties(encoded)?,
+        None => Map::new(),
+    };
+    if let Some(set) = event.properties.get("$group_set").and_then(Value::as_object) {
+        for (key, value) in set {
+            properties.insert(key.clone(), value.clone());
+        }
+    }
+    transaction.execute(
+        "INSERT INTO groups(project_id, group_type, group_key, properties, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id, group_type, group_key)
+         DO UPDATE SET properties = excluded.properties",
+        params![
+            project_id,
+            group_type,
+            group_key,
+            Value::Object(properties).to_string(),
+            event.timestamp.to_rfc3339(),
+        ],
     )?;
     Ok(())
 }
@@ -303,7 +456,8 @@ fn apply_person_properties(
 ) -> Result<(), ProjectionError> {
     let set_once = event.properties.get("$set_once").and_then(Value::as_object);
     let set = event.properties.get("$set").and_then(Value::as_object);
-    if set_once.is_none() && set.is_none() {
+    let unset = event.properties.get("$unset").and_then(Value::as_array);
+    if set_once.is_none() && set.is_none() && unset.is_none() {
         return Ok(());
     }
 
@@ -325,6 +479,11 @@ fn apply_person_properties(
     if let Some(values) = set {
         for (key, value) in values {
             properties.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(keys) = unset {
+        for key in keys.iter().filter_map(Value::as_str) {
+            properties.remove(key);
         }
     }
 

@@ -235,7 +235,7 @@ pub struct AuthorizedProject {
 
 #[derive(Debug, Clone)]
 pub struct CaptureProject {
-    pub project_id: Option<String>,
+    pub project_id: String,
     pub token: String,
 }
 
@@ -1023,7 +1023,7 @@ fn authorize_capture(connection: &Connection, value: &str) -> Result<CaptureProj
         .optional()?;
     project_id
         .map(|project_id| CaptureProject {
-            project_id: Some(project_id),
+            project_id,
             token: value.into(),
         })
         .ok_or(AccessError::Unauthorized)

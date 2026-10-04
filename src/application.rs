@@ -203,7 +203,6 @@ impl Application {
             Arc::new(ProjectAccessCaptureAuthorizer::new(access.as_ref().clone()));
         let capture = CaptureState {
             sink: durable_sink,
-            identity: identity.clone(),
             authorizer: authorizer.clone(),
             limiter: Arc::new(crate::ratelimit::RateLimiter::new(
                 config.max_events_per_second,

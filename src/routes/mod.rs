@@ -1,11 +1,6 @@
-pub mod admin;
-pub mod api;
-pub mod auth;
-pub mod catalog;
 pub mod catalog_v2;
 pub mod config;
 pub mod dashboard;
-pub mod dashboards;
 pub mod docs;
 pub mod flags;
 pub mod health;

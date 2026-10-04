@@ -297,6 +297,15 @@ impl WriteAheadLog {
     /// Serialize, frame, write, and fsync one batch before returning its
     /// durable byte span.
     pub fn append(&mut self, batch: CapturedBatch) -> Result<WalReceipt, WalError> {
+        let receipt = self.write(&batch)?;
+        self.sync()?;
+        Ok(receipt)
+    }
+
+    /// Frame and write one batch without fsync. The receipt is not a
+    /// durability promise until a later [`Self::sync`] returns `Ok`; group
+    /// commit writes many records and pays for one fsync.
+    pub fn write(&mut self, batch: &CapturedBatch) -> Result<WalReceipt, WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
@@ -304,7 +313,7 @@ impl WriteAheadLog {
             return Err(WalError::EmptyBatch);
         }
         let event_count = batch.event_count();
-        let payload = serde_json::to_vec(&batch)?;
+        let payload = serde_json::to_vec(batch)?;
         if payload.len() > self.config.max_record_bytes {
             return Err(WalError::RecordTooLarge {
                 actual: payload.len(),
@@ -324,10 +333,6 @@ impl WriteAheadLog {
             self.poisoned = true;
             return Err(error.into());
         }
-        if let Err(error) = self.active.file.sync_all() {
-            self.poisoned = true;
-            return Err(error.into());
-        }
         self.active.bytes += framed_bytes;
         Ok(WalReceipt {
             span: WalSpan {
@@ -337,6 +342,33 @@ impl WriteAheadLog {
             },
             event_count,
         })
+    }
+
+    /// Make every written record durable. A failure poisons the log: the
+    /// kernel may have dropped dirty pages, so no later write can be trusted.
+    pub fn sync(&mut self) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if let Err(error) = self.active.file.sync_data() {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Bytes in the active (unsealed) segment.
+    pub fn active_bytes(&self) -> u64 {
+        self.active.bytes
+    }
+
+    /// A read/reclaim handle for the publisher thread. It only ever touches
+    /// sealed segments, which the writer never modifies again.
+    pub fn reader(&self) -> WalReader {
+        WalReader {
+            directory: self.directory.clone(),
+            config: self.config,
+        }
     }
 
     /// Make the current non-empty segment immutable and start a new active
@@ -380,30 +412,7 @@ impl WriteAheadLog {
     /// exactly its validated EOF; a partial-segment checkpoint never removes
     /// that segment.
     pub fn reclaim_through(&self, checkpoint: WalCursor) -> Result<Vec<u64>, WalError> {
-        let layout = discover_segment_layout(&self.directory)?;
-        let validated = validate_cursor(&layout, checkpoint, self.config.max_record_bytes)?;
-        let mut reclaim = Vec::new();
-        for (sequence, path) in layout.sealed {
-            if sequence > checkpoint.segment {
-                break;
-            }
-            let covered = sequence < checkpoint.segment
-                || (sequence == checkpoint.segment
-                    && checkpoint.byte_offset == validated.valid_bytes);
-            if covered {
-                if sequence != checkpoint.segment {
-                    scan_segment(&path, sequence, self.config.max_record_bytes, false)?;
-                }
-                reclaim.push((sequence, path));
-            }
-        }
-        for (_, path) in &reclaim {
-            std::fs::remove_file(path)?;
-        }
-        if !reclaim.is_empty() {
-            sync_directory(&self.directory)?;
-        }
-        Ok(reclaim.into_iter().map(|(sequence, _)| sequence).collect())
+        reclaim_through(&self.directory, self.config, checkpoint)
     }
 
     fn seal_nonempty(&mut self) -> Result<(), WalError> {
@@ -433,6 +442,49 @@ impl WriteAheadLog {
             }
         };
         Ok(())
+    }
+}
+
+/// Read-only view of sealed WAL segments plus reclamation, owned by the
+/// publisher thread while the writer thread keeps appending.
+#[derive(Debug, Clone)]
+pub struct WalReader {
+    directory: PathBuf,
+    config: WalConfig,
+}
+
+impl WalReader {
+    /// Stream at most `max_bytes` of whole sealed records from `cursor`.
+    pub fn read_window(
+        &self,
+        cursor: WalCursor,
+        max_bytes: u64,
+    ) -> Result<PublicationWindow, WalError> {
+        if max_bytes == 0 {
+            return Err(WalError::InvalidConfig);
+        }
+        Ok(PublicationWindow {
+            records: SealedRecords::open(&self.directory, cursor, self.config.max_record_bytes)?,
+            checkpoint: cursor,
+            max_bytes,
+            framed_bytes: 0,
+            finished: false,
+        })
+    }
+
+    /// Remove sealed segments wholly covered by a committed checkpoint.
+    pub fn reclaim_through(&self, checkpoint: WalCursor) -> Result<Vec<u64>, WalError> {
+        reclaim_through(&self.directory, self.config, checkpoint)
+    }
+
+    /// Bytes held by sealed segments that are not yet reclaimed.
+    pub fn sealed_bytes(&self) -> Result<u64, WalError> {
+        let layout = discover_segment_layout(&self.directory)?;
+        let mut bytes = 0_u64;
+        for (_, path) in layout.sealed {
+            bytes = bytes.saturating_add(std::fs::metadata(&path)?.len());
+        }
+        Ok(bytes)
     }
 }
 
@@ -625,6 +677,34 @@ impl Iterator for PublicationWindow {
         self.checkpoint = self.records.next_cursor();
         Some(Ok(record))
     }
+}
+
+fn reclaim_through(
+    directory: &Path,
+    config: WalConfig,
+    checkpoint: WalCursor,
+) -> Result<Vec<u64>, WalError> {
+    let layout = discover_segment_layout(directory)?;
+    let validated = validate_cursor(&layout, checkpoint, config.max_record_bytes)?;
+    let mut reclaim = Vec::new();
+    for (sequence, path) in layout.sealed {
+        if sequence > checkpoint.segment {
+            break;
+        }
+        let covered = sequence < checkpoint.segment
+            || (sequence == checkpoint.segment
+                && checkpoint.byte_offset == validated.valid_bytes);
+        if covered {
+            reclaim.push((sequence, path));
+        }
+    }
+    for (_, path) in &reclaim {
+        std::fs::remove_file(path)?;
+    }
+    if !reclaim.is_empty() {
+        sync_directory(directory)?;
+    }
+    Ok(reclaim.into_iter().map(|(sequence, _)| sequence).collect())
 }
 
 fn encode_frame(payload: &[u8]) -> Vec<u8> {

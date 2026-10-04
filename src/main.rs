@@ -2,7 +2,6 @@ use std::error::Error;
 use std::net::SocketAddr;
 
 use hoglet::application::{Application, ApplicationConfig};
-use hoglet::storage_bootstrap::StoragePaths;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -16,24 +15,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let data_dir = std::path::PathBuf::from(
         std::env::var("HOGLET_DATA").unwrap_or_else(|_| "hoglet-data".into()),
     );
-    match std::env::args().nth(1).as_deref() {
-        Some("migrate") => {
-            let report = hoglet::migration::migrate_legacy_storage(&StoragePaths::new(&data_dir))?;
-            tracing::info!(
-                pair_id = %report.pair_id,
-                discovered_tokens = report.discovered_tokens,
-                resumed = report.resumed,
-                already_complete = report.already_complete,
-                "offline migration complete"
-            );
-            return Ok(());
-        }
-        Some(command) => {
-            return Err(format!("unknown command {command:?}; expected `migrate`").into());
-        }
-        None => {}
-    }
-
     let addr: SocketAddr = std::env::var("HOGLET_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8000".into())
         .parse()

@@ -17,6 +17,7 @@ fn main() {
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8000);
     let total: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50_000);
     let threads: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let token: String = args.get(4).cloned().unwrap_or_else(|| "phc_load".into());
 
     let per = total / threads;
     let ok = Arc::new(AtomicUsize::new(0));
@@ -25,6 +26,7 @@ fn main() {
     let handles: Vec<_> = (0..threads)
         .map(|t| {
             let ok = ok.clone();
+            let token = token.clone();
             std::thread::spawn(move || {
                 let mut stream =
                     TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -32,7 +34,8 @@ fn main() {
                 let mut buf = [0u8; 4096];
                 for i in 0..per {
                     let body = format!(
-                        r#"{{"api_key":"phc_load","batch":[{{"event":"evt_{}","distinct_id":"u_{}"}}]}}"#,
+                        r#"{{"api_key":"{}","batch":[{{"event":"evt_{}","distinct_id":"u_{}"}}]}}"#,
+                        token,
                         i % 50,
                         (t * per + i) % 5000
                     );

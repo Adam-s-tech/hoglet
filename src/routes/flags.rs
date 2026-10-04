@@ -183,7 +183,7 @@ async fn flags(
         .as_ref()
         .and_then(|id| id.first_seen_key_for(raw_token, distinct_id));
     let evaluated = if let Some(resources) = &state.resources {
-        let Some(project_id) = authorized_project.and_then(|project| project.project_id) else {
+        let Some(project_id) = authorized_project.map(|project| project.project_id) else {
             return StatusCode::UNAUTHORIZED.into_response();
         };
         let resources = resources.clone();
