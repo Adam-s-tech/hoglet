@@ -30,12 +30,18 @@ pub fn seeds() -> u64 {
         .unwrap_or(2)
 }
 
+/// Ports are handed out from a per-process range and probed, so two servers
+/// of one test run never share one and a stranger's listener is skipped.
 pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the ephemeral port")
-        .port()
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let base = 20_000 + (u64::from(std::process::id()) * 53) % 30_000;
+    loop {
+        let offset = NEXT.fetch_add(1, Ordering::SeqCst);
+        let port = (base + offset) % 40_000 + 20_000;
+        if TcpListener::bind(("127.0.0.1", port as u16)).is_ok() {
+            return port as u16;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- process

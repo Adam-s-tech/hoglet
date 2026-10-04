@@ -544,7 +544,11 @@ impl SealedRecords {
         let terminal_cursor = layout
             .active
             .as_ref()
-            .map(|(sequence, _)| WalCursor::new(*sequence, 0));
+            .map(|(sequence, _)| WalCursor::new(*sequence, 0))
+            // The writer is between renaming a full segment and creating the
+            // next one: the checkpoint must still name the segment that is
+            // about to exist, never the end of one reclamation will delete.
+            .or_else(|| layout.next_segment_cursor());
         let segments = layout
             .sealed
             .into_iter()
@@ -919,6 +923,18 @@ struct SegmentLayout {
     active: Option<(u64, PathBuf)>,
 }
 
+impl SegmentLayout {
+    /// Start of the segment the writer creates next, while it is mid-seal
+    /// (sealed segments exist, no active one yet).
+    fn next_segment_cursor(&self) -> Option<WalCursor> {
+        if self.active.is_some() {
+            return None;
+        }
+        let (last, _) = self.sealed.last()?;
+        Some(WalCursor::new(last.checked_add(1)?, 0))
+    }
+}
+
 /// Discover the complete WAL layout and reject any ambiguity before a caller
 /// reads, repairs, or removes a segment. The first sequence may be greater
 /// than one after prefix reclamation; every sequence after it must be exactly
@@ -996,14 +1012,18 @@ fn validate_cursor(
                 .as_ref()
                 .filter(|(sequence, _)| *sequence == cursor.segment)
                 .map(|(_, path)| path)
-        })
-        .ok_or_else(|| {
-            corruption(
-                cursor.segment,
-                cursor.byte_offset,
-                "cursor segment does not exist",
-            )
-        })?;
+        });
+    let Some(path) = path else {
+        // The start of the segment the writer is about to create.
+        if cursor.byte_offset == 0 && layout.next_segment_cursor() == Some(cursor) {
+            return Ok(ValidatedCursor { valid_bytes: 0 });
+        }
+        return Err(corruption(
+            cursor.segment,
+            cursor.byte_offset,
+            "cursor segment does not exist",
+        ));
+    };
     let scan = scan_segment(path, cursor.segment, max_record_bytes, false)?;
     if cursor.byte_offset > scan.valid_bytes {
         return Err(corruption(
