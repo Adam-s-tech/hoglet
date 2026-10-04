@@ -80,14 +80,14 @@ smoke() {
     project="$(printf '%s' "$setup" | sed -n 's/.*"projects":\[{"id":"\([0-9a-f-]*\)".*/\1/p')"
     [ -n "$project" ] || fail "setup response has no project id: $setup"
     year="$(date -u +%Y)"
-    trends="{\"query\":{\"kind\":\"Trends\",\"series\":[{\"event\":{\"type\":\"name\",\"value\":\"smoke_test\"},\"math\":{\"type\":\"total\"}}],\"filters\":{\"op\":\"AND\",\"values\":[]},\"range\":{\"from\":\"$((year - 1))-01-01T00:00:00Z\",\"to\":\"$((year + 1))-12-31T00:00:00Z\"},\"interval\":\"Month\"}}"
+    trends="{\"query\":{\"kind\":\"TrendsQuery\",\"series\":[{\"event\":\"smoke_test\",\"math\":\"total\"}],\"date_range\":{\"date_from\":\"$((year - 1))-01-01\",\"date_to\":\"$((year + 1))-12-31\"},\"interval\":\"month\"},\"refresh\":true}"
     counted=0
     for _ in $(seq 1 100); do
         result="$(curl -sS -b "$smoke_data.jar" -X POST "$smoke_url/api/projects/$project/query" \
             -H 'content-type: application/json' -d "$trends")" || fail "query request"
         case "$result" in
-            *'"count":1'*) counted=1; break ;;
-            *'"results"'*) sleep 0.1 ;; # not yet published to the lake
+            *'"aggregated_value":1.0'*) counted=1; break ;;
+            *'"result"'*) sleep 0.1 ;; # not yet published to the lake
             *) fail "query failed: $result" ;;
         esac
     done
