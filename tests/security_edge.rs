@@ -989,3 +989,77 @@ async fn slow_header_clients_are_disconnected() {
     let _ = stop.send(());
     server.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn sessions_per_user_are_bounded() {
+    let h = start().await;
+    let connection = rusqlite::Connection::open(h.dir.path().join("control.db")).unwrap();
+    let user: String = connection
+        .query_row("SELECT id FROM users", [], |row| row.get(0))
+        .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for index in 0..200 {
+        connection
+            .execute(
+                "INSERT INTO auth_sessions(id,user_id,created_at,expires_at) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![format!("old-{index}"), user, now - 1000 + index, now + 86_400],
+            )
+            .unwrap();
+    }
+    let (status, _, _) = send(
+        &h.router,
+        Request::post("/api/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"email": "owner@example.com", "password": PASSWORD}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM auth_sessions WHERE user_id=?1",
+            [&user],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 50);
+    // The oldest are the ones retired.
+    let oldest: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM auth_sessions WHERE id='old-0'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(oldest, 0);
+    h.finish().await;
+}
+
+/// KNOWN OPEN FINDING (src/query/sql_query.rs, outside this change): a single
+/// SQL result cell is not size-capped, so `repeat('x', 1e9)` makes the server
+/// build and send a 1 GB response. Un-ignore once cells are truncated.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "open finding: SQL result cells are unbounded (src/query/sql_query.rs)"]
+async fn sql_result_cells_are_size_capped() {
+    let h = start().await;
+    let (status, _, body) = send(
+        &h.router,
+        Request::post(format!("/api/projects/{}/query", h.project_id))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, &h.cookie)
+            .body(Body::from(
+                json!({"query": {"kind": "SqlQuery", "query": "select repeat('x', 50000000) as c"}})
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        status != StatusCode::OK || body.len() < 5 * 1024 * 1024,
+        "a single cell produced a {} byte response",
+        body.len()
+    );
+    h.finish().await;
+}

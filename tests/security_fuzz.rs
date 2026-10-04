@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 8000, ..ProptestConfig::default() })]
 
     #[test]
     fn decode_never_panics(
@@ -35,6 +35,12 @@ proptest! {
     ) {
         let body = format!("{prefix}{text}");
         let _ = decompress::decode_limited(body.as_bytes(), form, hint, 1 << 20);
+    }
+
+    #[test]
+    fn timestamps_never_panic(raw in "\\PC{0,40}", suffix in "[+-]?[0-9a-z]{0,3}") {
+        let _ = event::parse_timestamp(&raw);
+        let _ = event::parse_timestamp(&format!("{raw}{suffix}"));
     }
 
     #[test]
@@ -207,6 +213,82 @@ fn flag_regexes_are_bounded() {
         assert!(status.as_u16() < 500, "{pattern} evaluate -> {status}");
     }
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    let Server { runtime, application, router, .. } = server;
+    drop(router);
+    runtime.block_on(application.shutdown()).unwrap();
+}
+
+/// Flags with every operator and hostile values, evaluated against hostile
+/// person properties: never a 5xx, never a panic.
+#[test]
+fn flag_evaluation_never_panics_for_any_operator_or_value() {
+    let server = server();
+    let operators = [
+        "exact", "is_not", "icontains", "not_icontains", "regex", "not_regex", "gt", "gte", "lt",
+        "lte", "is_set", "is_not_set", "is_date_before", "is_date_after",
+    ];
+    let value = || {
+        prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(|number| json!(number)),
+            any::<f64>().prop_map(|number| json!(number)),
+            "\\PC{0,24}".prop_map(Value::String),
+            prop_oneof![
+                Just("-99999999999999999999d"),
+                Just("-9223372036854775808h"),
+                Just("-10000d"),
+                Just("-1y"),
+                Just("2026-13-45"),
+                Just("+262142-12-31T23:59:59Z"),
+                Just("-262143-01-01T00:00:00Z"),
+                Just("1e999"),
+                Just("(a+)+$"),
+            ]
+            .prop_map(|text| Value::String(text.to_owned())),
+            proptest::collection::vec(any::<i32>().prop_map(|number| json!(number)), 0..4)
+                .prop_map(Value::Array),
+        ]
+    };
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: 400,
+        ..ProptestConfig::default()
+    });
+    let counter = std::cell::Cell::new(0_u32);
+    runner
+        .run(
+            &(0..operators.len(), value(), value()),
+            |(operator, filter_value, person_value)| {
+                counter.set(counter.get() + 1);
+                let key = format!("fuzz-flag-{}", counter.get());
+                let create = Request::post(format!("/api/projects/{}/feature_flags", server.project_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &server.cookie)
+                    .body(Body::from(
+                        json!({
+                            "key": key,
+                            "filters": {"groups": [{
+                                "properties": [{"key": "p", "type": "person", "operator": operators[operator], "value": filter_value}],
+                                "rollout_percentage": 100
+                            }]}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+                let status = server.runtime.block_on(send(&server.router, create));
+                prop_assert!(status.as_u16() < 500, "create {operator} -> {status}");
+                let evaluate = Request::post("/flags/?v=2")
+                    .body(Body::from(
+                        json!({"token": "phc_fuzz", "distinct_id": "u", "person_properties": {"p": person_value}})
+                            .to_string(),
+                    ))
+                    .unwrap();
+                let status = server.runtime.block_on(send(&server.router, evaluate));
+                prop_assert!(status == StatusCode::OK, "evaluate {operator} -> {status}");
+                Ok(())
+            },
+        )
+        .unwrap();
     let Server { runtime, application, router, .. } = server;
     drop(router);
     runtime.block_on(application.shutdown()).unwrap();

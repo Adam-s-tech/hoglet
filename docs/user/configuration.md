@@ -14,6 +14,11 @@ Hoglet is configured with environment variables only. There is no config file.
 | `HOGLET_COOKIELESS_SALT` | unset: off | Secret salt. When set, events that have no `$device_id` get one derived from the client IP, the salt and the UTC date, so it rotates daily. Needs the client IP header (see [Deploy](deploy.md#client-ip-header)). An empty value is the same as unset. |
 | `HOGLET_NO_UA_PARSE` | unset: parsing on | Set to any value to stop parsing the User-Agent. By default Hoglet fills `$browser`, `$browser_version`, `$os`, `$os_version` and `$device_type` from the request's User-Agent when the event does not already have them. Server SDKs send none of these. |
 | `HOGLET_DEMO` | unset | Exactly `1`, on a fresh data directory, creates the demo account `demo@hoglet.dev` / `hoglet-demo-1` with 90 days of generated data. Ignored if the directory already has an account. |
+| `HOGLET_SETUP_TOKEN` | unset | When set, creating the first account needs this token: header `X-Hoglet-Setup-Token` or a `setup_token` field in the `POST /api/auth/setup` body. The dashboard's setup form has no token field, so with this set, create the account with `curl`. Without it, whoever opens the dashboard first becomes the owner, so finish setup before exposing the port. |
+| `HOGLET_TRUST_PROXY` | unset | Exactly `1` behind a reverse proxy that overwrites `X-Forwarded-For` (the Caddy and nginx examples do): login throttling then keys on the last entry. Leave unset when Hoglet is reached directly. |
+| `HOGLET_SECURE_COOKIES` | unset | Exactly `1` always adds `Secure` to the session cookie. It is added anyway when the proxy sends `X-Forwarded-Proto: https`. |
+| `HOGLET_METRICS_TOKEN` | unset: `/metrics` is open | When set, `/metrics` needs `Authorization: Bearer <token>`. |
+| `HOGLET_ALLOW_PRIVATE_FORWARDING` | unset | Exactly `1` lets shadow-mode forwarding reach loopback, private and link-local addresses (a PostHog on the same network). By default those are refused. |
 | `RUST_LOG` | `hoglet=info` | Log filter (standard `tracing` syntax, for example `hoglet=debug`). |
 
 A number that does not parse (for example `HOGLET_RETENTION_DAYS=x`) stops

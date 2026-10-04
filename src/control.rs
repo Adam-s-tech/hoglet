@@ -23,6 +23,8 @@ use crate::token;
 
 const COMMAND_CAPACITY: usize = 128;
 const SESSION_TTL_SECONDS: i64 = 7 * 24 * 3600;
+/// Concurrently valid sessions per user; a new login retires the oldest.
+const MAX_SESSIONS_PER_USER: i64 = 50;
 const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = r#"
@@ -940,6 +942,13 @@ fn start_session(connection: &mut Connection, user_id: &str) -> Result<SetupResu
     transaction.execute(
         "INSERT INTO auth_sessions(id,user_id,created_at,expires_at) VALUES (?1,?2,?3,?4)",
         rusqlite::params![session_id, user_id, now, now + SESSION_TTL_SECONDS],
+    )?;
+    // Bounded: only the newest sessions of a user stay valid.
+    transaction.execute(
+        "DELETE FROM auth_sessions WHERE user_id=?1 AND rowid NOT IN (
+             SELECT rowid FROM auth_sessions WHERE user_id=?1
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2)",
+        rusqlite::params![user_id, MAX_SESSIONS_PER_USER],
     )?;
     transaction.commit()?;
 

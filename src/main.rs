@@ -128,6 +128,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     eprintln!("  data        {}", data_dir.display());
     if demo {
         eprintln!("  demo login  {DEMO_EMAIL} / {DEMO_PASSWORD}");
+        if !addr.ip().is_loopback() {
+            tracing::warn!(
+                "HOGLET_DEMO created a published password and {addr} is reachable beyond \
+                 this machine: change it or do not expose this instance"
+            );
+        }
     }
     eprintln!();
     tracing::info!(%addr, "hoglet listening");
