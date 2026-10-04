@@ -127,6 +127,9 @@ Made inside the approved rebuild; listed so the boss can veto any of them.
 
 Dashboard stays React + TypeScript (Vite, embedded via rust-embed) and moves its
 component layer to **shadcn/ui on Base UI** (not Radix). Components are copied
-into the repo (shadcn model), Tailwind is a build-time dependency only. Charts
+into the repo (shadcn model), Tailwind is a build-time dependency only.
+TanStack libraries are used wherever they fit: Router (typed routes and search
+params), Query (all API calls), Table, Form, Virtual — client-only, no Start/SSR.
+Bundle budget: ≤ 260 KB gzipped JS with route-level splitting. Charts
 stay hand-written SVG: no charting library, no recharts. `web/dist/` stays
 committed so `cargo build` needs no Node.
