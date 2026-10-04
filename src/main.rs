@@ -10,6 +10,9 @@ USAGE:
     hoglet                  Start the server
     hoglet import posthog   Copy a PostHog project's history into Hoglet
                             (see `hoglet import posthog --help`)
+    hoglet reconcile posthog
+                            Compare Hoglet's numbers with PostHog's
+                            (see `hoglet reconcile posthog --help`)
     hoglet --version        Print the version
 
 ENVIRONMENT:
@@ -52,6 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
         Some("import") => return run_import().await,
+        Some("reconcile") => return run_reconcile().await,
         Some("serve") | None => {}
         Some(other) => return Err(format!("unknown command {other:?}; see `hoglet --help`").into()),
     }
@@ -141,6 +145,27 @@ async fn run_import() -> Result<(), Box<dyn Error>> {
         "done: {} events, {} persons, {} flags",
         report.events, report.persons, report.flags
     );
+    Ok(())
+}
+
+async fn run_reconcile() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    match args.first().map(String::as_str) {
+        Some("posthog") => {}
+        _ => return Err("usage: hoglet reconcile posthog --help".into()),
+    }
+    if args.len() == 1 || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{}", hoglet::reconcile::HELP);
+        return Ok(());
+    }
+    let config = hoglet::reconcile::parse_args(&args[1..])?;
+    let tolerance = config.tolerance_percent;
+    let rows = tokio::task::spawn_blocking(move || hoglet::reconcile::run(&config)).await??;
+    let (table, all_match) = hoglet::reconcile::render(&rows, tolerance);
+    print!("{table}");
+    if !all_match {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

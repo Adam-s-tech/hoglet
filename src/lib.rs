@@ -24,6 +24,7 @@ pub mod pipeline;
 pub mod projection_catalog;
 pub mod projections;
 pub mod query;
+pub mod reconcile;
 pub mod ratelimit;
 pub mod routes;
 pub mod sink;
