@@ -44,6 +44,17 @@ pub fn free_port() -> u16 {
     }
 }
 
+/// Print a result line, and append it to `HOGLET_MATRIX_OUT` when set.
+pub fn log_line(line: &str) {
+    use std::io::Write;
+    println!("{line}");
+    if let Ok(path) = std::env::var("HOGLET_MATRIX_OUT")
+        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 // ---------------------------------------------------------------- process
 
 pub struct Server {
@@ -420,7 +431,6 @@ impl Writers {
                 let prefix = id_prefix.to_owned();
                 std::thread::spawn(move || {
                     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(1_000).wrapping_add(writer as u64));
-                    let mut unknown_streak = 0;
                     while !stop.load(Ordering::Relaxed) {
                         let size = rng.gen_range(1..=max_batch);
                         let plans: Vec<EventPlan> = (0..size)
@@ -435,14 +445,14 @@ impl Writers {
                             })
                             .collect();
                         match post_batch(port, &ledger, &plans) {
+                            // A timeout under load must not retire the writer
+                            // (the fault may then never be reached); a dead
+                            // server just refuses quickly until `stop`.
                             Outcome::Unknown => {
-                                unknown_streak += 1;
-                                if unknown_streak > 3 {
-                                    break;
-                                }
+                                std::thread::sleep(Duration::from_millis(20));
                             }
                             Outcome::Rejected(code) => panic!("capture answered {code}; the harness sent a bad batch"),
-                            _ => unknown_streak = 0,
+                            _ => {}
                         }
                         if pace_ms > 0 {
                             std::thread::sleep(Duration::from_millis(rng.gen_range(0..=pace_ms)));

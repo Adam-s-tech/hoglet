@@ -201,11 +201,11 @@ impl Tally {
 
 fn report(line: &str) {
     println!("{line}");
-    if let Ok(path) = std::env::var("HOGLET_MATRIX_OUT") {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{line}");
-        }
+    use std::io::Write;
+    if let Ok(path) = std::env::var("HOGLET_MATRIX_OUT")
+        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 

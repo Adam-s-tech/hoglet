@@ -66,13 +66,7 @@ fn wal_failure(point: &str, seed: u64) {
         report.stored,
         ledger.retryable.load(Ordering::Relaxed)
     );
-    println!("{line}");
-    if let Ok(path) = std::env::var("HOGLET_MATRIX_OUT") {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{line}");
-        }
-    }
+    log_line(&line);
 }
 
 #[test]

@@ -22,7 +22,6 @@
 mod claim2_support;
 
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,15 +43,6 @@ struct Plan {
     spec: String,
     segment_bytes: Option<u64>,
     kind: Kind,
-}
-
-fn log_line(line: &str) {
-    println!("{line}");
-    if let Ok(path) = std::env::var("HOGLET_MATRIX_OUT") {
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{line}");
-        }
-    }
 }
 
 fn run(plan: &Plan, seed: u64) -> Result<Report, String> {

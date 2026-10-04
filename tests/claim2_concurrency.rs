@@ -214,13 +214,6 @@ fn run(seed: u64) -> String {
 #[test]
 fn writers_compaction_erasure_readers_and_restarts_keep_every_invariant() {
     for seed in 0..seeds() {
-        let line = run(seed);
-        println!("{line}");
-        if let Ok(path) = std::env::var("HOGLET_MATRIX_OUT") {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(file, "{line}");
-            }
-        }
+        log_line(&run(seed));
     }
 }
