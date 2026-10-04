@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS persons (
     PRIMARY KEY (project_id, id)
 );
 
+-- Persons list: newest first, keyset-paged.
+CREATE INDEX IF NOT EXISTS persons_created
+    ON persons(project_id, created_at, id);
+
 CREATE TABLE IF NOT EXISTS distinct_ids (
     project_id TEXT NOT NULL,
     distinct_id TEXT NOT NULL,

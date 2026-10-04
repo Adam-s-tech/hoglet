@@ -197,6 +197,11 @@ impl Application {
                 .map_err(|error| ApplicationError::Query(format!("{error:?}")))?,
         );
         let projection_catalog = Arc::new(ProjectionCatalog::open(&paths.projections())?);
+        let event_source: Arc<dyn crate::source::EventSource> = lake.clone();
+        let explorer = Arc::new(
+            crate::explore::Explorer::new(event_source, persons.clone())
+                .map_err(|error| ApplicationError::Query(error.to_string()))?,
+        );
 
         let flag_store = Arc::new(
             crate::flags::FlagStore::open(&paths.control())
@@ -252,6 +257,15 @@ impl Application {
                 flag_store,
                 persons.clone(),
             ))
+            .merge(crate::routes::persons::router(
+                access.clone(),
+                explorer.clone(),
+            ))
+            .merge(crate::routes::events::router(
+                access.clone(),
+                explorer.clone(),
+            ))
+            .merge(crate::routes::web::router(access.clone(), explorer))
             .merge(crate::routes::resources::router(access.clone(), resources));
 
         Ok(Self {
