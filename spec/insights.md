@@ -1,5 +1,8 @@
 # Insight Suite — Implementation Spec
 
+> **Historical design note.** Written before the 2026-10 rebuild; parts describe code that no longer exists. The shipped contract is `src/contract/` (exported to `web/src/types/`), the decisions are in `decisions.md` and `docs/adr/`, and user-facing behaviour is in `docs/user/`.
+
+
 P3. Funnels, retention, lifecycle, stickiness, formulas, SQL access, actor
 drill-down. Each insight = an IR kind + compiler template + oracle + (later)
 UI panel. The trend is already the phase that puts the IR to real use.

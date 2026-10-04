@@ -1,5 +1,8 @@
 # Auth & Accounts — Implementation Spec
 
+> **Historical design note.** Written before the 2026-10 rebuild; parts describe code that no longer exists. The shipped contract is `src/contract/` (exported to `web/src/types/`), the decisions are in `decisions.md` and `docs/adr/`, and user-facing behaviour is in `docs/user/`.
+
+
 P4. Required before anyone runs Hoglet for real — currently the dashboard and
 all `/api/*` endpoints are wide open. Capture edge stays token-authed.
 

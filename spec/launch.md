@@ -1,5 +1,8 @@
 # Launch — Implementation Spec
 
+> **Historical design note.** Written before the 2026-10 rebuild; parts describe code that no longer exists. The shipped contract is `src/contract/` (exported to `web/src/types/`), the decisions are in `decisions.md` and `docs/adr/`, and user-facing behaviour is in `docs/user/`.
+
+
 P8. One-curl install, prebuilt binaries, demo, docs, Show HN. The final
 mile before the repo goes public.
 

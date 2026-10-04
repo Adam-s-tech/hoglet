@@ -1,5 +1,8 @@
 # Data Model Maturity — Implementation Spec
 
+> **Historical design note.** Written before the 2026-10 rebuild; parts describe code that no longer exists. The shipped contract is `src/contract/` (exported to `web/src/types/`), the decisions are in `decisions.md` and `docs/adr/`, and user-facing behaviour is in `docs/user/`.
+
+
 P2. Properties catalog, sessions, persons v2, enrichment. Every piece the
 query lane needs to filter, break down, and compute over — beyond the raw
 event stream.

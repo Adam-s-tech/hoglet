@@ -1,5 +1,8 @@
 # Dashboards, Saved Insights, Sharing — Implementation Spec
 
+> **Historical design note.** Written before the 2026-10 rebuild; parts describe code that no longer exists. The shipped contract is `src/contract/` (exported to `web/src/types/`), the decisions are in `decisions.md` and `docs/adr/`, and user-facing behaviour is in `docs/user/`.
+
+
 P6. The product surface: build insights, save them, pin them to dashboards,
 share with a link. The backend is straightforward CRUD on SQLite; the frontend
 is an IR editor that talks to the catalog for autocomplete.

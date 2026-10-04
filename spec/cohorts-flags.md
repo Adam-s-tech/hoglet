@@ -1,5 +1,8 @@
 # Cohorts & Flags Complete — Implementation Spec
 
+> **Historical design note.** Written before the 2026-10 rebuild; parts describe code that no longer exists. The shipped contract is `src/contract/` (exported to `web/src/types/`), the decisions are in `decisions.md` and `docs/adr/`, and user-facing behaviour is in `docs/user/`.
+
+
 P5. Cohorts as a first-class filter source in the IR, flag payloads and cohort
 targeting, local evaluation endpoint, experience continuity.
 
