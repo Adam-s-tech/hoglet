@@ -55,9 +55,12 @@ function short(s: string, n = 28): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
+/** Least width per step column before the diagram scrolls horizontally. */
+const MIN_STEP_W = 150;
+
 const linkId = (l: PathLink) => `${l.source}>${l.target}`;
 
-export function PathsSankey({ links }: { links: PathLink[] }) {
+export function PathsSankey({ links, compact = false }: { links: PathLink[]; compact?: boolean }) {
   const [ref, size] = useSize<HTMLDivElement>();
   const [hot, setHot] = useState<{ kind: "node" | "link"; id: string } | null>(null);
   const [tip, setTip] = useState<{ x: number; y: number; band: Band } | null>(null);
@@ -89,7 +92,8 @@ export function PathsSankey({ links }: { links: PathLink[] }) {
     return { nodes, columns, steps, maxCount };
   }, [links]);
 
-  const width = size.width;
+  // Narrow screens scroll sideways instead of squeezing the steps together.
+  const width = size.width === 0 ? 0 : Math.max(size.width, layout.columns.length * MIN_STEP_W);
   const height = Math.max(340, Math.min(900, layout.maxCount * 44));
   const nodeW = 10;
   const pad = 14;
@@ -205,7 +209,9 @@ export function PathsSankey({ links }: { links: PathLink[] }) {
   const selOut = sel ? links.filter((l) => l.source === sel.id).sort((a, b) => b.value - a.value) : [];
 
   return (
-    <div className="chart" ref={ref}>
+    <div ref={ref}>
+      <div className="overflow-x-auto pb-1">
+      <div className="chart" style={{ width }}>
       <svg
         ref={svgRef}
         width={width}
@@ -317,6 +323,8 @@ export function PathsSankey({ links }: { links: PathLink[] }) {
           <TipRow label="Avg time between" value={fmtDuration(tip.band.link.average_conversion_time_s)} />
         </Tip>
       )}
+      </div>
+      </div>
       <div id={detailId} aria-live="polite">
         {sel && (
           <section className="mt-3 rounded-lg border p-3 text-sm" aria-label={`Flows at ${sel.name}`}>
@@ -336,6 +344,7 @@ export function PathsSankey({ links }: { links: PathLink[] }) {
           </section>
         )}
       </div>
+      {!compact && (
       <DataTableToggle
         caption="Path flows"
         head={["From", "To", "Persons", "Share of source", "Avg time between"]}
@@ -352,6 +361,7 @@ export function PathsSankey({ links }: { links: PathLink[] }) {
             ];
           })}
       />
+      )}
     </div>
   );
 }

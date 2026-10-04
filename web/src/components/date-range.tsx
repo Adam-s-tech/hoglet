@@ -32,17 +32,32 @@ export function DateRangePicker({
 }) {
   const [open, setOpen] = useState(false);
   const today = isoDay(new Date());
-  const [from, setFrom] = useState(() => (/^\d{4}-/.test(value.date_from) ? value.date_from.slice(0, 10) : isoDay(new Date(Date.now() - 13 * 86_400_000))));
-  const [to, setTo] = useState(() => (value.date_to && /^\d{4}-/.test(value.date_to) ? value.date_to.slice(0, 10) : today));
+  const initialFrom = () => (/^\d{4}-/.test(value.date_from) ? value.date_from.slice(0, 10) : isoDay(new Date(Date.now() - 13 * 86_400_000)));
+  const initialTo = () => (value.date_to && /^\d{4}-/.test(value.date_to) ? value.date_to.slice(0, 10) : today);
+  const [from, setFrom] = useState(initialFrom);
+  const [to, setTo] = useState(initialTo);
+
+  const problem = !from || !to ? "Pick both dates." : from > to ? "The start date is after the end date." : to > today ? "Dates in the future have no data yet." : null;
+  const days = problem ? 0 : Math.round((Date.parse(`${to}T00:00`) - Date.parse(`${from}T00:00`)) / 86_400_000) + 1;
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(o) => {
+        // Reopening starts from the range in force, not a half-edited one.
+        if (o) {
+          setFrom(initialFrom());
+          setTo(initialTo());
+        }
+        setOpen(o);
+      }}
+    >
       <PopoverTrigger render={<Button variant="outline" size={small ? "sm" : "default"} />} aria-label={`Date range: ${rangeLabel(value.date_from, value.date_to)}`}>
         <Icon name="calendar" size={14} />
         {rangeLabel(value.date_from, value.date_to)}
         <Icon name="chevronDown" size={12} className="text-muted-foreground" />
       </PopoverTrigger>
-      <PopoverContent align="start" className="w-64 gap-0 p-1">
+      <PopoverContent align="start" className="w-72 gap-0 p-1">
         <div role="listbox" aria-label="Date range presets" className="flex flex-col">
           {presets.map((p) => {
             const selected = p.date_from === value.date_from && (p.date_to ?? null) === (value.date_to ?? null);
@@ -69,16 +84,24 @@ export function DateRangePicker({
           })}
         </div>
         <div className="my-1 h-px bg-border" />
-        <div className="flex flex-col gap-1.5 px-2 pt-1.5 pb-2">
+        <div className="flex flex-col gap-2 px-2 pt-1.5 pb-2">
           <span className="text-xs font-semibold text-muted-foreground">Custom range</span>
-          <div className="flex items-center gap-1">
-            <Input type="date" className="h-7 min-w-0 flex-1 px-1.5 text-xs" value={from} max={to} onChange={(e) => setFrom(e.target.value)} aria-label="From date" />
-            <span className="text-muted-foreground">–</span>
-            <Input type="date" className="h-7 min-w-0 flex-1 px-1.5 text-xs" value={to} min={from} max={today} onChange={(e) => setTo(e.target.value)} aria-label="To date" />
+          <div className="grid grid-cols-2 gap-2">
+            <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
+              From
+              <Input type="date" className="h-8 min-w-0 px-1.5 text-xs text-foreground" value={from} max={to < today ? to : today} onChange={(e) => setFrom(e.target.value)} />
+            </label>
+            <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
+              To
+              <Input type="date" className="h-8 min-w-0 px-1.5 text-xs text-foreground" value={to} min={from} max={today} onChange={(e) => setTo(e.target.value)} />
+            </label>
           </div>
+          <p className={cn("min-h-4 text-xs", problem ? "text-destructive" : "text-muted-foreground")} role={problem ? "alert" : undefined}>
+            {problem ?? `${days} ${days === 1 ? "day" : "days"} selected`}
+          </p>
           <Button
             size="sm"
-            disabled={!from || !to || from > to}
+            disabled={problem !== null}
             onClick={() => {
               onChange({ date_from: from, date_to: to === today ? null : `${to}T23:59:59` });
               setOpen(false);

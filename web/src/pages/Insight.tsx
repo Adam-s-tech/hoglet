@@ -303,6 +303,8 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [sqlRun, setSqlRun] = useState<InsightQuery | null>(null);
+  /** Below `lg` the builder collapses behind a button; new insights start open, saved ones start on the result. */
+  const [builderOpen, setBuilderOpen] = useState(id === null);
 
   // Load a saved insight into the editor once; later refetches never clobber edits.
   const loadedFor = useRef<string | null>(null);
@@ -325,6 +327,7 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
 
   const isSql = query?.kind === "SqlQuery";
   const run = useInsightQuery(isSql ? sqlRun : query, isSql ? 0 : 350);
+  const firstRun = useFirstRun();
 
   const update = (q: InsightQuery) => {
     setQuery(q);
@@ -428,7 +431,6 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
   };
 
   const meta = isSql && !sqlRun ? undefined : run.data?.meta;
-  const firstRun = useFirstRun();
   const resultBody = (
     <div className={`relative p-4 ${isSql ? "min-h-[200px]" : "min-h-[380px]"}`}>
       <LoadingBar show={run.pending && !!run.data} />
@@ -568,7 +570,19 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
         </div>
       ) : (
         <div className="grid items-start gap-4 lg:grid-cols-[380px_minmax(0,1fr)]">
-          <Panel>
+          <Button
+            variant="outline"
+            className="justify-between lg:hidden"
+            aria-expanded={builderOpen}
+            aria-controls="query-builder"
+            onClick={() => setBuilderOpen((v) => !v)}
+          >
+            <span className="flex items-center gap-2">
+              <Icon name="filter" size={14} /> Edit query
+            </span>
+            <Icon name="chevronDown" size={14} className={builderOpen ? "rotate-180" : undefined} />
+          </Button>
+          <Panel id="query-builder" className={builderOpen ? undefined : "hidden lg:block"}>
             <QueryEditor query={query} onChange={update} />
           </Panel>
           <Panel className="relative">
