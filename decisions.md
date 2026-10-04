@@ -61,7 +61,7 @@ Live examples right now:
 Stack: Rust (tokio+axum), hand-rolled WAL, Parquet+DuckDB (events), SQLite (OLTP), React+TS embedded via rust-embed with ts-rs. Full detail in `stack.md`.
 
 - **SQLite over Turso.** Turso's MVCC — its only advantage for us — is flagged not-production-ready by its own manual. Revisit at Turso 1.0 + stable MVCC + frozen format.
-- **React over Dioxus/topcoat.** No maintained Rust library does interactive analytics charts; charts are the whole dashboard.
+- **React over Dioxus/topcoat** (component layer: shadcn/ui on Base UI, see "UI stack").** No maintained Rust library does interactive analytics charts; charts are the whole dashboard.
 - **DuckDB over DataFusion**, used read-only as a query engine over Parquet segments. Never a live read-write `.duckdb` file (single-writer wall).
 - **traceparent deferred.** Store the header's trace_id as an event property if free; build no query/UI until users ask. A hypothesis, not a differentiator.
 - **Scope ladder:** now = client+server events, identity, flags (AI events captured free via compat). Later = error tracking (exceptions are events), AI analytics dashboard, MCP server over the query API. Never = traces/logs/metrics including LLM trace waterfalls — store trace_id, link out.
@@ -122,3 +122,11 @@ Made inside the approved rebuild; listed so the boss can veto any of them.
 - **posthog-js surveys loader stub** at `/static/surveys.js` — the SDK loads it
   even with surveys off; a no-op extension avoids console errors.
 - **Demo data** (`HOGLET_DEMO=1`, `POST /demo`) goes through the real pipeline.
+
+## UI stack (boss, 2026-10-05)
+
+Dashboard stays React + TypeScript (Vite, embedded via rust-embed) and moves its
+component layer to **shadcn/ui on Base UI** (not Radix). Components are copied
+into the repo (shadcn model), Tailwind is a build-time dependency only. Charts
+stay hand-written SVG: no charting library, no recharts. `web/dist/` stays
+committed so `cargo build` needs no Node.
