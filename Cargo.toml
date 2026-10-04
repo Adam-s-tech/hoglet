@@ -36,8 +36,15 @@ argon2 = "0.5"
 sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
 regex = "1"
+libc = { version = "0.2", optional = true }
+
+[features]
+# Test-only crash and I/O fault hooks (src/fault.rs). Compiled out of release
+# builds: with the feature off every hook is an empty inline function.
+fault-injection = ["dep:libc"]
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"

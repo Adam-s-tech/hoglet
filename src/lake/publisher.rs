@@ -178,10 +178,13 @@ impl Publisher {
                 let dir = self.lake.partition_dir(&project_id, day)?;
                 let path = dir.join(format!("g{generation:012}-{index:04}.parquet"));
                 let temporary = path.with_extension("parquet.tmp");
+                crate::fault::io("pub.parquet_write").map_err(super::io_error(&temporary))?;
                 let bytes = super::parquet::write_file(&partition, &temporary)
                     .map_err(super::io_error(&temporary))?;
+                crate::fault::hit("pub.after_tmp_write");
                 std::fs::rename(&temporary, &path).map_err(super::io_error(&path))?;
                 sync_dir(&dir)?;
+                crate::fault::hit("pub.after_rename");
                 written.push(path.clone());
                 added.push(insert_file(
                     &transaction,
@@ -210,12 +213,15 @@ impl Publisher {
 
         let committed = advance_state(&transaction, &state, Some(next_checkpoint), now.timestamp())?;
         debug_assert_eq!(committed, generation);
+        crate::fault::hit("pub.before_commit");
         transaction.commit()?;
+        crate::fault::hit("pub.after_commit");
         drop(connection);
 
         let files = added.len();
         self.lake.activate(generation, added, &HashSet::new());
         self.wal.reclaim_through(next_checkpoint)?;
+        crate::fault::hit("pub.after_reclaim");
         Ok(Some(Published {
             generation,
             checkpoint: next_checkpoint,

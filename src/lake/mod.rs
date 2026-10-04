@@ -469,6 +469,7 @@ impl Lake {
             }
             match remove_if_exists(&file.path) {
                 Ok(()) => {
+                    crate::fault::hit("lake.sweep.after_unlink");
                     removed.push(file.id);
                     false
                 }

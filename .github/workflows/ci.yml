@@ -25,6 +25,33 @@ jobs:
       - run: cargo test --all
       - run: cargo clippy -- -D warnings
 
+  claims-2-and-4:
+    # Evidence for claims.md claims 2 (no lost events) and 4 (honest person
+    # counts): kill-point matrix, WAL corruption fuzz, I/O error injection,
+    # concurrency, and person-graph properties. PRs run a modest iteration
+    # count; the nightly run raises it (HOGLET_FAULT_SEEDS = randomized runs
+    # per kill point, HOGLET_PROPTEST_CASES = proptest cases per property).
+    runs-on: ubuntu-latest
+    env:
+      HOGLET_PROPTEST_CASES: ${{ github.event_name == 'schedule' && '5000' || '256' }}
+      HOGLET_FAULT_SEEDS: ${{ github.event_name == 'schedule' && '12' || '2' }}
+      HOGLET_CONC_CYCLES: ${{ github.event_name == 'schedule' && '12' || '4' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: person graph (claim 4) and WAL damage (claim 2), default build
+        run: cargo test --test claim4_person_graph --test claim2_wal_corruption --test claim2_wal_cursor_race --test claim2_erasure_atomicity
+      - name: fault hooks are compiled out of the shipped binary
+        run: |
+          cargo build
+          ! strings target/debug/hoglet | grep -q "fault injection: aborting at"
+      - name: kill-point matrix, I/O errors, concurrency, WAL damage end to end (fault-injection build)
+        run: cargo test --features fault-injection --test claim2_kill_matrix --test claim2_io_errors --test claim2_concurrency --test claim2_wal_corruption
+      - run: cargo clippy --all-targets --features fault-injection -- -D warnings
+
   sdk-contract:
     # Real PostHog SDKs at `latest` (never pinned) against a real Hoglet
     # binary, asserting on SDK-observable behavior and stored outcomes.
