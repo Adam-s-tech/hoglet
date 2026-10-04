@@ -32,6 +32,22 @@ posthog = Posthog('phc_your_project_token', host='https://analytics.example.com'
 
 Put Hoglet behind any TLS reverse proxy (Caddy, nginx) — see [`deploy/`](deploy/).
 
+## Documentation
+
+User docs are in [`docs/user/`](docs/user/README.md):
+[quickstart](docs/user/quickstart.md),
+[SDK setup](docs/user/sdk-setup.md),
+[migrate from PostHog](docs/user/migrate-from-posthog.md),
+[deploy](docs/user/deploy.md),
+[data and backup](docs/user/data-and-backup.md),
+[configuration](docs/user/configuration.md),
+[insights and queries](docs/user/insights-and-queries.md),
+[feature flags](docs/user/feature-flags.md),
+[API](docs/user/api.md),
+[FAQ](docs/user/faq.md) and
+[troubleshooting](docs/user/troubleshooting.md).
+A running instance serves its API reference at `/docs`.
+
 ## What you get
 
 - **Every PostHog SDK, unchanged.** Capture on every PostHog endpoint, gzip and
