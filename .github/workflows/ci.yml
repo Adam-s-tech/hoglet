@@ -26,7 +26,14 @@ jobs:
       - run: cargo clippy -- -D warnings
 
   sdk-contract:
+    # Real PostHog SDKs at `latest` (never pinned) against a real Hoglet
+    # binary, asserting on SDK-observable behavior and stored outcomes.
+    name: sdk-contract (${{ matrix.suite }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [node, browser, python]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,17 +41,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: actions/setup-python@v5
+        if: matrix.suite == 'python'
+        with:
+          python-version: "3.12"
       - run: cargo build
-      - name: posthog-node latest vs hoglet
-        working-directory: contract-tests
-        run: |
-          npm install --no-audit --no-fund
-          npm run test:node
-      - name: posthog-js latest in Chromium vs hoglet
-        working-directory: contract-tests
-        run: |
-          npx playwright install --with-deps chromium
-          npm run test:browser
+      - name: posthog ${{ matrix.suite }} SDK latest vs hoglet
+        env:
+          HOGLET_BIN: ${{ github.workspace }}/target/debug/hoglet
+          CONTRACT_PLAYWRIGHT_DEPS: "1"
+        run: scripts/contract-test.sh ${{ matrix.suite }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contract-results-${{ matrix.suite }}
+          path: contract-tests/results/
+          if-no-files-found: ignore
 
   forbidden-deps:
     # Claim 3's dependency assertion: the deployment must never grow a
