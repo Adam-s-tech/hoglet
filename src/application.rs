@@ -256,10 +256,18 @@ impl Application {
                 config.security.metrics_token.clone(),
             ))
             .merge(crate::routes::docs::router());
-        let dashboard = crate::routes::workspace::router_with(
+        // Sign-in and invite acceptance share one failure throttle.
+        let throttle = Arc::new(crate::security::LoginThrottle::default());
+        let dashboard = crate::routes::workspace::router_with_throttle(
             access.clone(),
             config.security.clone(),
+            throttle.clone(),
         )
+            .merge(crate::routes::members::router(
+                access.clone(),
+                config.security.clone(),
+                throttle,
+            ))
             .merge(crate::routes::project::router(access.clone(), engine))
             .merge(crate::routes::catalog_v2::router(
                 access.clone(),

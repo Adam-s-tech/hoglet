@@ -4,12 +4,13 @@ import { useState, type ReactNode } from "react";
 import { Icon } from "@/components/icons";
 import { CopyButton, Snippet } from "@/components/copy";
 import { CardPad, Page, PageHeader, Panel } from "@/components/page";
+import { Gated } from "@/components/role";
 import { toast } from "@/components/toast";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ApiError, api, errorMessage } from "@/lib/api";
-import { projectPath, useApp, usePath, useProjectId } from "@/lib/context";
+import { canEdit, projectPath, useApp, usePath, useProjectId } from "@/lib/context";
 import { fmtNumber, fmtRelative } from "@/lib/format";
 import { navigate } from "@/lib/nav";
 import { qk, statusQuery } from "@/lib/queries";
@@ -55,6 +56,7 @@ export function TokenBox({ token }: { token: string }) {
  */
 export function LoadDemoButton({ primary = false, small = false, onLoaded }: { primary?: boolean; small?: boolean; onLoaded?: () => void }) {
   const projectId = useProjectId();
+  const { organization } = useApp();
   const queryClient = useQueryClient();
   const [progress, setProgress] = useState<string | null>(null);
   const load = useMutation({
@@ -88,17 +90,19 @@ export function LoadDemoButton({ primary = false, small = false, onLoaded }: { p
     onSettled: () => setProgress(null),
   });
   return (
-    <Button
-      type="button"
-      variant={primary ? "default" : "outline"}
-      size={small ? "sm" : "default"}
-      disabled={load.isPending}
-      title="Adds 90 days of sample product data to this project so you can explore every screen"
-      onClick={() => load.mutate()}
-    >
-      {load.isPending ? <Spinner role="presentation" aria-hidden="true" className="size-3.5" /> : <Icon name="sparkle" size={14} />}
-      <span aria-live="polite">{load.isPending ? (progress ?? "Loading demo data…") : "Load demo data"}</span>
-    </Button>
+    <Gated allowed={canEdit(organization)}>
+      <Button
+        type="button"
+        variant={primary ? "default" : "outline"}
+        size={small ? "sm" : "default"}
+        disabled={load.isPending}
+        title="Adds 90 days of sample product data to this project so you can explore every screen"
+        onClick={() => load.mutate()}
+      >
+        {load.isPending ? <Spinner role="presentation" aria-hidden="true" className="size-3.5" /> : <Icon name="sparkle" size={14} />}
+        <span aria-live="polite">{load.isPending ? (progress ?? "Loading demo data…") : "Load demo data"}</span>
+      </Button>
+    </Gated>
   );
 }
 

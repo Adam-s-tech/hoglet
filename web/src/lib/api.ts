@@ -6,21 +6,28 @@ import { normalizeQuery } from "../insight/defaults";
 // here, once. Cookie auth (same-origin), uniform ApiError, every call
 // abortable. TanStack Query (lib/queries.ts) owns caching and 401 → login.
 
+import type { AcceptInviteRequest } from "../types/AcceptInviteRequest";
 import type { ActorsRequest } from "../types/ActorsRequest";
 import type { ActorsResponse } from "../types/ActorsResponse";
 import type { CatalogEvent } from "../types/CatalogEvent";
 import type { CatalogProperty } from "../types/CatalogProperty";
 import type { CatalogValue } from "../types/CatalogValue";
+import type { CreateInviteRequest } from "../types/CreateInviteRequest";
+import type { CreatedInvite } from "../types/CreatedInvite";
 import type { EventListResponse } from "../types/EventListResponse";
 import type { FeatureFlag } from "../types/FeatureFlag";
 import type { FeatureFlagInput } from "../types/FeatureFlagInput";
 import type { FlagEvaluation } from "../types/FlagEvaluation";
 import type { InsightQuery } from "../types/InsightQuery";
+import type { Invite } from "../types/Invite";
+import type { InvitePreview } from "../types/InvitePreview";
+import type { Member } from "../types/Member";
 import type { PersonDetail } from "../types/PersonDetail";
 import type { PersonListResponse } from "../types/PersonListResponse";
 import type { ProjectStatus } from "../types/ProjectStatus";
 import type { QueryRequest } from "../types/QueryRequest";
 import type { QueryResponse } from "../types/QueryResponse";
+import type { Role } from "../types/Role";
 import type { WebBreakdown } from "../types/WebBreakdown";
 import type { WebDimension } from "../types/WebDimension";
 import type { WebOverview } from "../types/WebOverview";
@@ -28,7 +35,7 @@ import type { WebQuery } from "../types/WebQuery";
 
 // ── Workspace shapes (src/control.rs, src/control_resources.rs) ───────────
 
-export type Role = "owner" | "admin" | "member";
+export type { CreatedInvite, Invite, InvitePreview, Member, Role };
 export interface User {
   id: string;
   email: string;
@@ -350,6 +357,7 @@ function normalizeCatalogValues(raw: unknown): CatalogValue[] {
 // ── Endpoints ──────────────────────────────────────────────────────────────
 
 const p = (projectId: string) => `/api/projects/${encodeURIComponent(projectId)}`;
+const o = (organizationId: string) => `/api/organizations/${encodeURIComponent(organizationId)}`;
 
 function webParams(q: WebQuery): QueryParams {
   return {
@@ -373,6 +381,18 @@ export const api = {
   createOrganization: (name: string) => request<Organization>("POST", "/api/organizations", { body: { name } }),
   createProject: (organizationId: string, name: string) =>
     request<Project>("POST", `/api/organizations/${encodeURIComponent(organizationId)}/projects`, { body: { name } }),
+
+  // Team (src/contract/members.rs)
+  members: (organizationId: string, signal?: AbortSignal) => request<Member[]>("GET", `${o(organizationId)}/members`, { signal }),
+  updateMember: (organizationId: string, userId: string, role: Role) =>
+    request<Member>("PATCH", `${o(organizationId)}/members/${encodeURIComponent(userId)}`, { body: { role } }),
+  removeMember: (organizationId: string, userId: string) => request<null>("DELETE", `${o(organizationId)}/members/${encodeURIComponent(userId)}`),
+  invites: (organizationId: string, signal?: AbortSignal) => request<Invite[]>("GET", `${o(organizationId)}/invites`, { signal }),
+  createInvite: (organizationId: string, body: CreateInviteRequest) => request<CreatedInvite>("POST", `${o(organizationId)}/invites`, { body }),
+  revokeInvite: (organizationId: string, inviteId: string) => request<null>("DELETE", `${o(organizationId)}/invites/${encodeURIComponent(inviteId)}`),
+  /** The invite token is the credential: these two run without a session, so a 401 is an answer (wrong password), not an expired session. */
+  previewInvite: (token: string, signal?: AbortSignal) => request<InvitePreview>("POST", "/api/invites/preview", { body: { token }, signal, authFlow: true }),
+  acceptInvite: (body: AcceptInviteRequest) => request<Workspace>("POST", "/api/invites/accept", { body, authFlow: true }),
 
   // Analytics
   query: (projectId: string, body: QueryRequest, signal?: AbortSignal) =>

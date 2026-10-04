@@ -20,6 +20,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ApiError, api, errorMessage } from "@/lib/api";
+import { Gated } from "@/components/role";
 import { canEdit, useApp, usePath, useProjectId } from "@/lib/context";
 import { fmtRelative } from "@/lib/format";
 import { navigate } from "@/lib/nav";
@@ -118,7 +119,9 @@ export function FlagsPage() {
           const f = c.row.original;
           return (
             <span onClick={(e) => e.stopPropagation()} className="flex h-5 items-center justify-end">
-              <Switch checked={f.active} onCheckedChange={(v) => mutateToggle({ flag: f, active: v })} aria-label={`Enable ${f.key}`} disabled={!editable} />
+              <Gated allowed={editable}>
+                <Switch checked={f.active} onCheckedChange={(v) => mutateToggle({ flag: f, active: v })} aria-label={`Enable ${f.key}`} />
+              </Gated>
             </span>
           );
         },
@@ -131,11 +134,13 @@ export function FlagsPage() {
 
   const q = search.trim().toLowerCase();
   const list = useMemo(() => (data ?? []).filter((f) => !q || `${f.key} ${f.name}`.toLowerCase().includes(q)), [data, q]);
-  const newFlag = editable ? (
-    <Button nativeButton={false} render={<Link to={path("flags/new")} />}>
-      <Icon name="plus" size={14} /> New flag
-    </Button>
-  ) : undefined;
+  const newFlag = (
+    <Gated allowed={editable}>
+      <Button nativeButton={false} render={<Link to={path("flags/new")} />}>
+        <Icon name="plus" size={14} /> New flag
+      </Button>
+    </Gated>
+  );
 
   return (
     <Page>
@@ -158,7 +163,13 @@ export function FlagsPage() {
           <Empty
             icon="flag"
             title="No feature flags yet"
-            action={editable ? <Button nativeButton={false} render={<Link to={path("flags/new")} />}>Create your first flag</Button> : undefined}
+            action={
+              <Gated allowed={editable}>
+                <Button nativeButton={false} render={<Link to={path("flags/new")} />}>
+                  Create your first flag
+                </Button>
+              </Gated>
+            }
           >
             Create a flag, then gate code with <code>posthog.isFeatureEnabled('my-flag')</code>. Flags evaluate in-process here; no extra service.
           </Empty>

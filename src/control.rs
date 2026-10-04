@@ -14,11 +14,14 @@ use argon2::{
 };
 use chrono::Utc;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
+use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::contract::members::{CreatedInvite, Invite, Member};
+use crate::control_members::{self, MemberError};
 use crate::token;
 
 const COMMAND_CAPACITY: usize = 128;
@@ -69,6 +72,17 @@ CREATE TABLE IF NOT EXISTS personal_api_keys (
     key_prefix TEXT NOT NULL,
     last_used INTEGER,
     created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS organization_invites (
+    id TEXT PRIMARY KEY NOT NULL,
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member')),
+    token_hash TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    UNIQUE (organization_id, email)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON auth_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON auth_sessions(expires_at);
@@ -188,7 +202,9 @@ pub struct CreatedPersonalApiKey {
     pub secret: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// A person's standing in one organization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../web/src/types/")]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Owner,
@@ -205,7 +221,7 @@ impl Role {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, AccessError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, AccessError> {
         match value {
             "owner" => Ok(Self::Owner),
             "admin" => Ok(Self::Admin),
@@ -272,7 +288,7 @@ pub struct CaptureProject {
     pub token: String,
 }
 
-enum Command {
+pub(crate) enum Command {
     Shutdown {
         response: std::sync::mpsc::SyncSender<()>,
     },
@@ -345,6 +361,51 @@ enum Command {
         token: String,
         response: oneshot::Sender<Result<CaptureProject, AccessError>>,
     },
+    ListMembers {
+        principal: Principal,
+        organization_id: String,
+        response: oneshot::Sender<Result<Vec<Member>, MemberError>>,
+    },
+    UpdateMemberRole {
+        principal: Principal,
+        organization_id: String,
+        user_id: String,
+        role: Role,
+        response: oneshot::Sender<Result<Member, MemberError>>,
+    },
+    RemoveMember {
+        principal: Principal,
+        organization_id: String,
+        user_id: String,
+        response: oneshot::Sender<Result<(), MemberError>>,
+    },
+    CreateInvite {
+        principal: Principal,
+        organization_id: String,
+        email: String,
+        role: Role,
+        response: oneshot::Sender<Result<CreatedInvite, MemberError>>,
+    },
+    ListInvites {
+        principal: Principal,
+        organization_id: String,
+        response: oneshot::Sender<Result<Vec<Invite>, MemberError>>,
+    },
+    RevokeInvite {
+        principal: Principal,
+        organization_id: String,
+        invite_id: String,
+        response: oneshot::Sender<Result<(), MemberError>>,
+    },
+    InviteLookup {
+        token_hash: String,
+        response: oneshot::Sender<Result<control_members::InviteLookup, MemberError>>,
+    },
+    AcceptInvite {
+        token_hash: String,
+        account: control_members::AcceptAccount,
+        response: oneshot::Sender<Result<SetupResult, MemberError>>,
+    },
 }
 
 /// Concurrent password hash/verify jobs. Argon2 is deliberately expensive in
@@ -356,7 +417,7 @@ const HASHING_QUEUE_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct ProjectAccess {
-    tx: mpsc::Sender<Command>,
+    pub(crate) tx: mpsc::Sender<Command>,
     hashing: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
@@ -410,7 +471,7 @@ impl ProjectAccess {
 
     /// Run a password hashing job on the blocking pool, at most
     /// `MAX_CONCURRENT_HASHING` at a time.
-    async fn run_hashing<T: Send + 'static>(
+    pub(crate) async fn run_hashing<T: Send + 'static>(
         &self,
         job: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, AccessError> {
@@ -704,6 +765,15 @@ fn open_connection(path: PathBuf) -> Result<Connection, AccessError> {
              CHECK (scope IN ('read', 'write'))",
         )?;
     }
+    let has_joined: bool = connection
+        .prepare("SELECT 1 FROM pragma_table_info('organization_members') WHERE name='joined_at'")?
+        .exists([])?;
+    if !has_joined {
+        // 0 = joined before membership dates were recorded.
+        connection.execute_batch(
+            "ALTER TABLE organization_members ADD COLUMN joined_at INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(connection)
 }
@@ -828,6 +898,101 @@ fn worker_loop(mut connection: Connection, mut rx: mpsc::Receiver<Command>) {
             Command::AuthorizeCapture { token, response } => {
                 let _ = response.send(authorize_capture(&connection, &token));
             }
+            Command::ListMembers {
+                principal,
+                organization_id,
+                response,
+            } => {
+                let _ = response.send(control_members::list_members(
+                    &connection,
+                    &principal,
+                    &organization_id,
+                ));
+            }
+            Command::UpdateMemberRole {
+                principal,
+                organization_id,
+                user_id,
+                role,
+                response,
+            } => {
+                let _ = response.send(control_members::update_member_role(
+                    &mut connection,
+                    &principal,
+                    &organization_id,
+                    &user_id,
+                    role,
+                ));
+            }
+            Command::RemoveMember {
+                principal,
+                organization_id,
+                user_id,
+                response,
+            } => {
+                let _ = response.send(control_members::remove_member(
+                    &mut connection,
+                    &principal,
+                    &organization_id,
+                    &user_id,
+                ));
+            }
+            Command::CreateInvite {
+                principal,
+                organization_id,
+                email,
+                role,
+                response,
+            } => {
+                let _ = response.send(control_members::create_invite(
+                    &mut connection,
+                    &principal,
+                    &organization_id,
+                    &email,
+                    role,
+                ));
+            }
+            Command::ListInvites {
+                principal,
+                organization_id,
+                response,
+            } => {
+                let _ = response.send(control_members::list_invites(
+                    &connection,
+                    &principal,
+                    &organization_id,
+                ));
+            }
+            Command::RevokeInvite {
+                principal,
+                organization_id,
+                invite_id,
+                response,
+            } => {
+                let _ = response.send(control_members::revoke_invite(
+                    &connection,
+                    &principal,
+                    &organization_id,
+                    &invite_id,
+                ));
+            }
+            Command::InviteLookup {
+                token_hash,
+                response,
+            } => {
+                let _ = response.send(control_members::invite_lookup(&connection, &token_hash));
+            }
+            Command::AcceptInvite {
+                token_hash,
+                account,
+                response,
+            } => {
+                let _ = response.send(control_members::accept_invite(
+                    &mut connection,
+                    &token_hash,
+                    account,
+                ));
+            }
         }
     }
 }
@@ -886,7 +1051,8 @@ fn setup(
     )?;
     if let Some((_, organization_id)) = &claimed_project {
         transaction.execute(
-            "INSERT INTO organization_members(organization_id,user_id,role) VALUES (?1,?2,'owner')",
+            "INSERT INTO organization_members(organization_id,user_id,role,joined_at)
+             VALUES (?1,?2,'owner',CAST(strftime('%s','now') AS INTEGER))",
             rusqlite::params![organization_id, user_id],
         )?;
     } else {
@@ -902,7 +1068,8 @@ fn setup(
             rusqlite::params![organization_id, request.organization_name, created_at],
         )?;
         transaction.execute(
-            "INSERT INTO organization_members(organization_id,user_id,role) VALUES (?1,?2,'owner')",
+            "INSERT INTO organization_members(organization_id,user_id,role,joined_at)
+             VALUES (?1,?2,'owner',CAST(strftime('%s','now') AS INTEGER))",
             rusqlite::params![organization_id, user_id],
         )?;
         transaction.execute(
@@ -917,8 +1084,8 @@ fn setup(
         )?;
     }
     transaction.execute(
-        "INSERT OR IGNORE INTO organization_members(organization_id,user_id,role)
-         SELECT id,?1,'owner' FROM organizations WHERE imported=1",
+        "INSERT OR IGNORE INTO organization_members(organization_id,user_id,role,joined_at)
+         SELECT id,?1,'owner',CAST(strftime('%s','now') AS INTEGER) FROM organizations WHERE imported=1",
         [&user_id],
     )?;
     transaction.execute(
@@ -934,7 +1101,7 @@ fn setup(
     })
 }
 
-fn start_session(connection: &mut Connection, user_id: &str) -> Result<SetupResult, AccessError> {
+pub(crate) fn start_session(connection: &mut Connection, user_id: &str) -> Result<SetupResult, AccessError> {
     let now = Utc::now().timestamp();
     let session_id = new_session_id();
     let transaction = connection.transaction()?;
@@ -1093,7 +1260,8 @@ fn create_organization(
         rusqlite::params![id, name, created_at],
     )?;
     transaction.execute(
-        "INSERT INTO organization_members(organization_id,user_id,role) VALUES (?1,?2,'owner')",
+        "INSERT INTO organization_members(organization_id,user_id,role,joined_at)
+             VALUES (?1,?2,'owner',CAST(strftime('%s','now') AS INTEGER))",
         rusqlite::params![id, principal.user_id],
     )?;
     transaction.commit()?;
@@ -1195,7 +1363,7 @@ fn authorize_project(
     })
 }
 
-fn workspace_for(connection: &Connection, user_id: &str) -> Result<Workspace, AccessError> {
+pub(crate) fn workspace_for(connection: &Connection, user_id: &str) -> Result<Workspace, AccessError> {
     let user: User = connection
         .query_row(
             "SELECT id,email,name FROM users WHERE id=?1",
@@ -1255,24 +1423,24 @@ fn workspace_for(connection: &Connection, user_id: &str) -> Result<Workspace, Ac
 /// 256 bits from the OS generator, hex encoded. Session ids and API keys are
 /// credentials: they get a full-width random value, not a UUID's 122 bits
 /// with fixed version bits.
-fn random_secret() -> String {
+pub(crate) fn random_secret() -> String {
     use rand::RngCore;
     let mut bytes = [0_u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
-fn new_session_id() -> String {
+pub(crate) fn new_session_id() -> String {
     random_secret()
 }
 
 /// A valid Argon2 hash of a password nobody has, for timing equalization.
-fn dummy_password_hash() -> &'static str {
+pub(crate) fn dummy_password_hash() -> &'static str {
     static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HASH.get_or_init(|| hash_password("hoglet-timing-equalizer").unwrap_or_default())
 }
 
-fn hash_password(password: &str) -> Result<String, AccessError> {
+pub(crate) fn hash_password(password: &str) -> Result<String, AccessError> {
     let salt = SaltString::generate(&mut rand::rngs::OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -1280,7 +1448,7 @@ fn hash_password(password: &str) -> Result<String, AccessError> {
         .map_err(|_| AccessError::InvalidCredentials)
 }
 
-fn validate_email(email: &str) -> Result<(), AccessError> {
+pub(crate) fn validate_email(email: &str) -> Result<(), AccessError> {
     let email = email.trim();
     if email.is_empty() || email.len() > 254 || !email.contains('@') {
         return Err(AccessError::InvalidRequest);
@@ -1288,28 +1456,28 @@ fn validate_email(email: &str) -> Result<(), AccessError> {
     Ok(())
 }
 
-fn validate_password(password: &str) -> Result<(), AccessError> {
+pub(crate) fn validate_password(password: &str) -> Result<(), AccessError> {
     if !(12..=1024).contains(&password.len()) {
         return Err(AccessError::InvalidRequest);
     }
     Ok(())
 }
 
-fn validate_name(name: &str) -> Result<(), AccessError> {
+pub(crate) fn validate_name(name: &str) -> Result<(), AccessError> {
     if name.trim().is_empty() || name.len() > 128 {
         return Err(AccessError::InvalidRequest);
     }
     Ok(())
 }
 
-fn require_session(principal: &Principal) -> Result<(), AccessError> {
+pub(crate) fn require_session(principal: &Principal) -> Result<(), AccessError> {
     if principal.authentication != Authentication::Session {
         return Err(AccessError::Forbidden);
     }
     Ok(())
 }
 
-fn verify_password(hash: &str, password: &str) -> Result<(), AccessError> {
+pub(crate) fn verify_password(hash: &str, password: &str) -> Result<(), AccessError> {
     let parsed = PasswordHash::new(hash).map_err(|_| AccessError::InvalidCredentials)?;
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)

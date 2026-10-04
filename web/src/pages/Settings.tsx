@@ -22,12 +22,14 @@ import { fmtBytes, fmtDate, fmtNumber, fmtRelative } from "@/lib/format";
 import { navigate } from "@/lib/nav";
 import { keysQuery, qk, statusQuery } from "@/lib/queries";
 import { setTheme, useTheme, type Theme } from "@/lib/theme";
+import { Gated } from "@/components/role";
 import { ForwardingCard } from "./Forwarding";
+import { MembersSettings } from "./Members";
 import { LoadDemoButton, SnippetTabs, TokenBox } from "./Onboarding";
 
 const settingsRouteApi = getRouteApi("/project/$projectId/settings");
 
-type Tab = "project" | "keys" | "account";
+type Tab = "project" | "members" | "keys" | "account";
 const NAME_MAX = 80;
 
 function SettingsCard({ title, description, action, children }: { title: string; description?: ReactNode; action?: ReactNode; children?: ReactNode }) {
@@ -211,29 +213,29 @@ function ProjectSettings() {
       >
         <ForwardingCard projectId={projectId} editable={editable} />
       </SettingsCard>
-      {editable && (
-        <SettingsCard
-          title="Demo data"
-          description="Adds 90 days of sample product data to this project so you can explore every screen."
-          action={<LoadDemoButton onLoaded={() => void queryClient.invalidateQueries({ queryKey: qk.project(projectId) })} />}
-        />
-      )}
-      {editable && (
-        <SettingsCard
-          title="Another project"
-          description="Projects keep events, persons and flags fully separate. Each gets its own token."
-          action={
-            <div className="flex flex-wrap gap-2">
+      <SettingsCard
+        title="Demo data"
+        description="Adds 90 days of sample product data to this project so you can explore every screen."
+        action={<LoadDemoButton onLoaded={() => void queryClient.invalidateQueries({ queryKey: qk.project(projectId) })} />}
+      />
+      <SettingsCard
+        title="Another project"
+        description="Projects keep events, persons and flags fully separate. Each gets its own token."
+        action={
+          <div className="flex flex-wrap gap-2">
+            <Gated allowed={editable}>
               <Button variant="outline" onClick={() => setDialog("organization")}>
                 <Icon name="plus" size={14} /> New organization
               </Button>
+            </Gated>
+            <Gated allowed={editable}>
               <Button variant="outline" onClick={() => setDialog("project")}>
                 <Icon name="plus" size={14} /> New project
               </Button>
-            </div>
-          }
-        />
-      )}
+            </Gated>
+          </div>
+        }
+      />
       {dialog === "project" && (
         <NameDialog
           title="New project"
@@ -556,6 +558,9 @@ export function SettingsPage() {
           <TabsTrigger value="project" className="flex-none px-3">
             Project
           </TabsTrigger>
+          <TabsTrigger value="members" className="flex-none px-3">
+            Members
+          </TabsTrigger>
           <TabsTrigger value="keys" className="flex-none px-3">
             API keys
           </TabsTrigger>
@@ -565,6 +570,9 @@ export function SettingsPage() {
         </TabsList>
         <TabsContent value="project" className="pt-2">
           <ProjectSettings />
+        </TabsContent>
+        <TabsContent value="members" className="pt-2">
+          <MembersSettings />
         </TabsContent>
         <TabsContent value="keys" className="pt-2">
           <ApiKeys />

@@ -56,10 +56,11 @@ personal API keys as hashes; the PostHog token for shadow mode is stored in
 ## How many users and projects can I have?
 
 Any number of organizations and projects, each with its own token and fully
-separate events, people and flags. There is one login: the account created at
-first run. There are no invitations or user roles to hand out yet, and no
-password-reset flow in this version, so keep the passphrase safe. You can
-create more personal API keys from the dashboard.
+separate events, people and flags. The account created at first run is the
+owner; add teammates with invite links as owners, admins or read-only members
+([Team](team.md)). There is no email "forgot password"; a locked-out account is
+recovered with `hoglet user reset-password` on the server. Anyone can create
+personal API keys from the dashboard.
 
 ## Why do my numbers differ from PostHog's?
 

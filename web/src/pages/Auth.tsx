@@ -99,12 +99,12 @@ export function SetupPage() {
           </FormField>
         )}
       </form.Field>
-      <form.Field name="password" validators={{ onChange: ({ value }) => (value.length > 0 && value.length < 8 ? "At least 8 characters." : undefined) }}>
+      <form.Field name="password" validators={{ onChange: ({ value }) => (value.length > 0 && value.length < 12 ? "At least 12 characters." : undefined) }}>
         {(f) => (
           <FormField
             label="Password"
             htmlFor="setup-password"
-            hint="At least 8 characters."
+            hint="At least 12 characters."
             error={f.state.meta.errors[0] ? String(f.state.meta.errors[0]) : undefined}
           >
             <Input
@@ -112,7 +112,7 @@ export function SetupPage() {
               type="password"
               autoComplete="new-password"
               required
-              minLength={8}
+              minLength={12}
               value={f.state.value}
               onChange={(e) => f.handleChange(e.target.value)}
               onBlur={f.handleBlur}
@@ -140,7 +140,7 @@ export function SetupPage() {
       {setup.error ? <Notice tone="bad">{errorMessage(setup.error)}</Notice> : null}
       <form.Subscribe selector={(s) => [s.canSubmit, s.values.password] as const}>
         {([canSubmit, password]) => (
-          <Button type="submit" size="lg" className="h-10 text-[15px]" disabled={setup.isPending || !canSubmit || password.length < 8}>
+          <Button type="submit" size="lg" className="h-10 text-[15px]" disabled={setup.isPending || !canSubmit || password.length < 12}>
             {setup.isPending ? "Creating…" : "Create workspace"}
             {!setup.isPending && <Icon name="arrowRight" size={14} />}
           </Button>

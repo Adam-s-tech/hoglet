@@ -47,7 +47,17 @@ Authorization
   caller's membership of that project before reading a body or an object id.
   Objects (insights, dashboards, shares, flags) are always looked up by
   `(project_id, id)`.
-- Mutations need an owner/admin role and a session or a `write` key.
+- Mutations need an owner/admin role and a session or a `write` key. A
+  `member` is read-only everywhere, including through a `write` key.
+- People are managed by session only (never by a key), per organization:
+  admins cannot create, change or remove owners, and an organization always
+  keeps one owner. Invite tokens are 256 random bits, stored as SHA-256 and
+  looked up by that hash, single use, 7-day expiry, at most 100 pending per
+  organization. Accepting one is throttled like sign-in (per source address and
+  per invited email), and failed guesses count against the source address.
+  Role changes, invites and removals are logged (`hoglet::audit`) with the
+  acting user id; tokens are never logged. Removing someone ends their
+  sessions and, when they have no organization left, their personal keys.
 - Cookie-authenticated state-changing requests are refused when the browser
   marks them cross-site (`Sec-Fetch-Site`, or `Origin` not equal to the host).
   Bearer-key requests are unaffected.
@@ -125,8 +135,17 @@ Data and outbound
   sandbox: any member who can query a project can read all of that project's
   events. A result cell is not size-capped yet (open finding, test marked
   `ignore` in `tests/security_edge.rs`).
-- Accounts have no second factor, no password reset and no way to add a second
-  user yet, so there is no member/admin separation to bypass.
+- Accounts have no second factor and no emailed password reset. A locked-out
+  owner is recovered on the server with `hoglet user reset-password`, which
+  needs shell access and a stopped server.
+- An invite link is a bearer credential for one seat until it is used: anyone
+  who reads it before the invitee can join with the invited role. It is shown
+  once, single use and expires in 7 days; the inviter must send it over a
+  channel only the invitee can read. The page URL (`/invite/{token}`) can reach
+  reverse-proxy access logs; the API calls carry the token in the body only.
+- Whoever holds a valid link learns whether the invited email already has an
+  account (the page asks for a password instead of a name). Nothing is revealed
+  without the link.
 - The installer verifies a SHA-256 published beside the tarball, which detects
   corruption but not a compromised release host; releases are not signed yet.
 - The bundled SQLite is 3.46.0 (via `rusqlite` 0.32). Hoglet only runs its own

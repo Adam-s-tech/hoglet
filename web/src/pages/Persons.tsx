@@ -15,6 +15,7 @@ import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbP
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api, errorMessage } from "@/lib/api";
+import { Gated } from "@/components/role";
 import { canEdit, useApp, usePath, useProjectId } from "@/lib/context";
 import { fmtDateTime, fmtNumber, fmtRelative } from "@/lib/format";
 import { useDebounced } from "@/lib/hooks";
@@ -389,16 +390,18 @@ export function PersonPage() {
         )}
       </Panel>
 
-      {canEdit(organization) && p && (
+      {p && (
         <Panel className="mt-6 ring-destructive/30">
           <CardPad className="flex flex-wrap items-center gap-4">
             <div className="min-w-0 flex-1">
               <h2 className="text-sm">Delete person and all their data</h2>
               <p className="text-sm text-muted-foreground">Erases this person, their distinct IDs and every event they sent. For GDPR deletion requests.</p>
             </div>
-            <Button variant="destructive" onClick={() => setErasing(true)}>
-              <Icon name="trash" size={14} /> Delete person
-            </Button>
+            <Gated allowed={canEdit(organization)}>
+              <Button variant="destructive" onClick={() => setErasing(true)}>
+                <Icon name="trash" size={14} /> Delete person
+              </Button>
+            </Gated>
           </CardPad>
         </Panel>
       )}

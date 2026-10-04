@@ -9,6 +9,7 @@ pub mod flags;
 pub mod forwarding;
 pub mod guard;
 pub mod health;
+pub mod members;
 pub mod metrics;
 pub mod persons;
 pub mod project;

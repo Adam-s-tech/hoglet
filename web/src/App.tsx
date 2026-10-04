@@ -136,10 +136,11 @@ function Gate() {
 
 export function Root() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const isShare = pathname.startsWith("/share/");
+  // Share and invite links work without a session: the link is the credential.
+  const isPublic = pathname.startsWith("/share/") || pathname.startsWith("/invite/");
   return (
     <>
-      {isShare ? <Outlet /> : <Gate />}
+      {isPublic ? <Outlet /> : <Gate />}
       <Suspense fallback={null}>
         <Toaster position="bottom-right" />
       </Suspense>

@@ -4,6 +4,7 @@
 //
 //   /                                   → last used project
 //   /share/$token                       public share (no session)
+//   /invite/$token                      accept a team invite (no session)
 //   /project/$projectId                 app shell
 //     /  /onboarding /web /insights /activity /persons /flags /dashboards /settings
 //     /insights/new?kind=&q=            builder state lives in typed search params
@@ -40,6 +41,12 @@ const shareRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "share/$token",
   component: lazyRouteComponent(() => import("@/pages/Share"), "SharePage"),
+});
+
+const inviteRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "invite/$token",
+  component: lazyRouteComponent(() => import("@/pages/Invite"), "InvitePage"),
 });
 
 const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/", component: Landing });
@@ -136,12 +143,12 @@ const dashboardsRoute = createRoute({ ...child("dashboards"), component: lazyRou
 const dashboardRoute = createRoute({ ...child("dashboards/$id"), component: lazyRouteComponent(() => import("@/pages/Dashboards"), "DashboardPage") });
 
 export interface SettingsSearch {
-  tab?: "project" | "keys" | "account";
+  tab?: "project" | "members" | "keys" | "account";
 }
 const settingsRoute = createRoute({
   ...child("settings"),
   validateSearch: (raw: Record<string, unknown>): SettingsSearch => ({
-    tab: raw.tab === "project" || raw.tab === "keys" || raw.tab === "account" ? raw.tab : undefined,
+    tab: raw.tab === "project" || raw.tab === "members" || raw.tab === "keys" || raw.tab === "account" ? raw.tab : undefined,
   }),
   component: lazyRouteComponent(() => import("@/pages/Settings"), "SettingsPage"),
 });
@@ -149,6 +156,7 @@ const settingsRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   indexRoute,
   shareRoute,
+  inviteRoute,
   projectRoute.addChildren([
     homeRoute,
     onboardingRoute,

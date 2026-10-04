@@ -9,6 +9,7 @@ pub mod cache;
 pub mod capture;
 pub mod contract;
 pub mod control;
+pub mod control_members;
 pub mod control_resources;
 pub mod demo;
 pub mod enrichment;
@@ -33,4 +34,5 @@ pub mod sink;
 pub mod source;
 pub mod storage_bootstrap;
 pub mod token;
+pub mod user_admin;
 

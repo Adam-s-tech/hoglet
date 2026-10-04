@@ -122,6 +122,7 @@ async fn docs_page() -> Html<&'static str> {
 
 const TAG_WIRE: &str = "SDK wire";
 const TAG_WORKSPACE: &str = "Auth & workspace";
+const TAG_TEAM: &str = "Team";
 const TAG_QUERY: &str = "Insights & query";
 const TAG_PERSONS: &str = "Persons & events";
 const TAG_WEB: &str = "Web analytics";
@@ -140,6 +141,10 @@ const TAGS: &[(&str, &str)] = &[
     (
         TAG_WORKSPACE,
         "First-run setup, login sessions, personal API keys, organizations and projects.",
+    ),
+    (
+        TAG_TEAM,
+        "Members, roles and invite links. No email server needed: creating an invite returns a one-time link to hand over.",
     ),
     (
         TAG_QUERY,
@@ -182,7 +187,8 @@ Everything else is Hoglet's own JSON API, used by the bundled dashboard.
 (set by `/api/auth/login` and `/api/auth/setup`) or a personal API key sent as \
 `Authorization: Bearer phx_…`. Reads need project membership. Writes need a session or a \
 `write`-scoped key, plus the `owner` or `admin` role in the project's organization. \
-Account management (keys, organizations, projects) needs a session. \
+Account management (keys, organizations, projects, members, invites) needs a session. \
+Roles are per organization: `owner` (everything), `admin` (everything but owners), `member` (read-only). \
 State-changing requests that carry the session cookie are refused (403) when a browser marks them \
 cross-site (`Sec-Fetch-Site`, or an `Origin` that is not this host); bearer-key requests are not affected.
 
@@ -273,6 +279,7 @@ fn responses(success: Value, errors: &[&str]) -> Value {
             "404" => "NotFound",
             "409" => "Conflict",
             "422" => "UnprocessableEntity",
+            "429" => "TooManyRequests",
             "500" => "InternalError",
             "503" => "Unavailable",
             "504" => "Timeout",
@@ -316,6 +323,7 @@ pub fn spec() -> Value {
     let mut paths = Paths::default();
     wire_paths(&mut paths);
     workspace_paths(&mut paths);
+    team_paths(&mut paths);
     query_paths(&mut paths);
     persons_paths(&mut paths);
     web_paths(&mut paths);
@@ -334,6 +342,7 @@ pub fn spec() -> Value {
         explore_schemas(),
         flag_schemas(),
         workspace_schemas(),
+        team_schemas(),
         resource_schemas(),
         project_schemas(),
     ] {
@@ -414,6 +423,7 @@ fn shared_responses() -> Value {
         "Forbidden": error("Authenticated, but not allowed: not a member of the project, missing `write` scope or owner/admin role, or a personal API key on a session-only route."),
         "NotFound": error("The resource does not exist or the id is malformed."),
         "Conflict": error("The request conflicts with existing state."),
+        "TooManyRequests": error("Too many failed attempts from this address or for this account; `Retry-After` says how long to wait."),
         "UnprocessableEntity": error("Well-formed but semantically invalid. `field` points at the offending part."),
         "InternalError": error("Unexpected server error."),
         "Unavailable": unavailable,
@@ -968,6 +978,147 @@ fn workspace_paths(paths: &mut Paths) {
             "responses": responses(
                 json!({ "201": ok("Created.", schema("Project")) }),
                 &["400", "401", "403", "500", "503"]
+            )
+        }),
+    );
+}
+
+// ── Team ──────────────────────────────────────────────────────────
+
+fn team_paths(paths: &mut Paths) {
+    let org = || path_param("organization_id", "Organization id.", json!({ "type": "string", "format": "uuid" }));
+    let user = || path_param("user_id", "Member's user id.", json!({ "type": "string", "format": "uuid" }));
+    paths.add(
+        "/api/organizations/{organization_id}/members",
+        "get",
+        json!({
+            "tags": [TAG_TEAM],
+            "operationId": "listMembers",
+            "summary": "List members",
+            "description": "Everyone in the organization with their role. Any member may read it.",
+            "security": auth_any(),
+            "parameters": [org()],
+            "responses": responses(
+                json!({ "200": ok("Members, owners first.", array_of(schema("Member"))) }),
+                &["401", "403", "404", "500", "503"]
+            )
+        }),
+    );
+    paths.add(
+        "/api/organizations/{organization_id}/members/{user_id}",
+        "patch",
+        json!({
+            "tags": [TAG_TEAM],
+            "operationId": "updateMember",
+            "summary": "Change a member's role",
+            "description": "Session only; `owner` or `admin`. Admins cannot change owners or grant `owner`. The last owner cannot be demoted (`409 last_owner`).",
+            "security": auth_session(),
+            "parameters": [org(), user()],
+            "requestBody": json_request(schema("UpdateMemberRequest")),
+            "responses": responses(
+                json!({ "200": ok("The member with the new role.", schema("Member")) }),
+                &["400", "401", "403", "404", "409", "500", "503"]
+            )
+        }),
+    );
+    paths.add(
+        "/api/organizations/{organization_id}/members/{user_id}",
+        "delete",
+        json!({
+            "tags": [TAG_TEAM],
+            "operationId": "removeMember",
+            "summary": "Remove a member (or leave)",
+            "description": "Session only. Owners and admins remove members (admins never owners); anyone may remove themselves. The last owner cannot be removed (`409 last_owner`). The person's sessions end, and when no organization is left their personal API keys are revoked.",
+            "security": auth_session(),
+            "parameters": [org(), user()],
+            "responses": responses(
+                json!({ "204": { "description": "Removed." } }),
+                &["401", "403", "404", "409", "500", "503"]
+            )
+        }),
+    );
+    paths.add(
+        "/api/organizations/{organization_id}/invites",
+        "get",
+        json!({
+            "tags": [TAG_TEAM],
+            "operationId": "listInvites",
+            "summary": "List pending invites",
+            "description": "Unused, unexpired invites. `owner` or `admin`. Tokens are never listed.",
+            "security": auth_any(),
+            "parameters": [org()],
+            "responses": responses(
+                json!({ "200": ok("Pending invites.", array_of(schema("Invite"))) }),
+                &["401", "403", "404", "500", "503"]
+            )
+        }),
+    );
+    paths.add(
+        "/api/organizations/{organization_id}/invites",
+        "post",
+        json!({
+            "tags": [TAG_TEAM],
+            "operationId": "createInvite",
+            "summary": "Invite someone",
+            "description": "Session only; `owner` or `admin` (admins cannot invite owners). Returns a one-time token and the dashboard path `/invite/{token}` to hand to the invitee. It is shown once, stored only as a hash, single use, and expires after 7 days. Inviting the same address again replaces the earlier link. At most 100 pending invites per organization.",
+            "security": auth_session(),
+            "parameters": [org()],
+            "requestBody": json_request(schema("CreateInviteRequest")),
+            "responses": responses(
+                json!({ "201": ok("Created. Store `token` now; it is not shown again.", schema("CreatedInvite")) }),
+                &["400", "401", "403", "404", "409", "500", "503"]
+            )
+        }),
+    );
+    paths.add(
+        "/api/organizations/{organization_id}/invites/{invite_id}",
+        "delete",
+        json!({
+            "tags": [TAG_TEAM],
+            "operationId": "revokeInvite",
+            "summary": "Revoke an invite",
+            "description": "Session only; `owner` or `admin` (admins cannot revoke owner invites). The link stops working at once.",
+            "security": auth_session(),
+            "parameters": [org(), path_param("invite_id", "Invite id.", json!({ "type": "string", "format": "uuid" }))],
+            "responses": responses(
+                json!({ "204": { "description": "Revoked." } }),
+                &["401", "403", "404", "500", "503"]
+            )
+        }),
+    );
+    paths.add(
+        "/api/invites/preview",
+        "post",
+        json!({
+            "tags": [TAG_TEAM],
+            "operationId": "previewInvite",
+            "summary": "Look at an invite",
+            "description": "No session: the token is the credential. Unknown, expired, used and revoked tokens all answer `404 invite_invalid`. Failed guesses are throttled per source address (`429`).",
+            "security": auth_none(),
+            "requestBody": json_request(schema("InviteTokenRequest")),
+            "responses": responses(
+                json!({ "200": ok("What the invite is for.", schema("InvitePreview")) }),
+                &["400", "404", "429", "500", "503"]
+            )
+        }),
+    );
+    paths.add(
+        "/api/invites/accept",
+        "post",
+        json!({
+            "tags": [TAG_TEAM],
+            "operationId": "acceptInvite",
+            "summary": "Accept an invite",
+            "description": "No session. A new address gets an account with the given `name` and `password` (at least 12 characters); an address that already has an account must present its current password, like a sign-in, and shares the sign-in throttle. Single use. Sets the `hoglet_sid` session cookie.",
+            "security": auth_none(),
+            "requestBody": json_request(schema("AcceptInviteRequest")),
+            "responses": responses(
+                json!({ "200": {
+                    "description": "Joined. The invitee's workspace; the response sets the session cookie.",
+                    "headers": session_cookie_header(),
+                    "content": { "application/json": { "schema": schema("Workspace") } }
+                } }),
+                &["400", "401", "404", "409", "429", "500", "503"]
             )
         }),
     );
@@ -2465,6 +2616,51 @@ fn workspace_schemas() -> Map<String, Value> {
     }))
 }
 
+fn team_schemas() -> Map<String, Value> {
+    let seconds = || json!({ "type": "integer", "description": "Unix seconds." });
+    let email = || json!({ "type": "string", "format": "email", "maxLength": 254 });
+    into_map(json!({
+        "Member": object(&["user_id", "name", "email", "role", "joined_at"], json!({
+            "user_id": { "type": "string", "format": "uuid" },
+            "name": { "type": "string" },
+            "email": { "type": "string" },
+            "role": schema("Role"),
+            "joined_at": seconds()
+        })),
+        "Invite": object(&["id", "email", "role", "created_by", "created_at", "expires_at"], json!({
+            "id": { "type": "string", "format": "uuid" },
+            "email": { "type": "string" },
+            "role": schema("Role"),
+            "created_by": { "type": "string", "description": "User id of the inviter." },
+            "created_at": seconds(),
+            "expires_at": seconds()
+        })),
+        "CreateInviteRequest": object(&["email", "role"], json!({
+            "email": email(),
+            "role": schema("Role")
+        })),
+        "CreatedInvite": object(&["invite", "token", "path"], json!({
+            "invite": schema("Invite"),
+            "token": { "type": "string", "description": "`hgi_…`. Shown once." },
+            "path": { "type": "string", "description": "`/invite/{token}`: prefix with the address people use to reach Hoglet." }
+        })),
+        "UpdateMemberRequest": object(&["role"], json!({ "role": schema("Role") })),
+        "InviteTokenRequest": object(&["token"], json!({ "token": { "type": "string" } })),
+        "InvitePreview": object(&["organization_name", "email", "role", "expires_at", "account_exists"], json!({
+            "organization_name": { "type": "string" },
+            "email": { "type": "string" },
+            "role": schema("Role"),
+            "expires_at": seconds(),
+            "account_exists": { "type": "boolean", "description": "An account with this email exists: accepting signs in with its password." }
+        })),
+        "AcceptInviteRequest": object(&["token", "password"], json!({
+            "token": { "type": "string" },
+            "name": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Required for a new account; ignored otherwise." },
+            "password": { "type": "string", "minLength": 12, "maxLength": 1024, "description": "The new password, or the current one for an existing account." }
+        }))
+    }))
+}
+
 fn resource_schemas() -> Map<String, Value> {
     let seconds = || json!({ "type": "integer", "description": "Unix seconds." });
     let name = || json!({ "type": "string", "minLength": 1, "maxLength": 512 });
@@ -2634,6 +2830,7 @@ mod tests {
             [
                 "SDK wire",
                 "Auth & workspace",
+                "Team",
                 "Insights & query",
                 "Persons & events",
                 "Web analytics",
@@ -2729,6 +2926,10 @@ mod tests {
             ("get", "/static/surveys.js"),
             ("post", "/api/auth/setup"),
             ("post", "/api/auth/keys"),
+            ("get", "/api/organizations/{organization_id}/members"),
+            ("patch", "/api/organizations/{organization_id}/members/{user_id}"),
+            ("post", "/api/organizations/{organization_id}/invites"),
+            ("post", "/api/invites/accept"),
             ("post", "/api/projects/{project_id}/query"),
             ("post", "/api/projects/{project_id}/query/actors"),
             ("get", "/api/projects/{project_id}/persons"),
