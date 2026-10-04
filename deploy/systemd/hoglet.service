@@ -26,9 +26,7 @@ Environment=HOGLET_ADDR=127.0.0.1:8000
 Environment=RUST_LOG=hoglet=info
 # Optional: Environment=HOGLET_MAX_EVENTS_PER_SEC=5000
 
-# Hoglet drains and flushes on SIGINT (ctrl-c). It does not install a SIGTERM
-# handler, so stop it with SIGINT to get a clean shutdown instead of WAL recovery.
-KillSignal=SIGINT
+# SIGTERM (systemd's default) drains requests and publishes the WAL.
 TimeoutStopSec=30
 Restart=on-failure
 RestartSec=2

@@ -12,7 +12,7 @@
 # Release CI passes --build-arg BINARY_SOURCE=prebuilt and supplies the
 # already smoke-tested binaries at dist/docker/<amd64|arm64>/hoglet instead.
 #
-# Shutdown: Hoglet flushes cleanly on SIGINT, hence STOPSIGNAL below.
+# Shutdown: Hoglet drains and publishes the WAL on SIGTERM or SIGINT.
 # Health: the image has no shell or curl. Probe HTTP GET /ready (readiness)
 # or /health (liveness) from the orchestrator instead of a HEALTHCHECK.
 
@@ -62,5 +62,4 @@ ENV HOGLET_ADDR=0.0.0.0:8000 \
     HOGLET_DATA=/data
 VOLUME ["/data"]
 EXPOSE 8000
-STOPSIGNAL SIGINT
 ENTRYPOINT ["/hoglet"]

@@ -25,15 +25,16 @@ Configuration is environment only:
 |---|---|---|
 | `HOGLET_ADDR` | `127.0.0.1:8000` (image: `0.0.0.0:8000`) | listen address |
 | `HOGLET_DATA` | `./hoglet-data` (unit: `/var/lib/hoglet`, image: `/data`) | data directory |
-| `HOGLET_MAX_EVENTS_PER_SEC` | built-in | capture rate limit |
+| `HOGLET_MAX_EVENTS_PER_SEC` | `10000` | per-project capture rate limit |
+| `HOGLET_RETENTION_DAYS` | keep all | delete events older than N days |
 | `RUST_LOG` | `hoglet=info` | log filter |
 
 Health: `GET /health` is liveness, `GET /ready` turns 200 only after WAL
 recovery and the stores are open. Point load balancers at `/ready`.
 
-Stop with **SIGINT** (the unit and image already do). Hoglet does not handle
-SIGTERM yet; a SIGTERM kill is safe (acked events are in the WAL) but skips the
-clean drain, so the next start replays the WAL.
+SIGTERM and SIGINT both drain in-flight requests, fsync and publish the WAL,
+then exit. A hard kill is also safe: acknowledged events are in the WAL and
+the next start publishes them before reporting ready.
 
 ## TLS and the client IP
 
@@ -62,11 +63,11 @@ the process; ingest is never starved by queries.
   control.db (+ -wal, -shm)       users, orgs, projects, keys, flags (SQLite)
   projections.db (+ -wal, -shm)   lake catalog: which Parquet files are live (SQLite)
   events/                         Parquet segments, immutable once published
-  wal-v2/                         capture write-ahead log (acked, not yet published)
+  wal/                         capture write-ahead log (acked, not yet published)
 ```
 
 `control.db` and `projections.db` are a matched pair (shared `pair_id`); always
-back them up together and restore them together with `events/` and `wal-v2/`.
+back them up together and restore them together with `events/` and `wal/`.
 
 What is safe while running:
 
