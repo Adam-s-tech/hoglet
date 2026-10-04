@@ -236,7 +236,7 @@ fn apply_identity(
                     &alias,
                     &event.distinct_id,
                     event,
-                    MergeGuard::RefuseIdentifiedSource,
+                    MergeGuard::RefuseBothIdentified,
                 )?;
             }
             mark_identified(transaction, project_id, &event.distinct_id)?;
@@ -328,6 +328,11 @@ enum MergeGuard {
     /// `$identify` / `$create_alias`: never fold an already identified person
     /// into another one — two logged-in users sharing a device stay apart.
     RefuseIdentifiedSource,
+    /// `$create_alias`: SDKs disagree on which side is `alias` (posthog-node
+    /// aliases the anonymous id into the user, posthog-python the reverse).
+    /// Merge unless both people are identified; an identified person always
+    /// survives.
+    RefuseBothIdentified,
     /// `$merge_dangerously`: the caller asserted these are one human.
     Always,
 }
@@ -343,19 +348,29 @@ fn merge_persons(
     event: &CapturedEvent,
     guard: MergeGuard,
 ) -> Result<(), ProjectionError> {
-    let winner = ensure_person(transaction, project_id, winning_distinct_id, event)?;
-    let loser = ensure_person(transaction, project_id, losing_distinct_id, event)?;
+    let mut winner = ensure_person(transaction, project_id, winning_distinct_id, event)?;
+    let mut loser = ensure_person(transaction, project_id, losing_distinct_id, event)?;
     if winner == loser {
         return Ok(());
     }
 
-    let loser_is_identified: bool = transaction.query_row(
-        "SELECT is_identified FROM persons WHERE project_id=?1 AND id=?2",
-        params![project_id, loser],
-        |row| row.get(0),
-    )?;
-    if guard == MergeGuard::RefuseIdentifiedSource && loser_is_identified {
-        return Ok(());
+    let identified = |person: &str| -> Result<bool, ProjectionError> {
+        Ok(transaction.query_row(
+            "SELECT is_identified FROM persons WHERE project_id=?1 AND id=?2",
+            params![project_id, person],
+            |row| row.get(0),
+        )?)
+    };
+    let loser_is_identified = identified(&loser)?;
+    match guard {
+        MergeGuard::RefuseIdentifiedSource if loser_is_identified => return Ok(()),
+        MergeGuard::RefuseBothIdentified if loser_is_identified => {
+            if identified(&winner)? {
+                return Ok(());
+            }
+            std::mem::swap(&mut winner, &mut loser);
+        }
+        _ => {}
     }
 
     let (winner_json, winner_created, winner_first_seen): (String, String, String) = transaction

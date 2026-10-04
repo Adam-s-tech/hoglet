@@ -162,3 +162,75 @@ fn rolling_back_the_publication_transaction_removes_every_projection_effect() {
     }
 
 }
+
+fn person_of(connection: &Connection, distinct_id: &str) -> String {
+    connection
+        .query_row(
+            "SELECT person_id FROM distinct_ids WHERE project_id = 'p' AND distinct_id = ?1",
+            [distinct_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn apply_all(connection: &mut Connection, events: &[hoglet::capture::event::CapturedEvent]) {
+    let transaction = connection.transaction().unwrap();
+    for event in events {
+        apply_captured_event(&transaction, "p", event, WalCursor::new(1, 0)).unwrap();
+    }
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn alias_merges_in_either_sdk_direction() {
+    // posthog-node: distinct_id = user, alias = anonymous id.
+    // posthog-python: distinct_id = anonymous id, alias = user.
+    for (distinct_id, alias) in [("user", "anon2"), ("anon2", "user")] {
+        let mut connection = connection();
+        apply_all(
+            &mut connection,
+            &[
+                event("t", 1, "$identify", "user", json!({"$anon_distinct_id": "anon"})),
+                event("t", 2, "click", "anon2", json!({})),
+                event("t", 3, "$create_alias", distinct_id, json!({"alias": alias})),
+            ],
+        );
+        let person = person_of(&connection, "user");
+        assert_eq!(person_of(&connection, "anon"), person);
+        assert_eq!(person_of(&connection, "anon2"), person, "direction {distinct_id} <- {alias}");
+    }
+}
+
+#[test]
+fn alias_never_merges_two_identified_people() {
+    let mut connection = connection();
+    apply_all(
+        &mut connection,
+        &[
+            event("t", 1, "$identify", "alice", json!({"$anon_distinct_id": "a1"})),
+            event("t", 2, "$identify", "bob", json!({"$anon_distinct_id": "b1"})),
+            event("t", 3, "$create_alias", "alice", json!({"alias": "bob"})),
+        ],
+    );
+    assert_ne!(person_of(&connection, "alice"), person_of(&connection, "bob"));
+    // ...unless the caller insists.
+    apply_all(
+        &mut connection,
+        &[event("t", 4, "$merge_dangerously", "alice", json!({"alias": "bob"}))],
+    );
+    assert_eq!(person_of(&connection, "alice"), person_of(&connection, "bob"));
+}
+
+#[test]
+fn identify_on_a_shared_device_keeps_identified_people_apart() {
+    let mut connection = connection();
+    apply_all(
+        &mut connection,
+        &[
+            event("t", 1, "$identify", "alice", json!({"$anon_distinct_id": "device"})),
+            event("t", 2, "$identify", "bob", json!({"$anon_distinct_id": "device"})),
+        ],
+    );
+    assert_ne!(person_of(&connection, "alice"), person_of(&connection, "bob"));
+    assert_eq!(person_of(&connection, "device"), person_of(&connection, "alice"));
+}
