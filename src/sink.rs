@@ -685,8 +685,18 @@ fn publish_and_account(
     publisher: &Publisher,
     stats: &PipelineStats,
 ) -> Result<(), DurablePipelineError> {
+    let started = Instant::now();
     let published = publisher.publish_all()?;
     let events: usize = published.iter().map(|p| p.events).sum();
+    if events > 0 {
+        let elapsed = started.elapsed();
+        let files: usize = published.iter().map(|p| p.files).sum();
+        if elapsed > Duration::from_secs(1) {
+            tracing::info!(events, files, elapsed_ms = elapsed.as_millis() as u64, "slow publication");
+        } else {
+            tracing::debug!(events, files, elapsed_ms = elapsed.as_millis() as u64, "published");
+        }
+    }
     let checkpoint = publisher.checkpoint()?;
     stats.sealed_bytes.store(
         publisher.wal_reader().sealed_bytes().unwrap_or(0),

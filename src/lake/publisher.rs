@@ -143,6 +143,7 @@ impl Publisher {
         // SDK retries of one event inside one window collapse here; across
         // windows the compactor removes them.
         let mut seen: HashSet<(String, uuid::Uuid)> = HashSet::new();
+        let mut catalog = crate::projections::CatalogBatch::default();
         for record in records {
             let project_ids = record
                 .batch
@@ -156,12 +157,8 @@ impl Publisher {
                 if !seen.insert((project_id.clone(), event.uuid)) {
                     continue;
                 }
-                crate::projections::apply_captured_event(
-                    &transaction,
-                    &project_id,
-                    &event,
-                    record.span.end,
-                )?;
+                crate::projections::apply_identity_effects(&transaction, &project_id, &event)?;
+                catalog.add(&project_id, &event);
                 events += 1;
                 partitions
                     .entry((project_id, event.timestamp.date_naive()))
@@ -169,6 +166,8 @@ impl Publisher {
                     .push(event);
             }
         }
+
+        catalog.flush(&transaction)?;
 
         let generation = state.generation + 1;
         let mut added: Vec<LakeFile> = Vec::with_capacity(partitions.len());

@@ -329,6 +329,7 @@ pub struct Session {
     pub person: String,
     pub pageviews: u64,
     pub events: u64,
+    pub autocaptures: u64,
     pub duration_us: i64,
     pub entry_page: Option<String>,
     pub exit_page: Option<String>,
@@ -406,6 +407,10 @@ pub fn build_sessions(
             person: first.0.clone(),
             pageviews: pageviews.len() as u64,
             events: members.len() as u64,
+            autocaptures: members
+                .iter()
+                .filter(|(_, event)| event.event == "$autocapture")
+                .count() as u64,
             duration_us: max - min,
             entry_page: text(&first.1, "$pathname"),
             exit_page: text(&last.1, "$pathname"),
@@ -413,6 +418,13 @@ pub fn build_sessions(
         });
     }
     (tagged, out)
+}
+
+impl Session {
+    /// PostHog's bounce: one pageview, no autocapture, under 10 seconds.
+    pub fn is_bounce(&self) -> bool {
+        self.pageviews == 1 && self.autocaptures == 0 && self.duration_us < 10_000_000
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -437,7 +449,7 @@ pub fn period_metrics(
     let mine: Vec<&Session> = sessions.iter().filter(|s| s.period == period).collect();
     let bounces = mine
         .iter()
-        .filter(|s| s.pageviews == 1 && s.events == 1)
+        .filter(|s| s.is_bounce())
         .count();
     let count = mine.len() as f64;
     PeriodMetrics {

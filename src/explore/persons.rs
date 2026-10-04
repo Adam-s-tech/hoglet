@@ -101,7 +101,7 @@ pub fn list(
     Ok(PersonListResponse {
         persons: entries
             .into_iter()
-            .map(|entry| summary(entry.person, entry.distinct_ids, None))
+            .map(|entry| summary(entry.person, entry.distinct_ids, entry.last_seen))
             .collect(),
         next_cursor,
     })

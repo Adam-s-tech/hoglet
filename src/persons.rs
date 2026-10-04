@@ -262,6 +262,8 @@ pub struct PersonListEntry {
     pub person: PersonRecord,
     /// First-seen order, at most the requested number.
     pub distinct_ids: Vec<String>,
+    /// Newest event time, RFC 3339 UTC.
+    pub last_seen: Option<String>,
 }
 
 type RawPerson = (PersonRecord, String);
@@ -325,7 +327,8 @@ impl PersonStore {
             .map(|text| text.chars().take(MAX_PERSON_SEARCH).collect());
         self.with_connection(|connection| {
             let mut statement = connection.prepare_cached(
-                "SELECT p.id, p.properties, p.is_identified, p.created_at, p.first_seen_key
+                "SELECT p.id, p.properties, p.is_identified, p.created_at, p.first_seen_key,
+                        p.last_seen
                  FROM persons p
                  WHERE p.project_id = ?1
                    AND (?2 IS NULL OR p.created_at < ?2 OR (p.created_at = ?2 AND p.id < ?3))
@@ -350,17 +353,18 @@ impl PersonStore {
                         search.as_deref(),
                         limit
                     ],
-                    |row| read_person(project_id, row),
+                    |row| Ok((read_person(project_id, row)?, row.get::<_, Option<String>>(5)?)),
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
             let mut entries = Vec::with_capacity(rows.len());
-            for row in rows {
+            for (row, last_seen) in rows {
                 let person = finish_person(row)?;
                 let distinct_ids =
                     distinct_ids_on(connection, project_id, &person.id, distinct_ids_per_person)?;
                 entries.push(PersonListEntry {
                     person,
                     distinct_ids,
+                    last_seen,
                 });
             }
             Ok(entries)

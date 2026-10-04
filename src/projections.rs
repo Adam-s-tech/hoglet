@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS persons (
     is_identified INTEGER NOT NULL DEFAULT 0 CHECK(is_identified IN (0, 1)),
     properties TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(properties)),
     first_seen_key TEXT NOT NULL,
+    -- Newest event time of any of the person's distinct ids (RFC 3339 UTC).
+    last_seen TEXT,
     PRIMARY KEY (project_id, id)
 );
 
@@ -144,7 +146,18 @@ impl From<serde_json::Error> for ProjectionError {
 /// owner evolve those tables independently.
 pub fn initialize_schema(connection: &Connection) -> Result<(), ProjectionError> {
     connection.execute_batch(SCHEMA)?;
+    let has_last_seen = connection
+        .prepare("SELECT 1 FROM pragma_table_info('persons') WHERE name = 'last_seen'")?
+        .exists([])?;
+    if !has_last_seen {
+        connection.execute_batch("ALTER TABLE persons ADD COLUMN last_seen TEXT")?;
+    }
     Ok(())
+}
+
+/// Sortable UTC text form used for `persons.last_seen`.
+fn sortable_time(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 /// Apply one event's rebuildable effects inside the caller's publication
@@ -168,12 +181,30 @@ pub fn apply_captured_event(
     Ok(ApplyOutcome::Applied)
 }
 
+/// Identity effects only, in WAL order; the caller aggregates catalog effects
+/// in a [`CatalogBatch`] and flushes it once per window.
+pub fn apply_identity_effects(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    event: &CapturedEvent,
+) -> Result<(), ProjectionError> {
+    if project_id.trim().is_empty() {
+        return Err(ProjectionError::InvalidProjectId);
+    }
+    apply_identity(transaction, project_id, event)
+}
+
 fn apply_identity(
     transaction: &Transaction<'_>,
     project_id: &str,
     event: &CapturedEvent,
 ) -> Result<(), ProjectionError> {
-    ensure_person(transaction, project_id, &event.distinct_id, event)?;
+    let person_id = ensure_person(transaction, project_id, &event.distinct_id, event)?;
+    transaction.execute(
+        "UPDATE persons SET last_seen = ?3
+         WHERE project_id = ?1 AND id = ?2 AND (last_seen IS NULL OR last_seen < ?3)",
+        params![project_id, person_id, sortable_time(event.timestamp)],
+    )?;
     let other_id = |key: &str| {
         event
             .properties
@@ -362,6 +393,13 @@ fn merge_persons(
     )?;
     transaction.execute(
         "UPDATE persons
+         SET last_seen = (SELECT max(last_seen) FROM persons
+                          WHERE project_id = ?1 AND id IN (?2, ?3))
+         WHERE project_id = ?1 AND id = ?2",
+        params![project_id, winner, loser],
+    )?;
+    transaction.execute(
+        "UPDATE persons
          SET properties=?1, created_at=?2, first_seen_key=?3, is_identified=1
          WHERE project_id=?4 AND id=?5",
         params![
@@ -517,40 +555,152 @@ fn apply_catalog(
     project_id: &str,
     event: &CapturedEvent,
 ) -> Result<(), ProjectionError> {
-    let last_seen = event.timestamp.timestamp_millis();
-    transaction.execute(
-        "INSERT INTO event_names(project_id, name, last_seen, count)
-         VALUES (?1, ?2, ?3, 1)
-         ON CONFLICT(project_id, name) DO UPDATE SET
-             last_seen=max(event_names.last_seen, excluded.last_seen),
-             count=event_names.count + 1",
-        params![project_id, event.event, last_seen],
-    )?;
+    let mut batch = CatalogBatch::default();
+    batch.add(project_id, event);
+    batch.flush(transaction)
+}
 
-    for (key, value) in &event.properties {
-        transaction.execute(
-            "INSERT INTO property_keys(
-                 project_id, source, key, type_guess, last_seen, count
-             ) VALUES (?1, 'event', ?2, ?3, ?4, 1)
+/// Distinct values remembered per property key; values beyond this are not
+/// catalogued (they remain in the events). Bounds the catalog for
+/// high-cardinality keys like ids and URLs.
+pub const MAX_VALUES_PER_KEY: i64 = 500;
+/// Longer values are never catalogued.
+pub const MAX_CATALOG_VALUE_CHARS: usize = 200;
+/// Keys whose values are identifiers, not categories.
+const UNCATALOGUED_VALUE_KEYS: &[&str] = &[
+    "$session_id",
+    "$window_id",
+    "$insert_id",
+    "$pageview_id",
+    "$device_id",
+    "$anon_distinct_id",
+    "$ai_trace_id",
+    "$ai_span_id",
+    "$ai_generation_id",
+    "$time",
+    "$sent_at",
+    "token",
+    "distinct_id",
+    "$set",
+    "$set_once",
+    "$unset",
+    "$groups",
+    "$elements",
+    "$elements_chain",
+];
+
+#[derive(Default)]
+struct Seen {
+    count: i64,
+    last_seen: i64,
+}
+
+/// Catalog effects of a whole publication window, aggregated in memory and
+/// written once per distinct name/key/value instead of once per event.
+#[derive(Default)]
+pub struct CatalogBatch {
+    names: std::collections::HashMap<(String, String), Seen>,
+    keys: std::collections::HashMap<(String, String), (Seen, &'static str)>,
+    values: std::collections::HashMap<(String, String, String), Seen>,
+}
+
+impl CatalogBatch {
+    pub fn add(&mut self, project_id: &str, event: &CapturedEvent) {
+        let at = event.timestamp.timestamp_millis();
+        let bump = |seen: &mut Seen| {
+            seen.count += 1;
+            seen.last_seen = seen.last_seen.max(at);
+        };
+        bump(
+            self.names
+                .entry((project_id.to_owned(), event.event.clone()))
+                .or_default(),
+        );
+        for (key, value) in &event.properties {
+            let entry = self
+                .keys
+                .entry((project_id.to_owned(), key.clone()))
+                .or_insert_with(|| (Seen::default(), value_type(value)));
+            bump(&mut entry.0);
+            entry.1 = value_type(value);
+            if value.is_null()
+                || value.is_object()
+                || value.is_array()
+                || UNCATALOGUED_VALUE_KEYS.contains(&key.as_str())
+            {
+                continue;
+            }
+            let text = value_text(value);
+            if text.chars().count() > MAX_CATALOG_VALUE_CHARS {
+                continue;
+            }
+            bump(
+                self.values
+                    .entry((project_id.to_owned(), key.clone(), text))
+                    .or_default(),
+            );
+        }
+    }
+
+    pub fn flush(self, transaction: &Transaction<'_>) -> Result<(), ProjectionError> {
+        let mut names = transaction.prepare_cached(
+            "INSERT INTO event_names(project_id, name, last_seen, count)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id, name) DO UPDATE SET
+                 last_seen=max(event_names.last_seen, excluded.last_seen),
+                 count=event_names.count + excluded.count",
+        )?;
+        for ((project_id, name), seen) in &self.names {
+            names.execute(params![project_id, name, seen.last_seen, seen.count])?;
+        }
+        let mut keys = transaction.prepare_cached(
+            "INSERT INTO property_keys(project_id, source, key, type_guess, last_seen, count)
+             VALUES (?1, 'event', ?2, ?3, ?4, ?5)
              ON CONFLICT(project_id, source, key) DO UPDATE SET
                  type_guess=excluded.type_guess,
                  last_seen=max(property_keys.last_seen, excluded.last_seen),
-                 count=property_keys.count + 1",
-            params![project_id, key, value_type(value), last_seen],
+                 count=property_keys.count + excluded.count",
         )?;
-
-        if !value.is_null() {
-            transaction.execute(
-                "INSERT INTO property_values(project_id, key, value, last_seen, count)
-                 VALUES (?1, ?2, ?3, ?4, 1)
-                 ON CONFLICT(project_id, key, value) DO UPDATE SET
-                     last_seen=max(property_values.last_seen, excluded.last_seen),
-                     count=property_values.count + 1",
-                params![project_id, key, value_text(value), last_seen],
-            )?;
+        for ((project_id, key), (seen, kind)) in &self.keys {
+            keys.execute(params![project_id, key, kind, seen.last_seen, seen.count])?;
         }
+        let mut existing = transaction.prepare_cached(
+            "SELECT count FROM property_values WHERE project_id=?1 AND key=?2 AND value=?3",
+        )?;
+        let mut cardinality = transaction.prepare_cached(
+            "SELECT count(*) FROM property_values WHERE project_id=?1 AND key=?2",
+        )?;
+        let mut upsert = transaction.prepare_cached(
+            "INSERT INTO property_values(project_id, key, value, last_seen, count)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id, key, value) DO UPDATE SET
+                 last_seen=max(property_values.last_seen, excluded.last_seen),
+                 count=property_values.count + excluded.count",
+        )?;
+        let mut sizes: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        // Most frequent first, so the cap keeps the values that matter.
+        let mut values: Vec<_> = self.values.into_iter().collect();
+        values.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+        for ((project_id, key, value), seen) in values {
+            let known = existing
+                .query_row(params![project_id, key, value], |row| row.get::<_, i64>(0))
+                .optional()?
+                .is_some();
+            if !known {
+                let size = match sizes.get(&(project_id.clone(), key.clone())) {
+                    Some(size) => *size,
+                    None => cardinality.query_row(params![project_id, key], |row| row.get(0))?,
+                };
+                if size >= MAX_VALUES_PER_KEY {
+                    continue;
+                }
+                sizes.insert((project_id.clone(), key.clone()), size + 1);
+            }
+            upsert.execute(params![project_id, key, value, seen.last_seen, seen.count])?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn value_type(value: &Value) -> &'static str {

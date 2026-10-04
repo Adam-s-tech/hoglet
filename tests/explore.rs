@@ -276,7 +276,7 @@ fn expected_breakdown(
     let rate = |members: &[&Session]| {
         let bounced = members
             .iter()
-            .filter(|s| s.pageviews == 1 && s.events == 1)
+            .filter(|s| s.is_bounce())
             .count();
         100.0 * bounced as f64 / members.len() as f64
     };
@@ -1026,7 +1026,17 @@ fn persons_list_pages_newest_first_and_searches() {
         } else {
             assert_eq!(person.display_name, person.distinct_ids[0]);
         }
-        assert!(person.last_seen.is_none());
+        let newest = dataset
+            .events
+            .iter()
+            .filter(|event| dataset.person_of.get(&event.distinct_id) == Some(&person.id))
+            .map(|event| event.timestamp)
+            .max();
+        let listed_last = person
+            .last_seen
+            .as_deref()
+            .map(|text| chrono::DateTime::parse_from_rfc3339(text).unwrap().with_timezone(&chrono::Utc));
+        assert_eq!(listed_last, newest, "last_seen of {}", person.id);
     }
     // Exact limit boundary: a full last page still terminates.
     assert_eq!(

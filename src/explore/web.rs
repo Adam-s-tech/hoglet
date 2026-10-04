@@ -7,7 +7,8 @@
 //!   person, a new session starting after more than 30 minutes of
 //!   inactivity. Only sessions containing at least one `$pageview` count.
 //! - visitors: distinct persons with a pageview. pageviews: `$pageview`s.
-//! - bounce rate: sessions with exactly one event (that pageview) / sessions.
+//! - bounce rate: PostHog's definition — sessions with one pageview, no
+//!   `$autocapture`, lasting under 10 seconds — over all sessions.
 //! - session duration: mean of (last event − first event) per session.
 //! - `previous`: the same metric over the preceding period of equal length,
 //!   sessionized independently.
@@ -92,6 +93,7 @@ fn session_ctes(source: &str, dimension: &str, filter_sql: &str) -> String {
             SELECT period, sid,
                    count(*) FILTER (WHERE event = '$pageview') AS pageviews,
                    count(*) AS events,
+                   count(*) FILTER (WHERE event = '$autocapture') AS autocaptures,
                    max(ts) - min(ts) AS duration,
                    arg_min(pathname, (ts, uuid)) FILTER (WHERE event = '$pageview') AS entry_page,
                    arg_max(pathname, (ts, uuid)) FILTER (WHERE event = '$pageview') AS exit_page,
@@ -231,7 +233,7 @@ pub fn overview(
             ),
             session_stats AS (
                 SELECT period, count(*) AS sessions,
-                       count(*) FILTER (WHERE pageviews = 1 AND events = 1) AS bounces,
+                       count(*) FILTER (WHERE pageviews = 1 AND autocaptures = 0 AND duration < 10000000) AS bounces,
                        avg(duration) AS duration
                 FROM sessions GROUP BY period
             ),
@@ -369,7 +371,7 @@ pub fn breakdown(
         });
     };
     explorer.sync_overrides(connection)?;
-    let bounce = "100.0 * count(*) FILTER (WHERE pageviews = 1 AND events = 1) / count(*)";
+    let bounce = "100.0 * count(*) FILTER (WHERE pageviews = 1 AND autocaptures = 0 AND duration < 10000000) / count(*)";
     let select = match dimension {
         WebDimension::Page => format!(
             "views AS (
