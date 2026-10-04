@@ -1,0 +1,74 @@
+# Hoglet — systemd unit for a single small VPS (1 vCPU / 1 GB).
+#
+# Install:  sudo install -m 0644 deploy/systemd/hoglet.service /etc/systemd/system/
+#           sudo useradd --system --home-dir /var/lib/hoglet --shell /usr/sbin/nologin hoglet
+#           sudo systemctl daemon-reload && sudo systemctl enable --now hoglet
+# Overrides go in `systemctl edit hoglet`, not in this file.
+
+[Unit]
+Description=Hoglet product analytics
+Documentation=https://github.com/debpalash/hoglet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hoglet
+Group=hoglet
+ExecStart=/usr/local/bin/hoglet
+# StateDirectory creates /var/lib/hoglet owned by User= with mode 0700.
+StateDirectory=hoglet
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/hoglet
+Environment=HOGLET_DATA=/var/lib/hoglet
+# Loopback only: put Caddy or nginx in front for TLS (deploy/caddy, deploy/nginx).
+Environment=HOGLET_ADDR=127.0.0.1:8000
+Environment=RUST_LOG=hoglet=info
+# Optional: Environment=HOGLET_MAX_EVENTS_PER_SEC=5000
+
+# Hoglet drains and flushes on SIGINT (ctrl-c). It does not install a SIGTERM
+# handler, so stop it with SIGINT to get a clean shutdown instead of WAL recovery.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+
+# Memory: DuckDB queries are capped at 128 MB inside the process; ingest and
+# SQLite live outside that cap. 768M leaves ~250 MB for the OS + reverse proxy
+# on a 1 GB box. MemoryHigh throttles before the hard kill.
+MemoryHigh=640M
+MemoryMax=768M
+TasksMax=256
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hoglet
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

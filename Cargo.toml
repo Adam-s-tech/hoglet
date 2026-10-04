@@ -41,7 +41,19 @@ http-body-util = "0.1"
 tempfile = "3"
 uuid = { version = "1", features = ["v7", "v4", "serde"] }
 
+# Release binaries ship as one static file (scripts/build-release.sh).
+# Measured on the static linux-amd64 build with DuckDB parquet+json compiled
+# in, 2026-10:
+#   as below                             51.1 MB
+#   opt-level = "s" for Rust code        47.6 MB (-7%)
+#   opt-level = "s" for DuckDB (C++)     46.8 MB (-8%)
+# Neither saving is worth slower ingest or slower funnels; keep opt-level 3.
 [profile.release]
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+# Must stay "unwind": a panicking spawn_blocking query or pipeline worker is
+# surfaced as a JoinError / WorkerPanicked and answered with a 5xx. "abort"
+# would turn any such panic into a whole-process crash.
+panic = "unwind"
