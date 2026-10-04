@@ -20,7 +20,7 @@ import { eventLabel } from "@/lib/properties";
 import { catalogEventsQuery, eventsQuery } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 import type { EventRow } from "@/types/EventRow";
-import { LoadDemoButton } from "@/pages/Onboarding";
+import { FirstRunEmpty } from "@/components/first-run";
 import { KV } from "@/components/page";
 
 const route = getRouteApi("/project/$projectId/activity");
@@ -235,7 +235,6 @@ function EventFilter({ value, onChange }: { value: string | null; onChange: (v: 
 
 export function ActivityPage() {
   const pid = useProjectId();
-  const path = usePath();
   const search = route.useSearch();
   const navigate = route.useNavigate();
   const event = search.event ?? null;
@@ -353,18 +352,9 @@ export function ActivityPage() {
           filtered ? (
             <Empty icon="search" title="No events match these filters" />
           ) : (
-            <Empty
-              icon="activity"
-              title="No events yet"
-              action={
-                <div className="flex flex-wrap items-center justify-center gap-2">
-                  <LoadDemoButton />
-                  <Button nativeButton={false} render={<Link to={path("onboarding")} />}>Connect your app</Button>
-                </div>
-              }
-            >
+            <FirstRunEmpty icon="activity" title="No events yet">
               Point a PostHog SDK at this server and events show up here within seconds. This page refreshes on its own.
-            </Empty>
+            </FirstRunEmpty>
           )
         ) : (
           <ScrollEnd onEnd={() => pages.length < AUTO_PAGES && loadOlder()}>

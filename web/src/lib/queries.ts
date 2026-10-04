@@ -19,7 +19,8 @@ import { ApiError, api, type Workspace } from "./api";
 
 // ── Session ──────────────────────────────────────────────────────────────
 
-export type Boot = { state: "setup" } | { state: "login" } | { state: "ready"; workspace: Workspace };
+/** `expired`: the session ended while the app was open (a 401 from any call), as opposed to a fresh visit. */
+export type Boot = { state: "setup" } | { state: "login"; expired?: boolean } | { state: "ready"; workspace: Workspace };
 
 export const bootKey = ["boot"] as const;
 

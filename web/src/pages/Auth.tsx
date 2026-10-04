@@ -1,7 +1,7 @@
 // First-run setup and sign-in. Both end by writing the session into the boot
 // query, which swaps the screen for the app.
 
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "@tanstack/react-form";
 import type { ReactNode } from "react";
 import { Icon, Logo } from "@/components/icons";
@@ -12,7 +12,7 @@ import { Input } from "@/components/ui/input";
 import { ApiError, api, errorMessage, isMock, type Workspace } from "@/lib/api";
 import { firstProject, projectPath } from "@/lib/context";
 import { navigate } from "@/lib/nav";
-import { bootKey } from "@/lib/queries";
+import { bootKey, bootQuery } from "@/lib/queries";
 import { clearSessionData } from "@/lib/query-client";
 
 function AuthCard({ title, lede, foot, onSubmit, children }: { title: string; lede: string; foot: string; onSubmit: () => void; children: ReactNode }) {
@@ -163,6 +163,8 @@ export function LoginPage() {
     },
   });
   const bad = login.error instanceof ApiError && login.error.status === 401;
+  const boot = useQuery(bootQuery).data;
+  const expired = boot?.state === "login" && boot.expired === true;
 
   return (
     <AuthCard title="Sign in" lede="Product analytics, on your own server." foot="Sessions last 7 days on this browser." onSubmit={() => void form.handleSubmit()}>
@@ -188,6 +190,7 @@ export function LoginPage() {
           </FormField>
         )}
       </form.Field>
+      {expired && !login.error ? <Notice tone="warn">Your session ended. Sign in again to pick up where you left off.</Notice> : null}
       {login.error ? <Notice tone="bad">{bad ? "That email and password don't match." : errorMessage(login.error)}</Notice> : null}
       <Button type="submit" size="lg" className="h-10 text-[15px]" disabled={login.isPending}>
         {login.isPending ? "Signing in…" : "Sign in"}

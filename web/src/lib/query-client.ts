@@ -7,11 +7,11 @@
 
 import { MutationCache, QueryCache, QueryClient } from "@tanstack/react-query";
 import { ApiError } from "./api";
-import { bootKey } from "./queries";
+import { bootKey, type Boot } from "./queries";
 
 function onApiError(error: unknown): void {
   if (error instanceof ApiError && error.status === 401 && !error.authFlow) {
-    queryClient.setQueryData(bootKey, { state: "login" });
+    queryClient.setQueryData(bootKey, { state: "login", expired: true } satisfies Boot);
   }
 }
 

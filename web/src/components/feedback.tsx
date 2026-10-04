@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, errorMessage } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { CopyButton } from "./copy";
 import { Icon, type IconName } from "./icons";
 
 export { Skeleton };
@@ -48,19 +49,41 @@ export function Empty({
       <div className="mb-1 grid size-14 place-items-center rounded-full bg-muted text-muted-foreground">
         <Icon name={icon} size={26} strokeWidth={1.4} />
       </div>
-      <h3>{title}</h3>
+      <h2 className="text-sm">{title}</h2>
       {children ? <p className="max-w-md text-muted-foreground">{children}</p> : null}
       {action ? <div className="mt-2">{action}</div> : null}
     </div>
   );
 }
 
-/** Uniform error rendering; "not available" (endpoint missing) reads as a state, not a failure. */
+/** The id the server logged for this failure: what to quote when reporting it. */
+function RequestId({ id }: { id: string }) {
+  return (
+    <span className="inline-flex items-center gap-1 align-middle font-mono text-xs text-muted-foreground">
+      request id {id}
+      <CopyButton label="" title="Copy request ID" text={id} />
+    </span>
+  );
+}
+
+function describe(error: unknown): { title: string; body: string; icon: IconName; soft: boolean } {
+  if (error instanceof ApiError) {
+    if (error.notAvailable) {
+      return { title: "Not available on this server yet", body: "This Hoglet build doesn't serve this data yet. Upgrade the binary to enable it.", icon: "clock", soft: true };
+    }
+    if (error.status === 0) {
+      return { title: "Can't reach the server", body: "Check your connection and that Hoglet is running, then retry.", icon: "alert", soft: false };
+    }
+    if (error.status === 403) return { title: "You don't have access to this", body: error.message, icon: "alert", soft: false };
+    if (error.status === 404) return { title: "This doesn't exist anymore", body: error.message, icon: "search", soft: false };
+  }
+  return { title: "Couldn't load this", body: errorMessage(error), icon: "alert", soft: false };
+}
+
+/** Uniform error rendering: what failed, a retry, and the request id to quote. "Not available" (endpoint missing) reads as a state, not a failure. */
 export function ErrorState({ error, retry, compact }: { error: unknown; retry?: () => void; compact?: boolean }) {
-  const unavailable = error instanceof ApiError && error.notAvailable;
+  const { title, body, icon, soft } = describe(error);
   const requestId = error instanceof ApiError ? error.requestId : null;
-  const title = unavailable ? "Not available on this server yet" : "Couldn't load this";
-  const body = unavailable ? "This Hoglet build doesn't serve this data yet. Upgrade the binary to enable it." : errorMessage(error);
   const retryButton = retry ? (
     <Button variant="outline" size="sm" onClick={retry}>
       <Icon name="refresh" size={14} /> Retry
@@ -69,13 +92,12 @@ export function ErrorState({ error, retry, compact }: { error: unknown; retry?: 
 
   if (compact) {
     return (
-      <Alert variant={unavailable ? "default" : "destructive"} className="flex items-center gap-3 [&>svg]:translate-y-0">
-        <Icon name={unavailable ? "info" : "alert"} />
+      <Alert variant={soft ? "default" : "destructive"} className="flex items-center gap-3 [&>svg]:translate-y-0">
+        <Icon name={soft ? "info" : "alert"} />
         <div className="min-w-0 flex-1">
           <AlertTitle>{title}</AlertTitle>
           <AlertDescription>
-            {body}
-            {requestId ? <span className="font-mono"> · {requestId.slice(-8)}</span> : null}
+            {body} {requestId ? <RequestId id={requestId} /> : null}
           </AlertDescription>
         </div>
         {retryButton}
@@ -83,9 +105,14 @@ export function ErrorState({ error, retry, compact }: { error: unknown; retry?: 
     );
   }
   return (
-    <Empty icon={unavailable ? "clock" : "alert"} title={title} action={retryButton}>
+    <Empty icon={icon} title={title} action={retryButton}>
       {body}
-      {requestId ? <span className="font-mono"> · {requestId.slice(-8)}</span> : null}
+      {requestId ? (
+        <>
+          <br />
+          <RequestId id={requestId} />
+        </>
+      ) : null}
     </Empty>
   );
 }

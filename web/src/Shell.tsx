@@ -3,9 +3,10 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Link, useRouterState } from "@tanstack/react-router";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { AppDialog } from "@/components/dialogs";
 import { Icon, Logo, type IconName } from "@/components/icons";
+import { Notice } from "@/components/feedback";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -47,16 +48,36 @@ const THEMES: { value: Theme; label: string; icon: IconName }[] = [
   { value: "dark", label: "Dark", icon: "moon" },
 ];
 
-/** Polls /status every 10s (paused while the tab is hidden): Live, behind, unreachable. */
-function Freshness() {
+/** Past this lag the whole page says so, not just the sidebar pill. */
+const BEHIND_BANNER_S = 60;
+
+const subscribeOnline = (cb: () => void) => {
+  window.addEventListener("online", cb);
+  window.addEventListener("offline", cb);
+  return () => {
+    window.removeEventListener("online", cb);
+    window.removeEventListener("offline", cb);
+  };
+};
+
+type Tone = "idle" | "live" | "behind" | "down";
+
+/** Polls /status every 10s (paused while the tab is hidden): live, behind, unreachable, offline. */
+function useFreshness() {
   const projectId = useProjectId();
   const now = useNow(1000);
-  const { data, error, isFetching } = useQuery(statusQuery(projectId, 10_000));
+  const online = useSyncExternalStore(subscribeOnline, () => navigator.onLine);
+  const { data, error, isFetching, refetch } = useQuery(statusQuery(projectId, 10_000));
 
-  let tone: "idle" | "live" | "behind" | "down" = "idle";
+  let tone: Tone = "idle";
   let title = "Checking…";
   let detail: string | null = null;
-  if (error && !data) {
+  if (!online) {
+    tone = "down";
+    title = "You're offline";
+    detail = "reconnecting when you are";
+  } else if (error) {
+    // Also when an earlier poll succeeded: stale "Live" after the server died is the worst answer.
     if (error instanceof ApiError && error.notAvailable) {
       title = "Freshness unknown";
       detail = "status not served";
@@ -76,10 +97,54 @@ function Freshness() {
     } else {
       tone = "behind";
       title = `${fmtDuration(data.ingestion_lag_seconds)} behind`;
-      detail = "ingestion is catching up";
+      detail = data.ingestion_lag_seconds >= BEHIND_BANNER_S ? "events are safe, catching up" : "ingestion is catching up";
     }
   }
+  return { data, now, online, tone, title, detail, refetch: () => void refetch() };
+}
 
+/** Full-width notice for the states a user must not miss: charts well behind, or the server out of reach. */
+function StatusBanner() {
+  const { data, online, tone, refetch } = useFreshness();
+  let body: ReactNode = null;
+  let level: "warn" | "bad" = "warn";
+  if (tone === "down") {
+    level = "bad";
+    body = online ? (
+      <>
+        <b>Can't reach the Hoglet server.</b> What you see may be out of date. Hoglet only acknowledges an event after storing it, so your apps keep retrying anything it missed. Trying again every 10 seconds.
+      </>
+    ) : (
+      <>
+        <b>You're offline.</b> What you see may be out of date. It refreshes by itself when your connection is back.
+      </>
+    );
+  } else if (tone === "behind" && data && data.ingestion_lag_seconds >= BEHIND_BANNER_S) {
+    body = (
+      <>
+        <b>Charts are {fmtDuration(data.ingestion_lag_seconds)} behind.</b> Every event Hoglet has acknowledged is stored; it shows up in charts once ingestion catches up. Recent numbers may look low until then.
+      </>
+    );
+  }
+  if (!body) return null;
+  return (
+    <div className="px-3.5 pt-3 md:px-7">
+      <Notice tone={level} className="mx-auto max-w-[1440px] items-center">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span className="min-w-0 flex-1">{body}</span>
+          {online ? (
+            <Button variant="outline" size="sm" onClick={refetch}>
+              <Icon name="refresh" size={14} /> Check now
+            </Button>
+          ) : null}
+        </div>
+      </Notice>
+    </div>
+  );
+}
+
+function Freshness() {
+  const { data, now, tone, title, detail } = useFreshness();
   return (
     <Popover>
       <PopoverTrigger
@@ -382,6 +447,7 @@ export function Shell({ children }: { children: ReactNode }) {
         </SheetContent>
       </Sheet>
       <main id="main" tabIndex={-1} className="flex min-w-0 flex-col outline-none">
+        <StatusBanner />
         <TooltipProvider delay={300}>{children}</TooltipProvider>
       </main>
       {help && <Shortcuts onClose={() => setHelp(false)} />}

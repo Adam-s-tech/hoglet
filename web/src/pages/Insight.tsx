@@ -27,6 +27,7 @@ import { CopyButton } from "@/components/copy";
 import { AppDialog, Confirm } from "@/components/dialogs";
 import { DateRangePicker } from "@/components/date-range";
 import { Empty, ErrorState, LoadingBar, Skeleton } from "@/components/feedback";
+import { FirstRunEmpty, useFirstRun } from "@/components/first-run";
 import { InlineEdit } from "@/components/inline-edit";
 import { CardBar, CardPad, FormField, Page, PageHeader, Panel } from "@/components/page";
 import { toast } from "@/components/toast";
@@ -427,11 +428,16 @@ function InsightEditor({ id, initial, persist }: { id: string | null; initial?: 
   };
 
   const meta = isSql && !sqlRun ? undefined : run.data?.meta;
+  const firstRun = useFirstRun();
   const resultBody = (
     <div className={`relative p-4 ${isSql ? "min-h-[200px]" : "min-h-[380px]"}`}>
       <LoadingBar show={run.pending && !!run.data} />
       {run.hint ? (
         <Empty icon="info" title={run.hint} />
+      ) : firstRun && !isSql ? (
+        <FirstRunEmpty icon="trends" title="No events to analyze yet">
+          Insights read the events your app sends. Connect an app, or load demo data to see this chart with real-looking numbers.
+        </FirstRunEmpty>
       ) : isSql && !sqlRun ? (
         <Empty icon="play" title="Run the query to see results">
           Press{" "}

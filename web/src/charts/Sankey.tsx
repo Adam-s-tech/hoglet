@@ -321,9 +321,9 @@ export function PathsSankey({ links }: { links: PathLink[] }) {
         {sel && (
           <section className="mt-3 rounded-lg border p-3 text-sm" aria-label={`Flows at ${sel.name}`}>
             <div className="mb-2 flex items-center gap-2">
-              <h3 className="min-w-0 flex-1 truncate">
+              <h2 className="min-w-0 flex-1 truncate text-sm">
                 Step {sel.step} · {sel.name}
-              </h3>
+              </h2>
               <span className="num text-muted-foreground">{fmtNumber(sel.value)} persons</span>
               <button type="button" className="rounded px-1 text-xs text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none" onClick={() => setSelected(null)}>
                 Close
