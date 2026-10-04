@@ -206,6 +206,243 @@ impl PeriodStats {
     }
 }
 
+/// Most 64-bit words of bucket bits one visitor needs on the fast path.
+const MAX_BUCKET_WORDS: usize = 4;
+/// Sessions of one period shorter than this, with one pageview and no
+/// autocapture, are bounces.
+const BOUNCE_MICROS: i64 = 10_000_000;
+
+struct FastOverview {
+    periods: [PeriodStats; 2],
+    visitors_series: Vec<u64>,
+    pageviews_series: Vec<u64>,
+}
+
+/// The overview without materializing events.
+///
+/// - visitors and pageviews: one pass over the `$pageview`s. Each distinct id
+///   folds its pageviews into a bitmask of the buckets it was seen in (plus a
+///   previous-period flag); the masks are joined to the identity overrides
+///   once per distinct id and OR-ed per person, so a person's devices merge
+///   exactly. Pageviews per bucket come from the same pass.
+/// - sessions: one pass over every event grouped by `(period, session_id)`;
+///   only the counts, bounce and duration survive, never the events.
+///   Events without a session id are sessionized per person (30 minute gap)
+///   in a third pass that runs only when such pageviews exist.
+///
+/// `None` when the request does not fit (month buckets are not uniform;
+/// more than `MAX_BUCKET_WORDS * 64` buckets): the general SQL runs then.
+fn overview_fast(
+    connection: &duckdb::Connection,
+    files: &crate::source::EventFiles,
+    project_id: &str,
+    plan: &Plan,
+    lo: DateTime<Utc>,
+    interval: Interval,
+    buckets: &[DateTime<Utc>],
+) -> Result<Option<FastOverview>, ExploreError> {
+    let unit = match interval {
+        Interval::Hour => 3_600_000_000_i64,
+        Interval::Day => 86_400_000_000,
+        Interval::Week => 7 * 86_400_000_000,
+        Interval::Month => return Ok(None),
+    };
+    let words = buckets.len().div_ceil(64).max(1);
+    let Some(first_bucket) = buckets.first() else {
+        return Ok(None);
+    };
+    if words > MAX_BUCKET_WORDS {
+        return Ok(None);
+    }
+    let Some(source) = parquet_source(files)? else {
+        return Ok(None);
+    };
+    let from = plan.from.timestamp_micros();
+    let base = first_bucket.timestamp_micros();
+    let range = |params: &mut Vec<Db>| {
+        params.push(Db::BigInt(lo.timestamp_micros()));
+        params.push(Db::BigInt(plan.to.timestamp_micros()));
+        params.extend(plan.filters.params.iter().cloned());
+    };
+    let filter_sql = &plan.filters.sql;
+    let when = "e.timestamp >= make_timestamp(?::BIGINT)::TIMESTAMPTZ \
+                AND e.timestamp < make_timestamp(?::BIGINT)::TIMESTAMPTZ";
+
+    let mut periods = [PeriodStats::default(); 2];
+    let mut visitors_series = vec![0_u64; buckets.len()];
+    let mut pageviews_series = vec![0_u64; buckets.len()];
+
+    // Visitors and pageviews.
+    let first_words: String = (0..words)
+        .map(|word| {
+            let low = word * 64;
+            format!(
+                "bit_or(CASE WHEN i >= {low} AND i < {} THEN 1::UBIGINT << (i - {low})::UBIGINT \
+                 ELSE 0::UBIGINT END) AS m{word}",
+                low + 64
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let merged_words: String = (0..words)
+        .map(|word| format!("bit_or(g.m{word}) AS m{word}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let word_names: String = (0..words)
+        .map(|word| format!("m{word}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let zero_words: String = (0..words)
+        .map(|word| format!("0::UBIGINT AS m{word}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH ev AS (SELECT epoch_us(e.timestamp) AS ts, e.distinct_id AS distinct_id \
+                     FROM {source} e WHERE e.event = '$pageview' AND {when} {filter_sql}), \
+         x AS (SELECT distinct_id, CASE WHEN ts >= {from} THEN (ts - {base}) // {unit} ELSE -1 END AS i \
+               FROM ev), \
+         g AS (SELECT distinct_id, i, {first_words}, \
+                      max(CASE WHEN i < 0 THEN 1 ELSE 0 END) AS prev, count(*) AS n, \
+                      GROUPING(distinct_id) AS kind \
+               FROM x GROUP BY GROUPING SETS ((distinct_id), (i))), \
+         p AS (SELECT coalesce(o.person_id, g.distinct_id) AS person_id, {merged_words}, \
+                      max(g.prev) AS prev \
+               FROM g LEFT JOIN (SELECT distinct_id, person_id FROM explore_overrides \
+                                 WHERE project_id = ?) o ON o.distinct_id = g.distinct_id \
+               WHERE g.kind = 0 GROUP BY 1) \
+         SELECT 'person', prev::BIGINT AS a, count(*) AS b, {word_names} FROM p \
+                GROUP BY prev, {word_names} \
+         UNION ALL \
+         SELECT 'bucket', i, n, {zero_words} FROM g WHERE kind = 1"
+    );
+    let mut params = Vec::new();
+    range(&mut params);
+    params.push(Db::Text(project_id.to_owned()));
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement.query(duckdb::params_from_iter(params))?;
+    while let Some(row) = rows.next()? {
+        let kind: String = row.get(0)?;
+        let a: i64 = row.get(1)?;
+        let b: i64 = row.get(2)?;
+        if kind == "bucket" {
+            if a < 0 {
+                periods[0].pageviews = b as f64;
+            } else {
+                periods[1].pageviews += b as f64;
+                if let Some(slot) = pageviews_series.get_mut(a as usize) {
+                    *slot = b as u64;
+                }
+            }
+            continue;
+        }
+        let mut masks = Vec::with_capacity(words);
+        for word in 0..words {
+            masks.push(row.get::<_, u64>(3 + word)?);
+        }
+        if a == 1 {
+            periods[0].visitors += b as f64;
+        }
+        if masks.iter().any(|mask| *mask != 0) {
+            periods[1].visitors += b as f64;
+        }
+        for (index, slot) in visitors_series.iter_mut().enumerate() {
+            if masks[index / 64] >> (index % 64) & 1 == 1 {
+                *slot += b as u64;
+            }
+        }
+    }
+    drop(rows);
+
+    // Sessions that carry a session id.
+    let sql = format!(
+        "WITH ev AS (SELECT epoch_us(e.timestamp) AS ts, e.event AS event, \
+                            e.session_id AS session_id \
+                     FROM {source} e WHERE {when} {filter_sql}), \
+         s AS (SELECT (ts >= {from})::INT AS period, session_id, \
+                      count(*) FILTER (WHERE event = '$pageview') AS pv, \
+                      count(*) FILTER (WHERE event = '$autocapture') AS ac, \
+                      max(ts) - min(ts) AS dur \
+               FROM ev GROUP BY period, session_id) \
+         SELECT period, session_id IS NULL AS sessionless, count(*), \
+                count(*) FILTER (WHERE pv = 1 AND ac = 0 AND dur < {BOUNCE_MICROS}), \
+                sum(dur)::DOUBLE \
+         FROM s WHERE pv > 0 GROUP BY period, sessionless"
+    );
+    let mut params = Vec::new();
+    range(&mut params);
+    let mut sessionless = false;
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement.query(duckdb::params_from_iter(params))?;
+    while let Some(row) = rows.next()? {
+        let period = usize::try_from(row.get::<_, i64>(0)?).unwrap_or(2);
+        let is_sessionless: bool = row.get(1)?;
+        if is_sessionless {
+            sessionless = true;
+            continue;
+        }
+        let Some(stats) = periods.get_mut(period) else {
+            continue;
+        };
+        stats.sessions += row.get::<_, i64>(2)? as f64;
+        stats.bounces += row.get::<_, i64>(3)? as f64;
+        stats.duration_us += row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+    }
+    drop(rows);
+
+    // Events without a session id: sessions are gaps in a person's activity.
+    if sessionless {
+        let sql = format!(
+            "WITH ev AS (SELECT epoch_us(e.timestamp) AS ts, e.event AS event, \
+                                (epoch_us(e.timestamp) >= {from})::INT AS period, \
+                                coalesce(o.person_id, e.distinct_id) AS person \
+                         FROM {source} e \
+                         LEFT JOIN (SELECT distinct_id, person_id FROM explore_overrides \
+                                    WHERE project_id = ?) o ON o.distinct_id = e.distinct_id \
+                         WHERE e.session_id IS NULL AND {when} {filter_sql}), \
+             gaps AS (SELECT *, CASE WHEN ts - lag(ts) OVER (PARTITION BY period, person ORDER BY ts) \
+                                          <= {SESSION_GAP_MICROS} THEN 0 ELSE 1 END AS new_session \
+                      FROM ev), \
+             numbered AS (SELECT period, person, event, ts, \
+                                 sum(new_session) OVER (PARTITION BY period, person ORDER BY ts \
+                                                        ROWS UNBOUNDED PRECEDING) AS n \
+                          FROM gaps), \
+             s AS (SELECT period, \
+                          count(*) FILTER (WHERE event = '$pageview') AS pv, \
+                          count(*) FILTER (WHERE event = '$autocapture') AS ac, \
+                          max(ts) - min(ts) AS dur \
+                   FROM numbered GROUP BY period, person, n) \
+             SELECT period, count(*), \
+                    count(*) FILTER (WHERE pv = 1 AND ac = 0 AND dur < {BOUNCE_MICROS}), \
+                    sum(dur)::DOUBLE \
+             FROM s WHERE pv > 0 GROUP BY period"
+        );
+        let mut params = vec![Db::Text(project_id.to_owned())];
+        range(&mut params);
+        let mut statement = connection.prepare(&sql)?;
+        let mut rows = statement.query(duckdb::params_from_iter(params))?;
+        while let Some(row) = rows.next()? {
+            let period = usize::try_from(row.get::<_, i64>(0)?).unwrap_or(2);
+            let Some(stats) = periods.get_mut(period) else {
+                continue;
+            };
+            stats.sessions += row.get::<_, i64>(1)? as f64;
+            stats.bounces += row.get::<_, i64>(2)? as f64;
+            stats.duration_us += row.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
+        }
+    }
+    // `duration_us` accumulated sums; the metric is their mean.
+    for stats in &mut periods {
+        if stats.sessions > 0.0 {
+            stats.duration_us /= stats.sessions;
+        }
+    }
+    Ok(Some(FastOverview {
+        periods,
+        visitors_series,
+        pageviews_series,
+    }))
+}
+
 pub fn overview(
     explorer: &Explorer,
     connection: &duckdb::Connection,
@@ -222,7 +459,17 @@ pub fn overview(
     let mut visitors_series = vec![0_u64; buckets.len()];
     let mut pageviews_series = vec![0_u64; buckets.len()];
     let files = explorer.source().files(project_id, first_day, last_day);
-    if let Some(source) = parquet_source(&files)? {
+    let fast = if files.is_empty() {
+        None
+    } else {
+        explorer.sync_overrides(connection)?;
+        overview_fast(connection, &files, project_id, &plan, lo, interval, &buckets)?
+    };
+    if let Some(fast) = fast {
+        periods = fast.periods;
+        visitors_series = fast.visitors_series;
+        pageviews_series = fast.pageviews_series;
+    } else if let Some(source) = parquet_source(&files)? {
         explorer.sync_overrides(connection)?;
         let unit = dates::unit(interval);
         let sql = format!(

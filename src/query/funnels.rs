@@ -35,6 +35,7 @@ use crate::contract::insight::{
     FunnelBreakdownResult, FunnelOrder, FunnelStepResult, FunnelsQuery, HistogramBin, InsightResult,
 };
 use duckdb::arrow::array::Array;
+use duckdb::arrow::datatypes::DataType;
 
 /// Exclusion bits start here; steps use bits `0..20`.
 const EXCLUSION_BIT: u32 = 32;
@@ -203,11 +204,27 @@ pub(crate) struct PersonOutcome {
     pub breakdown: Option<String>,
 }
 
-fn analyze(
-    ctx: &Ctx<'_>,
-    q: &FunnelsQuery,
-    range: &ResolvedRange,
-) -> Result<Vec<PersonOutcome>, QueryError> {
+/// Persons whose equal-timestamp events differ are ordered by uuid in a
+/// second, small query; past this many the whole analysis runs that way.
+const MAX_TIED_PERSONS: usize = 20_000;
+
+/// Everything about the scan that is the same for every pass.
+struct Scan {
+    relation: String,
+    params: Params,
+    steps: usize,
+    window: i64,
+    order: FunnelOrder,
+    mask_sql: String,
+    bd_column: String,
+    has_breakdown: bool,
+    person_breakdown: bool,
+    event_prefilter: String,
+    keep: &'static str,
+    exclusions: Vec<Exclusion>,
+}
+
+fn scan_plan(ctx: &Ctx<'_>, q: &FunnelsQuery, range: &ResolvedRange) -> Result<Scan, QueryError> {
     let steps = q.series.len();
     let window = q.funnel_window.seconds().saturating_mul(1_000_000);
     let mut params = Params::new();
@@ -250,7 +267,6 @@ fn analyze(
         .as_ref()
         .map(|text| format!(", {text} AS bd"))
         .unwrap_or_default();
-    let bd_select = if breakdown.is_some() { ", bd" } else { "" };
     // Only step and exclusion events matter unless order is strict (where
     // any event in between breaks a sequence) or a step matches all events.
     // Saying so explicitly lets DuckDB skip row groups: files are sorted by
@@ -276,73 +292,264 @@ fn analyze(
     } else {
         "mask <> 0"
     };
-    let mask_sql = mask_terms.join(" + ");
-    let partitions = ctx.person_partitions()?;
-    let person_breakdown = matches!(
-        q.breakdown.as_ref().map(|b| b.source),
-        Some(PropertySource::Person)
-    );
+    Ok(Scan {
+        relation,
+        params,
+        steps,
+        window,
+        order: q.funnel_order,
+        mask_sql: mask_terms.join(" + "),
+        has_breakdown: breakdown.is_some(),
+        bd_column,
+        person_breakdown: matches!(
+            q.breakdown.as_ref().map(|b| b.source),
+            Some(PropertySource::Person)
+        ),
+        event_prefilter,
+        keep,
+        exclusions,
+    })
+}
 
-    // Rows arrive ordered by (person, timestamp, uuid); a person's events
-    // are collected, analysed, and dropped before the next person.
-    struct Current {
-        person: Option<String>,
-        events: Vec<Event>,
-        breakdowns: Vec<Option<String>>,
-    }
-    let mut outcomes = Vec::new();
-    let mut current = Current {
-        person: None,
-        events: Vec::new(),
-        breakdowns: Vec::new(),
-    };
-    let finish = |current: &mut Current, outcomes: &mut Vec<PersonOutcome>| {
-        if let Some(person) = current.person.take()
-            && let Some(attempt) =
-                best_attempt(&current.events, q.funnel_order, steps, window, &exclusions)
-        {
-            let index = if person_breakdown { 0 } else { attempt.anchor };
-            outcomes.push(PersonOutcome {
-                person,
-                breakdown: current.breakdowns.get(index).cloned().flatten(),
-                times: attempt.times,
-            });
+/// One person's events as collected from a scan, in `(timestamp, …)` order.
+struct Collected {
+    person: String,
+    events: Vec<Event>,
+    breakdowns: Vec<Option<String>>,
+}
+
+impl Collected {
+    fn new(person: &str) -> Self {
+        Self {
+            person: person.to_owned(),
+            events: Vec::new(),
+            breakdowns: Vec::new(),
         }
-        current.events.clear();
-        current.breakdowns.clear();
+    }
+}
+
+impl Scan {
+    fn outcome(&self, collected: &Collected) -> Option<PersonOutcome> {
+        let attempt = best_attempt(
+            &collected.events,
+            self.order,
+            self.steps,
+            self.window,
+            &self.exclusions,
+        )?;
+        let index = if self.person_breakdown {
+            0
+        } else {
+            attempt.anchor
+        };
+        Some(PersonOutcome {
+            person: collected.person.clone(),
+            breakdown: collected.breakdowns.get(index).cloned().flatten(),
+            times: attempt.times,
+        })
+    }
+
+    /// Do two events with the same timestamp differ in anything the
+    /// analysis reads (their order then needs the uuid)?
+    fn tie_matters(&self, collected: &Collected) -> bool {
+        collected.events.windows(2).enumerate().any(|(index, pair)| {
+            pair[0].ts == pair[1].ts
+                && (pair[0].mask != pair[1].mask
+                    || (self.has_breakdown
+                        && collected.breakdowns[index] != collected.breakdowns[index + 1]))
+        })
+    }
+
+    fn push(&self, collected: &mut Collected, ts: i64, mask: i64, breakdown: Option<Option<String>>) {
+        collected.events.push(Event {
+            ts,
+            mask: mask as u64,
+        });
+        if let Some(breakdown) = breakdown {
+            collected.breakdowns.push(breakdown);
+        }
+    }
+}
+
+fn analyze(
+    ctx: &Ctx<'_>,
+    q: &FunnelsQuery,
+    range: &ResolvedRange,
+) -> Result<Vec<PersonOutcome>, QueryError> {
+    let scan = scan_plan(ctx, q, range)?;
+    match analyze_by_hash(ctx, &scan)? {
+        Some(outcomes) => Ok(outcomes),
+        None => analyze_ordered(ctx, &scan, false),
+    }
+}
+
+/// Fast path: DuckDB orders each partition by `(hash(person), timestamp)` —
+/// two integers, no strings, no uuid column read — and a person's events are
+/// the rows of one hash run (a hash collision between persons is resolved by
+/// comparing the ids). Persons with equal-timestamp events that differ are
+/// not decided here: their order is the uuid's, so they are re-read by
+/// [`analyze_ordered`] restricted to them. `None` when too many persons tie.
+fn analyze_by_hash(ctx: &Ctx<'_>, scan: &Scan) -> Result<Option<Vec<PersonOutcome>>, QueryError> {
+    let partitions = ctx.person_partitions()?;
+    let mut outcomes = Vec::new();
+    let mut tied: Vec<String> = Vec::new();
+    // The rows of one hash value; almost always a single person.
+    let mut run_hash: Option<i64> = None;
+    let mut run: Vec<Collected> = Vec::new();
+    let mut overflow = false;
+    let bd_select = if scan.has_breakdown { ", bd" } else { "" };
+    let finish = |run: &mut Vec<Collected>,
+                  outcomes: &mut Vec<PersonOutcome>,
+                  tied: &mut Vec<String>,
+                  overflow: &mut bool| {
+        for collected in run.drain(..) {
+            if scan.tie_matters(&collected) {
+                if tied.len() >= MAX_TIED_PERSONS {
+                    *overflow = true;
+                } else {
+                    tied.push(collected.person);
+                }
+            } else if let Some(outcome) = scan.outcome(&collected) {
+                outcomes.push(outcome);
+            }
+        }
+    };
+    for partition in 0..partitions {
+        let sql = format!(
+            "WITH ev AS ({relation}), \
+             x AS (SELECT person_id, (hash(person_id) >> 1::UBIGINT)::BIGINT AS h, ts, \
+                          ({mask_sql})::BIGINT AS mask{bd_column} FROM ev \
+                   WHERE {part} AND {prefilter}) \
+             SELECT person_id, h, ts, mask{bd_select} FROM x WHERE {keep} ORDER BY h, ts",
+            relation = scan.relation,
+            mask_sql = scan.mask_sql,
+            bd_column = scan.bd_column,
+            part = super::partition_clause(partition, partitions),
+            prefilter = scan.event_prefilter,
+            keep = scan.keep,
+        );
+        let mut types = vec![DataType::Utf8, DataType::Int64, DataType::Int64, DataType::Int64];
+        if scan.has_breakdown {
+            types.push(DataType::Utf8);
+        }
+        ctx.arrow_streaming(&sql, &scan.params, &types, |batch| {
+            let persons = string_column(batch, 0)?;
+            let hashes = i64_column(batch, 1)?;
+            let times = i64_column(batch, 2)?;
+            let masks = i64_column(batch, 3)?;
+            let breakdowns = if scan.has_breakdown {
+                Some(string_column(batch, 4)?)
+            } else {
+                None
+            };
+            for row in 0..batch.num_rows() {
+                let hash = hashes.value(row);
+                if run_hash != Some(hash) {
+                    finish(&mut run, &mut outcomes, &mut tied, &mut overflow);
+                    run_hash = Some(hash);
+                }
+                let person = persons.value(row);
+                let position = match run.iter().position(|c| c.person == person) {
+                    Some(position) => position,
+                    None => {
+                        run.push(Collected::new(person));
+                        run.len() - 1
+                    }
+                };
+                scan.push(
+                    &mut run[position],
+                    times.value(row),
+                    masks.value(row),
+                    breakdowns
+                        .as_ref()
+                        .map(|values| (!values.is_null(row)).then(|| values.value(row).to_owned())),
+                );
+            }
+            Ok(())
+        })?;
+        finish(&mut run, &mut outcomes, &mut tied, &mut overflow);
+        run_hash = None;
+        if overflow {
+            return Ok(None);
+        }
+    }
+    if !tied.is_empty() {
+        ctx.temp_text_table("funnel_tied", "person_id", &tied)?;
+        outcomes.extend(analyze_ordered(ctx, scan, true)?);
+    }
+    Ok(Some(outcomes))
+}
+
+/// Exact path: rows arrive ordered by `(person, timestamp, uuid)`; a
+/// person's events are collected, analysed, and dropped before the next
+/// person. `tied_only` restricts it to the persons in `funnel_tied`.
+fn analyze_ordered(
+    ctx: &Ctx<'_>,
+    scan: &Scan,
+    tied_only: bool,
+) -> Result<Vec<PersonOutcome>, QueryError> {
+    let partitions = if tied_only {
+        1
+    } else {
+        ctx.person_partitions()?
+    };
+    let only = if tied_only {
+        "person_id IN (SELECT person_id FROM funnel_tied)"
+    } else {
+        "TRUE"
+    };
+    let bd_select = if scan.has_breakdown { ", bd" } else { "" };
+    let mut outcomes = Vec::new();
+    let mut current: Option<Collected> = None;
+    let finish = |current: &mut Option<Collected>, outcomes: &mut Vec<PersonOutcome>| {
+        if let Some(collected) = current.take()
+            && let Some(outcome) = scan.outcome(&collected)
+        {
+            outcomes.push(outcome);
+        }
     };
     for partition in 0..partitions {
         let sql = format!(
             "WITH ev AS ({relation}), \
              x AS (SELECT person_id, ts, uuid, ({mask_sql})::BIGINT AS mask{bd_column} FROM ev \
-                   WHERE {} AND {event_prefilter}) \
+                   WHERE {part} AND {prefilter} AND {only}) \
              SELECT person_id, ts, mask{bd_select} FROM x WHERE {keep} \
              ORDER BY person_id, ts, uuid",
-            super::partition_clause(partition, partitions)
+            relation = scan.relation,
+            mask_sql = scan.mask_sql,
+            bd_column = scan.bd_column,
+            part = super::partition_clause(partition, partitions),
+            prefilter = scan.event_prefilter,
+            keep = scan.keep,
         );
-        ctx.arrow(&sql, &params, |batch| {
+        let mut types = vec![DataType::Utf8, DataType::Int64, DataType::Int64];
+        if scan.has_breakdown {
+            types.push(DataType::Utf8);
+        }
+        ctx.arrow_streaming(&sql, &scan.params, &types, |batch| {
             let persons = string_column(batch, 0)?;
             let times = i64_column(batch, 1)?;
             let masks = i64_column(batch, 2)?;
-            let breakdowns = if breakdown.is_some() {
+            let breakdowns = if scan.has_breakdown {
                 Some(string_column(batch, 3)?)
             } else {
                 None
             };
             for row in 0..batch.num_rows() {
                 let person = persons.value(row);
-                if current.person.as_deref() != Some(person) {
+                if current.as_ref().map(|c| c.person.as_str()) != Some(person) {
                     finish(&mut current, &mut outcomes);
-                    current.person = Some(person.to_owned());
+                    current = Some(Collected::new(person));
                 }
-                current.events.push(Event {
-                    ts: times.value(row),
-                    mask: masks.value(row) as u64,
-                });
-                if let Some(values) = &breakdowns {
-                    current
-                        .breakdowns
-                        .push((!values.is_null(row)).then(|| values.value(row).to_owned()));
+                if let Some(collected) = current.as_mut() {
+                    scan.push(
+                        collected,
+                        times.value(row),
+                        masks.value(row),
+                        breakdowns.as_ref().map(|values| {
+                            (!values.is_null(row)).then(|| values.value(row).to_owned())
+                        }),
+                    );
                 }
             }
             Ok(())

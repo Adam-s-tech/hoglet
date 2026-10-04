@@ -17,6 +17,7 @@
 //! - `HOGLET_BENCH_RUNS`: runs per query (default 3; the median is reported).
 //! - `HOGLET_BENCH_MEM_MB` / `HOGLET_BENCH_THREADS`: engine limits
 //!   (defaults: the production defaults).
+//! - `HOGLET_BENCH_PARTITION_ROWS`: rows per person partition.
 //! - `HOGLET_QUERY_PROFILE=1`: print DuckDB's EXPLAIN ANALYZE of every
 //!   statement the engine runs (see `Ctx::profile`).
 
@@ -42,6 +43,30 @@ use crate::source::DirectorySource;
 const PROJECT: &str = "33333333-3333-4333-8333-333333333333";
 const DAYS: i64 = 30;
 const PERSONS: u32 = 300_000;
+
+/// `HOGLET_BENCH_IDS=uuid` uses 36-character ids (what SDKs generate)
+/// instead of the short `anon-N` / `user-N` ones.
+fn long_ids() -> bool {
+    std::env::var("HOGLET_BENCH_IDS").is_ok_and(|style| style == "uuid")
+}
+
+fn anon_id(person: u32) -> String {
+    if long_ids() {
+        Uuid::from_u128(u128::from(person) * 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835 + 1)
+            .to_string()
+    } else {
+        format!("anon-{person}")
+    }
+}
+
+fn user_id(person: u32) -> String {
+    if long_ids() {
+        Uuid::from_u128(u128::from(person) * 0xD1B5_4A32_D192_ED03_8CB9_2BA7_2F3D_8DD7 + 2)
+            .to_string()
+    } else {
+        format!("user-{person}")
+    }
+}
 
 fn generate_raw(lake: &Path, total: usize) {
     let source = DirectorySource::new(lake);
@@ -79,7 +104,7 @@ fn generate_raw(lake: &Path, total: usize) {
                 CapturedEvent {
                     uuid: Uuid::from_u128(rng.r#gen()),
                     event: name.into(),
-                    distinct_id: format!("anon-{person}"),
+                    distinct_id: anon_id(person),
                     token: "phc_bench".into(),
                     timestamp: midnight + Duration::microseconds(rng.gen_range(0..86_400_000_000)),
                     properties,
@@ -121,18 +146,33 @@ fn compact(raw: &Path, compacted: &Path) {
 fn load_identity(projections: &Path) {
     let connection = rusqlite::Connection::open(projections).unwrap();
     crate::projections::initialize_schema(&connection).unwrap();
-    // 50k identity overrides: anon-i -> user-i.
+    // 50k identity overrides: anon id i -> user id i.
+    let transaction = connection.unchecked_transaction().unwrap();
+    {
+        let mut person = transaction
+            .prepare(
+                "INSERT INTO persons (project_id, id, created_at, properties, first_seen_key)
+                 VALUES (?1, ?2, '2026-01-01T00:00:00Z', '{\"plan\":\"pro\"}', ?2)",
+            )
+            .unwrap();
+        let mut distinct = transaction
+            .prepare(
+                "INSERT INTO distinct_ids (project_id, distinct_id, person_id, seq)
+                 VALUES (?1, ?2, ?3, 1)",
+            )
+            .unwrap();
+        for i in 0..50_000 {
+            person
+                .execute(rusqlite::params![PROJECT, user_id(i)])
+                .unwrap();
+            distinct
+                .execute(rusqlite::params![PROJECT, anon_id(i), user_id(i)])
+                .unwrap();
+        }
+    }
+    transaction.commit().unwrap();
     connection
-        .execute_batch(
-            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 49999)
-             INSERT INTO persons (project_id, id, created_at, properties, first_seen_key)
-             SELECT '33333333-3333-4333-8333-333333333333', 'user-' || i, '2026-01-01T00:00:00Z',
-                    '{\"plan\":\"pro\"}', 'user-' || i FROM n;
-             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 49999)
-             INSERT INTO distinct_ids (project_id, distinct_id, person_id, seq)
-             SELECT '33333333-3333-4333-8333-333333333333', 'anon-' || i, 'user-' || i, 1 FROM n;
-             UPDATE identity_state SET seq = 1;",
-        )
+        .execute_batch("UPDATE identity_state SET seq = 1;")
         .unwrap();
 }
 
@@ -249,6 +289,8 @@ fn bench_ten_million() {
         threads: env_usize("HOGLET_BENCH_THREADS", 2) as u32,
         connections: 1,
         temp_directory: Some(root.join("spill")),
+        partition_rows: env_usize("HOGLET_BENCH_PARTITION_ROWS", super::PARTITION_ROWS as usize)
+            as u64,
         ..EngineConfig::default()
     };
     config.timeout = StdDuration::from_secs(600);
@@ -353,11 +395,24 @@ fn sql_lab() {
     connection
         .execute_batch(&format!(
             "SET temp_directory = '{}'; SET parquet_metadata_cache = true;
-             CREATE TABLE person_overrides (project_id VARCHAR, distinct_id VARCHAR, person_id VARCHAR);
-             INSERT INTO person_overrides SELECT '{PROJECT}', 'anon-' || i, 'user-' || i FROM range(50000) t(i);",
+             CREATE TABLE person_overrides (project_id VARCHAR, distinct_id VARCHAR, person_id VARCHAR);",
             root.join("spill").display()
         ))
         .unwrap();
+    let projections = rusqlite::Connection::open(root.join("projections.db")).unwrap();
+    let mut statement = projections
+        .prepare("SELECT distinct_id, person_id FROM distinct_ids")
+        .unwrap();
+    let mut appender = connection.appender("person_overrides").unwrap();
+    let mut rows = statement.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let distinct: String = row.get(0).unwrap();
+        let person: String = row.get(1).unwrap();
+        appender
+            .append_row(duckdb::params![PROJECT, distinct, person])
+            .unwrap();
+    }
+    appender.flush().unwrap();
     let text = std::fs::read_to_string(std::env::var("HOGLET_LAB_SQL").unwrap()).unwrap();
     for statement in text.split("\n;;\n") {
         let sql = statement.replace("{FILES}", &source);

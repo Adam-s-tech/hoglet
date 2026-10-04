@@ -70,6 +70,10 @@ use sql::{EventSchema, Params, Source};
 
 /// Explicit bound on rows any internal result set may return.
 pub const MAX_INTERNAL_ROWS: usize = 5_000_000;
+/// Explicit bound on rows one streamed statement may deliver. Streamed rows
+/// are consumed batch by batch (nothing accumulates here), so the bound only
+/// stops runaway scans; consumers bound their own state.
+pub const MAX_STREAMED_ROWS: usize = 100_000_000;
 /// Explicit bound on actors per page.
 pub const MAX_ACTOR_PAGE: u32 = 1_000;
 /// Explicit bound on actor offsets.
@@ -364,7 +368,45 @@ impl Ctx<'_> {
         let mut rows = 0_usize;
         for batch in batches {
             rows += batch.num_rows();
-            if rows > MAX_INTERNAL_ROWS {
+            if rows > MAX_STREAMED_ROWS {
+                return Err(QueryError::too_large(
+                    "the query produced too many intermediate rows; narrow the date range or filters",
+                ));
+            }
+            self.check_deadline()?;
+            each(&batch)?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Ctx::arrow`], but DuckDB streams the result instead of
+    /// materializing it first: a large ordered result never sits in memory
+    /// next to the consumer's own state. `types` are the result columns'
+    /// Arrow types (`Utf8` for VARCHAR, `Int64` for BIGINT).
+    pub fn arrow_streaming(
+        &self,
+        sql: &str,
+        params: &Params,
+        types: &[DataType],
+        mut each: impl FnMut(&RecordBatch) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
+        #[cfg(test)]
+        self.profile(sql, params);
+        let schema = Arc::new(duckdb::arrow::datatypes::Schema::new(
+            types
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| {
+                    duckdb::arrow::datatypes::Field::new(format!("c{index}"), kind.clone(), true)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let mut statement = self.conn.prepare(sql)?;
+        let batches = statement.stream_arrow(duckdb::params_from_iter(params.values()), schema)?;
+        let mut rows = 0_usize;
+        for batch in batches {
+            rows += batch.num_rows();
+            if rows > MAX_STREAMED_ROWS {
                 return Err(QueryError::too_large(
                     "the query produced too many intermediate rows; narrow the date range or filters",
                 ));
@@ -397,6 +439,24 @@ impl Ctx<'_> {
         Ok((rows.max(0) as u64)
             .div_ceil(self.partition_rows)
             .clamp(1, MAX_PARTITIONS))
+    }
+
+    /// Replace a connection-local temp table with one VARCHAR column.
+    pub fn temp_text_table(
+        &self,
+        name: &str,
+        column: &str,
+        rows: &[String],
+    ) -> Result<(), QueryError> {
+        self.conn.execute_batch(&format!(
+            "CREATE OR REPLACE TEMP TABLE {name} ({column} VARCHAR)"
+        ))?;
+        let mut appender = self.conn.appender_to_catalog_and_db(name, "temp", "main")?;
+        for row in rows {
+            appender.append_row(duckdb::params![row])?;
+        }
+        appender.flush()?;
+        Ok(())
     }
 
     /// Replace a connection-local temp table of BIGINT columns.
