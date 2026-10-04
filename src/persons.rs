@@ -5,6 +5,7 @@
 //! API — reads through this store on its own SQLite connections, so a slow
 //! reader can never block publication (SQLite WAL mode).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -16,6 +17,12 @@ use serde_json::{Map, Value};
 const MAX_POOLED_CONNECTIONS: usize = 8;
 /// Explicit bound on one override sync batch.
 pub const MAX_OVERRIDE_BATCH: usize = 100_000;
+/// Largest page of the persons list.
+pub const MAX_PERSON_PAGE: usize = 100;
+/// Longest persons search string, in characters.
+pub const MAX_PERSON_SEARCH: usize = 200;
+/// Most distinct ids resolved, or returned for one person, per call.
+pub const MAX_DISTINCT_IDS_PER_CALL: usize = 1_000;
 
 #[derive(Debug)]
 pub enum PersonStoreError {
@@ -147,16 +154,18 @@ impl PersonStore {
                     },
                 )
                 .optional()?
-                .map(|(id, properties, is_identified, created_at, first_seen_key)| {
-                    Ok(PersonRecord {
-                        project_id: project_id.to_owned(),
-                        id,
-                        properties: decode_object(&properties)?,
-                        is_identified,
-                        created_at,
-                        first_seen_key,
-                    })
-                })
+                .map(
+                    |(id, properties, is_identified, created_at, first_seen_key)| {
+                        Ok(PersonRecord {
+                            project_id: project_id.to_owned(),
+                            id,
+                            properties: decode_object(&properties)?,
+                            is_identified,
+                            created_at,
+                            first_seen_key,
+                        })
+                    },
+                )
                 .transpose()
         })
     }
@@ -236,6 +245,185 @@ impl PersonStore {
                 changes,
                 truncated,
             })
+        })
+    }
+}
+
+/// Keyset position in the persons list (newest first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonCursor {
+    pub created_at: String,
+    pub id: String,
+}
+
+/// One row of the persons list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersonListEntry {
+    pub person: PersonRecord,
+    /// First-seen order, at most the requested number.
+    pub distinct_ids: Vec<String>,
+}
+
+type RawPerson = (PersonRecord, String);
+
+fn read_person(project_id: &str, row: &rusqlite::Row<'_>) -> rusqlite::Result<RawPerson> {
+    Ok((
+        PersonRecord {
+            project_id: project_id.to_owned(),
+            id: row.get(0)?,
+            properties: Map::new(),
+            is_identified: row.get(2)?,
+            created_at: row.get(3)?,
+            first_seen_key: row.get(4)?,
+        },
+        row.get(1)?,
+    ))
+}
+
+fn finish_person((mut person, encoded): RawPerson) -> Result<PersonRecord, PersonStoreError> {
+    person.properties = decode_object(&encoded)?;
+    Ok(person)
+}
+
+fn distinct_ids_on(
+    connection: &Connection,
+    project_id: &str,
+    person_id: &str,
+    limit: usize,
+) -> Result<Vec<String>, PersonStoreError> {
+    let limit = limit.min(MAX_DISTINCT_IDS_PER_CALL) as i64;
+    let mut statement = connection.prepare_cached(
+        "SELECT distinct_id FROM distinct_ids
+         WHERE project_id = ?1 AND person_id = ?2
+         ORDER BY rowid
+         LIMIT ?3",
+    )?;
+    let ids = statement
+        .query_map(params![project_id, person_id, limit], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(ids)
+}
+
+impl PersonStore {
+    /// Persons of a project, newest first, keyset-paged.
+    ///
+    /// `search` matches a distinct id by exact value or prefix, or the
+    /// `email`/`name` person properties case-insensitively by substring.
+    /// Returns at most `MAX_PERSON_PAGE + 1` rows (one look-ahead row).
+    pub fn list_persons(
+        &self,
+        project_id: &str,
+        search: Option<&str>,
+        after: Option<&PersonCursor>,
+        limit: usize,
+        distinct_ids_per_person: usize,
+    ) -> Result<Vec<PersonListEntry>, PersonStoreError> {
+        let limit = limit.clamp(1, MAX_PERSON_PAGE + 1) as i64;
+        let search: Option<String> = search
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.chars().take(MAX_PERSON_SEARCH).collect());
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT p.id, p.properties, p.is_identified, p.created_at, p.first_seen_key
+                 FROM persons p
+                 WHERE p.project_id = ?1
+                   AND (?2 IS NULL OR p.created_at < ?2 OR (p.created_at = ?2 AND p.id < ?3))
+                   AND (?4 IS NULL
+                        OR p.id IN (SELECT d.person_id FROM distinct_ids d
+                                    WHERE d.project_id = ?1
+                                      AND d.distinct_id >= ?4
+                                      AND d.distinct_id <= ?4 || char(1114111))
+                        OR instr(lower(coalesce(json_extract(p.properties, '$.email'), '')),
+                                 lower(?4)) > 0
+                        OR instr(lower(coalesce(json_extract(p.properties, '$.name'), '')),
+                                 lower(?4)) > 0)
+                 ORDER BY p.created_at DESC, p.id DESC
+                 LIMIT ?5",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        project_id,
+                        after.map(|cursor| cursor.created_at.as_str()),
+                        after.map(|cursor| cursor.id.as_str()),
+                        search.as_deref(),
+                        limit
+                    ],
+                    |row| read_person(project_id, row),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut entries = Vec::with_capacity(rows.len());
+            for row in rows {
+                let person = finish_person(row)?;
+                let distinct_ids =
+                    distinct_ids_on(connection, project_id, &person.id, distinct_ids_per_person)?;
+                entries.push(PersonListEntry {
+                    person,
+                    distinct_ids,
+                });
+            }
+            Ok(entries)
+        })
+    }
+
+    /// One person by id.
+    pub fn person(
+        &self,
+        project_id: &str,
+        person_id: &str,
+    ) -> Result<Option<PersonRecord>, PersonStoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, properties, is_identified, created_at, first_seen_key
+                     FROM persons WHERE project_id = ?1 AND id = ?2",
+                    params![project_id, person_id],
+                    |row| read_person(project_id, row),
+                )
+                .optional()?
+                .map(finish_person)
+                .transpose()
+        })
+    }
+
+    /// A person's distinct ids in first-seen order, at most `limit` (itself
+    /// capped at [`MAX_DISTINCT_IDS_PER_CALL`]).
+    pub fn distinct_ids_of(
+        &self,
+        project_id: &str,
+        person_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, PersonStoreError> {
+        self.with_connection(|connection| distinct_ids_on(connection, project_id, person_id, limit))
+    }
+
+    /// `distinct_id -> person_id` for the given ids. Ids the projection has
+    /// not seen yet are absent. At most [`MAX_DISTINCT_IDS_PER_CALL`] ids are
+    /// resolved per call.
+    pub fn resolve_distinct_ids(
+        &self,
+        project_id: &str,
+        distinct_ids: &[String],
+    ) -> Result<HashMap<String, String>, PersonStoreError> {
+        let ids = &distinct_ids[..distinct_ids.len().min(MAX_DISTINCT_IDS_PER_CALL)];
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT person_id FROM distinct_ids WHERE project_id = ?1 AND distinct_id = ?2",
+            )?;
+            let mut resolved = HashMap::with_capacity(ids.len());
+            for id in ids {
+                if resolved.contains_key(id) {
+                    continue;
+                }
+                if let Some(person_id) = statement
+                    .query_row(params![project_id, id], |row| row.get::<_, String>(0))
+                    .optional()?
+                {
+                    resolved.insert(id.clone(), person_id);
+                }
+            }
+            Ok(resolved)
         })
     }
 }

@@ -12,6 +12,7 @@ pub mod control;
 pub mod control_resources;
 pub mod enrichment;
 pub mod event_lake;
+pub mod explore;
 pub mod flags;
 pub mod identity;
 pub mod lake;

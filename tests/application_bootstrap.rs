@@ -292,7 +292,7 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
         .await
         .expect("catalog response");
     assert_eq!(catalog.status(), StatusCode::OK);
-    let names: Vec<String> = serde_json::from_slice(
+    let names: Vec<hoglet::contract::persons::CatalogEvent> = serde_json::from_slice(
         &catalog
             .into_body()
             .collect()
@@ -301,6 +301,7 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
             .to_bytes(),
     )
     .expect("catalog JSON");
+    let names: Vec<&str> = names.iter().map(|event| event.name.as_str()).collect();
     assert_eq!(names, vec!["signed_up"]);
 
     let values = router
@@ -316,7 +317,7 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
         .await
         .expect("catalog values response");
     assert_eq!(values.status(), StatusCode::OK);
-    let values: Vec<String> = serde_json::from_slice(
+    let values: Vec<hoglet::contract::persons::CatalogValue> = serde_json::from_slice(
         &values
             .into_body()
             .collect()
@@ -325,6 +326,7 @@ async fn authorized_capture_reaches_a_leased_generation_query() {
             .to_bytes(),
     )
     .expect("catalog values JSON");
+    let values: Vec<&str> = values.iter().map(|value| value.value.as_str()).collect();
     assert_eq!(values, vec!["pro"]);
 
     drop(router);

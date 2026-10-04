@@ -186,6 +186,20 @@ impl Application {
                 .map_err(|error| ApplicationError::Query(format!("{error:?}")))?,
         );
         let projection_catalog = Arc::new(ProjectionCatalog::open(&paths.projections())?);
+        let person_store = Arc::new(
+            crate::persons::PersonStore::open(&paths.projections())
+                .map_err(|error| ApplicationError::LocalStore(error.to_string()))?,
+        );
+        // TODO(lake integration): replace this placeholder with the production
+        // `crate::lake::Lake` (it implements `EventSource`) once the lake is
+        // constructed here. `DirectorySource` reads
+        // `events/<project_id>/<YYYY-MM-DD>/*.parquet` without lease guards.
+        let event_source: Arc<dyn crate::source::EventSource> =
+            Arc::new(crate::source::DirectorySource::new(&event_root));
+        let explorer = Arc::new(
+            crate::explore::Explorer::new(event_source, person_store)
+                .map_err(|error| ApplicationError::Query(error.to_string()))?,
+        );
         let (durable_sink, wal_runtime, recovery) = DurableWalSink::open(wal_root, coordinator)?;
         if recovery.truncated_tail {
             tracing::warn!("recovered a torn tail from the v2 capture WAL");
@@ -228,6 +242,15 @@ impl Application {
                 access.clone(),
                 projection_catalog,
             ))
+            .merge(crate::routes::persons::router(
+                access.clone(),
+                explorer.clone(),
+            ))
+            .merge(crate::routes::events::router(
+                access.clone(),
+                explorer.clone(),
+            ))
+            .merge(crate::routes::web::router(access.clone(), explorer))
             .merge(crate::routes::resources::router(access, resources));
 
         Ok(Self {
