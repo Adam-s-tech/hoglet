@@ -98,6 +98,9 @@ pub const SEAL_INTERVAL: Duration = Duration::from_millis(1000);
 /// How often the publisher wakes without a seal notification (compaction,
 /// graveyard sweeps, retries).
 pub const PUBLISHER_TICK: Duration = Duration::from_millis(1000);
+/// Longest one steady-state publication call runs before the publisher
+/// thread checks for erasure and shutdown requests.
+pub const PUBLISH_BUDGET: Duration = Duration::from_millis(1500);
 
 #[derive(Debug)]
 pub enum DurablePipelineError {
@@ -250,6 +253,8 @@ enum PublisherSignal {
     Erase {
         project_id: String,
         person_id: String,
+        /// Every segment up to this one was sealed when the request arrived.
+        through_segment: u64,
         ack: oneshot::Sender<Result<ErasureReport, DurablePipelineError>>,
     },
     Shutdown {
@@ -563,12 +568,14 @@ fn writer_loop(
                 }
             }
         }
+        let through_segment = wal.active_segment().saturating_sub(1);
         for (project_id, person_id, ack) in erasures {
             if let Err(sync_mpsc::TrySendError::Full(PublisherSignal::Erase { ack, .. })
             | sync_mpsc::TrySendError::Disconnected(PublisherSignal::Erase { ack, .. })) =
                 publisher.try_send(PublisherSignal::Erase {
                     project_id,
                     person_id,
+                    through_segment,
                     ack,
                 })
             {
@@ -605,18 +612,23 @@ fn publisher_loop(
     stats: Arc<PipelineStats>,
 ) {
     let mut last_maintenance = Instant::now();
+    // Sealed WAL is still waiting after a budgeted publication: come back
+    // immediately (after checking for requests) instead of sleeping a tick.
+    let mut backlog = false;
     loop {
-        let shutdown = match signals.recv_timeout(PUBLISHER_TICK) {
+        let wait = if backlog { Duration::ZERO } else { PUBLISHER_TICK };
+        let shutdown = match signals.recv_timeout(wait) {
             Ok(PublisherSignal::Sealed) | Err(sync_mpsc::RecvTimeoutError::Timeout) => None,
             Ok(PublisherSignal::Erase {
                 project_id,
                 person_id,
+                through_segment,
                 ack,
             }) => {
                 // An earlier erasure that failed part-way is finished first,
                 // before anything newer is published.
                 let result = resume_pending_erasures(&publisher, &compactor)
-                    .and_then(|()| publish_and_account(&publisher, &stats))
+                    .and_then(|()| publish_and_account(&publisher, &stats, Publish::Through(through_segment)).map(|_| ()))
                     .and_then(|()| erase(&publisher, &compactor, &project_id, &person_id));
                 let _ = ack.send(result);
                 continue;
@@ -625,11 +637,16 @@ fn publisher_loop(
             Err(sync_mpsc::RecvTimeoutError::Disconnected) => return,
         };
 
-        let published = publish_and_account(&publisher, &stats);
+        let published = if shutdown.is_some() {
+            publish_and_account(&publisher, &stats, Publish::All)
+        } else {
+            publish_and_account(&publisher, &stats, Publish::Budget(PUBLISH_BUDGET))
+        };
         if let Some(ack) = shutdown {
-            let _ = ack.send(published);
+            let _ = ack.send(published.map(|_| ()));
             return;
         }
+        backlog = matches!(published, Ok(true));
         if let Err(error) = published {
             tracing::error!(%error, "event publication failed; the WAL keeps the events and will retry");
             continue;
@@ -726,12 +743,34 @@ fn erase(
     })
 }
 
+/// Publish what is sealed (everything, or only through `through_segment`) and
+/// update the freshness counters.
+enum Publish {
+    /// Everything sealed (startup, shutdown).
+    All,
+    /// Everything sealed when an erasure was requested.
+    Through(u64),
+    /// Steady state: bounded work per call.
+    Budget(Duration),
+}
+
+/// Returns whether sealed WAL is still waiting (only `Budget` can leave some).
 fn publish_and_account(
     publisher: &Publisher,
     stats: &PipelineStats,
-) -> Result<(), DurablePipelineError> {
+    mode: Publish,
+) -> Result<bool, DurablePipelineError> {
     let started = Instant::now();
-    let published = publisher.publish_all()?;
+    let mut more = false;
+    let published = match mode {
+        Publish::Through(segment) => publisher.publish_through(segment)?,
+        Publish::All => publisher.publish_all()?,
+        Publish::Budget(budget) => {
+            let (published, pending) = publisher.publish_for(budget)?;
+            more = pending;
+            published
+        }
+    };
     let events: usize = published.iter().map(|p| p.events).sum();
     if events > 0 {
         let elapsed = started.elapsed();
@@ -748,7 +787,7 @@ fn publish_and_account(
         Ordering::Relaxed,
     );
     stats.note_published(events as u64, checkpoint.segment);
-    Ok(())
+    Ok(more)
 }
 
 fn map_wal_error(error: WalError) -> SinkError {

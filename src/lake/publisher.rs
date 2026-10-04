@@ -113,6 +113,39 @@ impl Publisher {
         Ok(published)
     }
 
+    /// Publish windows until nothing sealed is pending or `budget` has been
+    /// spent; the flag says whether more is waiting. Bounding each call lets
+    /// the publisher thread keep answering erasure and shutdown requests
+    /// while ingest outruns it.
+    pub fn publish_for(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<(Vec<Published>, bool), PublishError> {
+        let started = std::time::Instant::now();
+        let mut published = Vec::new();
+        while let Some(result) = self.publish_window()? {
+            published.push(result);
+            if started.elapsed() >= budget {
+                return Ok((published, true));
+            }
+        }
+        Ok((published, false))
+    }
+
+    /// Publish until every segment up to and including `segment` is published
+    /// (or nothing sealed is pending). Unlike [`Self::publish_all`] it ignores
+    /// segments sealed later, so it terminates under unthrottled ingest.
+    pub fn publish_through(&self, segment: u64) -> Result<Vec<Published>, PublishError> {
+        let mut published = Vec::new();
+        while self.checkpoint()?.segment <= segment {
+            match self.publish_window()? {
+                Some(result) => published.push(result),
+                None => break,
+            }
+        }
+        Ok(published)
+    }
+
     /// Publish at most one window. `None` when nothing sealed is pending.
     pub fn publish_window(&self) -> Result<Option<Published>, PublishError> {
         let mut connection = self.lake.lock_connection()?;

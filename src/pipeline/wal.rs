@@ -383,6 +383,11 @@ impl WriteAheadLog {
         self.active.bytes
     }
 
+    /// Sequence number of the active segment; every earlier one is sealed.
+    pub fn active_segment(&self) -> u64 {
+        self.active.sequence
+    }
+
     /// A read/reclaim handle for the publisher thread. It only ever touches
     /// sealed segments, which the writer never modifies again.
     pub fn reader(&self) -> WalReader {
@@ -860,7 +865,16 @@ fn scan_segment(
         file.seek(SeekFrom::Start(offset))?;
         let mut header = [0_u8; RECORD_HEADER_BYTES];
         file.read_exact(&mut header)?;
-        validate_header(&header, sequence, offset)?;
+        if let Err(error) = validate_header(&header, sequence, offset) {
+            // After power loss a file can end in zero-filled blocks whose
+            // size was persisted before their data: that is a torn tail, not
+            // damage to anything acknowledged.
+            if repair_final_tail && is_zero_tail(&mut file, offset, file_bytes)? {
+                truncated_tail = true;
+                break;
+            }
+            return Err(error);
+        }
         let length = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
         if length > max_record_bytes {
             return Err(corruption(sequence, offset, "record length exceeds limit"));
@@ -882,11 +896,24 @@ fn scan_segment(
         let expected_crc = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
         let mut payload = vec![0; length];
         file.read_exact(&mut payload)?;
+        // A bad final record is a torn write (its length landed, its payload
+        // did not); a bad record with valid data after it is real damage.
+        let final_record = frame_end == file_bytes;
         if crc32fast::hash(&payload) != expected_crc {
+            if repair_final_tail && final_record {
+                truncated_tail = true;
+                break;
+            }
             return Err(corruption(sequence, offset, "record checksum mismatch"));
         }
-        let batch: CapturedBatch = serde_json::from_slice(&payload)
-            .map_err(|_| corruption(sequence, offset, "invalid captured batch payload"))?;
+        let batch: CapturedBatch = match serde_json::from_slice(&payload) {
+            Ok(batch) => batch,
+            Err(_) if repair_final_tail && final_record => {
+                truncated_tail = true;
+                break;
+            }
+            Err(_) => return Err(corruption(sequence, offset, "invalid captured batch payload")),
+        };
         if batch.events.is_empty() {
             return Err(corruption(sequence, offset, "empty captured batch"));
         }
@@ -894,6 +921,7 @@ fn scan_segment(
     }
 
     if truncated_tail {
+        keep_torn_tail(&mut file, path, offset, file_bytes);
         file.set_len(offset)?;
         file.sync_all()?;
     }
@@ -901,6 +929,46 @@ fn scan_segment(
         valid_bytes: offset,
         truncated_tail,
     })
+}
+
+/// Whether every byte from `from` to `to` is zero.
+fn is_zero_tail(file: &mut File, from: u64, to: u64) -> Result<bool, WalError> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = to.saturating_sub(from);
+    while remaining > 0 {
+        let take = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..take])?;
+        if buffer[..take].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        remaining -= take as u64;
+    }
+    Ok(true)
+}
+
+/// Best effort: keep the bytes recovery is about to drop next to the
+/// segment, for forensics. Torn tails were never acknowledged, so failure
+/// to save them never blocks recovery.
+fn keep_torn_tail(file: &mut File, path: &Path, from: u64, to: u64) {
+    const MAX_KEPT_BYTES: u64 = 8 * 1024 * 1024;
+    if to <= from {
+        return;
+    }
+    let keep = (to - from).min(MAX_KEPT_BYTES) as usize;
+    let mut bytes = vec![0_u8; keep];
+    let saved = file
+        .seek(SeekFrom::Start(from))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .and_then(|()| std::fs::write(path.with_extension("torn"), &bytes));
+    if saved.is_err() {
+        return;
+    }
+    tracing::warn!(
+        segment = %path.display(),
+        dropped_bytes = to - from,
+        "dropped an unacknowledged torn tail while recovering the WAL"
+    );
 }
 
 fn validate_header(

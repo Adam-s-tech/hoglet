@@ -422,3 +422,97 @@ async fn erasure_physically_removes_a_person_and_all_their_events() {
     let reopened = fixture.lake();
     assert_eq!(stored_rows(&reopened, &fixture.project_id).len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "stress test, minutes in a debug build: run with --ignored (nightly CI)"]
+async fn erasure_finishes_while_ingest_runs_flat_out() {
+    let fixture = Fixture::new();
+    let lake = fixture.lake();
+    let (sink, runtime, _) = DurableWalSink::open(fixture.config(), lake.clone()).unwrap();
+    sink.append(fixture.batch(vec![
+        event("$pageview", "erase-me", 3),
+        event("$pageview", "stay", 3),
+    ]))
+    .await
+    .unwrap();
+
+    // Writers that never stop, so new segments keep sealing behind the erasure.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for task in 0..4 {
+        let sink = sink.clone();
+        let stop = stop.clone();
+        let batches: Vec<_> = (0..8)
+            .map(|i| fixture.batch((0..40).map(|j| event("click", &format!("w{task}-{i}-{j}"), 1)).collect()))
+            .collect();
+        writers.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for batch in &batches {
+                    let mut batch = batch.clone();
+                    for event in &mut batch.events {
+                        event.uuid = Uuid::new_v4();
+                    }
+                    let _ = sink.append(batch).await;
+                }
+            }
+        }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let started = std::time::Instant::now();
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        runtime.eraser().erase_person(&fixture.project_id, "erase-me"),
+    )
+    .await
+    .expect("erasure must not be starved by concurrent ingest")
+    .expect("erasure succeeds");
+    assert_eq!(report.events, 1);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    runtime.shutdown().await.unwrap();
+}
+
+/// The deterministic core of "erasure and shutdown are not starved by
+/// ingest": steady-state publication is budgeted per call, and an erasure
+/// publishes only through the segments sealed when it was requested.
+#[test]
+fn publication_is_bounded_per_call_and_erasure_stops_at_its_segment() {
+    let fixture = Fixture::new();
+    let lake = fixture.lake();
+    let (mut wal, _) = WriteAheadLog::open(
+        fixture.directory.path().join("wal"),
+        WalConfig::new(1, 64 * 1024 * 1024).unwrap(), // every record seals its own segment
+    )
+    .unwrap();
+    let publisher = Publisher::new(lake.clone(), wal.reader());
+    let mut bindings = BTreeMap::new();
+    bindings.insert(TOKEN.to_owned(), fixture.project_id.clone());
+    for i in 0..6 {
+        wal.append(
+            CapturedBatch::authorized(vec![event("click", &format!("u{i}"), 1)], bindings.clone(), false)
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    wal.seal().unwrap();
+    let active = wal.active_segment();
+    assert!(active >= 6, "one sealed segment per record, got active {active}");
+
+    // A zero budget does exactly one window, however much is waiting.
+    let (done, _pending) = publisher.publish_for(std::time::Duration::ZERO).unwrap();
+    assert_eq!(done.len(), 1);
+
+    // `publish_through` stops once its segment is published (a window may
+    // carry later segments with it, never fewer).
+    publisher.publish_through(3).unwrap();
+    assert!(publisher.checkpoint().unwrap().segment > 3);
+
+    // The remainder drains normally and nothing is lost or repeated.
+    publisher.publish_all().unwrap();
+    assert_eq!(stored_rows(&lake, &fixture.project_id).len(), 6);
+}

@@ -401,11 +401,11 @@ fn a_sealed_segment_cut_mid_record_is_refused_at_every_offset() {
 }
 
 #[test]
-fn a_zero_filled_tail_after_a_power_cut_is_refused_loudly_not_silently_truncated() {
+fn a_zero_filled_tail_after_a_power_cut_is_dropped_and_kept_for_forensics() {
     // Some filesystems extend a file's length before its data reaches disk, so
-    // a power cut leaves zeros where the last record should be. Hoglet refuses
-    // to start (the operator must decide) instead of guessing that the zeros
-    // were never acknowledged. Pinning this makes any change deliberate.
+    // a power cut leaves zeros where the last record should be. Those bytes
+    // were never acknowledged (acks wait for fsync), so recovery drops them
+    // and saves them next to the segment instead of refusing to start.
     let written = standard_log();
     let active = written.active_name();
     let (_, start, end) = written.records.last().expect("records").clone();
@@ -414,11 +414,35 @@ fn a_zero_filled_tail_after_a_power_cut_is_refused_loudly_not_silently_truncated
         *byte = 0;
     }
     let mut damaged = written.files.clone();
+    damaged.insert(active.clone(), bytes);
+    let directory = materialize(&damaged);
+    match recover(directory.path(), written.config) {
+        Recovered::Records(records, truncated) => {
+            assert!(truncated, "recovery reports the dropped tail");
+            assert_eq!(records.len(), written.records.len() - 1);
+        }
+        Recovered::Refused(error) => panic!("a zero-filled torn tail must not stop recovery: {error}"),
+    }
+    let kept = directory.path().join(active.replace(".open", ".torn"));
+    assert!(kept.exists(), "the dropped bytes are kept for forensics");
+}
+
+#[test]
+fn a_bad_record_followed_by_valid_data_is_still_refused() {
+    // Damage in the middle of the log is not a torn tail: acknowledged
+    // records come after it. Refusing is the only honest answer.
+    let written = standard_log();
+    let active = written.active_name();
+    assert!(written.records.len() >= 3, "the standard log has several records");
+    let (_, start, _) = written.records[written.records.len() - 2].clone();
+    let mut bytes = written.files[&active].clone();
+    bytes[start as usize + 16 + 4] ^= 0xff;
+    let mut damaged = written.files.clone();
     damaged.insert(active, bytes);
     let directory = materialize(&damaged);
     match recover(directory.path(), written.config) {
         Recovered::Refused(error) => assert_loud(&error),
-        Recovered::Records(..) => panic!("a zero-filled final record was accepted"),
+        Recovered::Records(..) => panic!("damage before a valid record was silently accepted"),
     }
 }
 
