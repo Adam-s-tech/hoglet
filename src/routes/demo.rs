@@ -16,7 +16,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::control::{AccessError, ProjectAccess};
+use crate::control::ProjectAccess;
 use crate::sink::{AuthorizedEventBatch, EventSink};
 
 /// Events per WAL record while seeding.
@@ -39,21 +39,25 @@ async fn seed(
     Path(project_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let principal = match crate::routes::workspace::authenticate(&state.access, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return access_error(error),
-    };
-    let project = match state.access.authorize_project(&principal, &project_id).await {
+    let project = match crate::routes::guard::authorize(
+        &state.access,
+        &headers,
+        &project_id,
+        crate::routes::guard::Intent::Write,
+    )
+    .await
+    {
         Ok(project) => project,
-        Err(error) => return access_error(error),
+        Err(response) => return response,
     };
     match seed_project(state.sink.as_ref(), &project.project_id, &project.capture_token).await {
         Ok(events) => Json(json!({"events": events})).into_response(),
-        Err(()) => (
+        Err(()) => crate::routes::guard::error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {"code": "unavailable", "message": "The demo data could not be stored; try again."}})),
-        )
-            .into_response(),
+            "unavailable",
+            "The demo data could not be stored; try again.",
+            &crate::routes::guard::request_id(&headers),
+        ),
     }
 }
 
@@ -90,19 +94,4 @@ pub async fn seed_project(
         }
     }
     Ok(total)
-}
-
-fn access_error(error: AccessError) -> Response {
-    let (status, code) = match error {
-        AccessError::Unauthorized | AccessError::InvalidToken => {
-            (StatusCode::UNAUTHORIZED, "unauthorized")
-        }
-        AccessError::Forbidden | AccessError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-        _ => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-    };
-    (
-        status,
-        Json(json!({"error": {"code": code, "message": code.replace('_', " ")}})),
-    )
-        .into_response()
 }

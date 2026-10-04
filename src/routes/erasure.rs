@@ -11,9 +11,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde_json::json;
 
-use crate::control::{AccessError, ProjectAccess, Role};
+use crate::control::ProjectAccess;
 use crate::sink::Eraser;
 
 #[derive(Clone)]
@@ -36,17 +35,21 @@ async fn erase(
     Path((project_id, person_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let principal = match crate::routes::workspace::authenticate(&state.access, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return access_error(error),
-    };
-    let project = match state.access.authorize_project(&principal, &project_id).await {
+    let project = match crate::routes::guard::authorize(
+        &state.access,
+        &headers,
+        &project_id,
+        crate::routes::guard::Intent::Write,
+    )
+    .await
+    {
         Ok(project) => project,
-        Err(error) => return access_error(error),
+        Err(response) => return response,
     };
-    if !matches!(project.role, Role::Owner | Role::Admin) {
-        return error(StatusCode::FORBIDDEN, "forbidden", "Only owners and admins can erase people.");
-    }
+    let request_id = crate::routes::guard::request_id(&headers);
+    let error = |status, code: &str, message: &str| {
+        crate::routes::guard::error(status, code, message, &request_id)
+    };
     if person_id.is_empty() || person_id.len() > 400 {
         return error(StatusCode::NOT_FOUND, "not_found", "No such person.");
     }
@@ -67,29 +70,5 @@ async fn erase(
                 "Erasure could not complete; nothing was reported erased. Try again.",
             )
         }
-    }
-}
-
-fn error(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({"error": {"code": code, "message": message}})),
-    )
-        .into_response()
-}
-
-fn access_error(failure: AccessError) -> Response {
-    match failure {
-        AccessError::Unauthorized | AccessError::InvalidToken => {
-            error(StatusCode::UNAUTHORIZED, "unauthorized", "Log in to continue.")
-        }
-        AccessError::Forbidden | AccessError::NotFound => {
-            error(StatusCode::NOT_FOUND, "not_found", "No such project.")
-        }
-        _ => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "Project access is unavailable.",
-        ),
     }
 }

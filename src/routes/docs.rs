@@ -2550,7 +2550,7 @@ mod tests {
 
     /// Documented but not yet mounted by the production router. Each must
     /// either 404 at the router or be served; once served, drop it from here.
-    const PENDING: &[(&str, &str)] = &[("post", "/api/projects/{project_id}/query/actors")];
+    const PENDING: &[(&str, &str)] = &[];
 
     fn operations(document: &Value) -> Vec<(String, String, Value)> {
         let mut found = Vec::new();

@@ -9,9 +9,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde_json::json;
 
-use crate::control::{AccessError, AuthorizedProject, ProjectAccess, Role};
+use crate::control::{AuthorizedProject, ProjectAccess};
+use crate::routes::guard::Intent;
 use crate::forward::{ForwardingConfig, Forwarder};
 
 #[derive(Clone)]
@@ -33,15 +33,9 @@ async fn authorize(
     state: &ForwardingState,
     project_id: &str,
     headers: &HeaderMap,
+    intent: Intent,
 ) -> Result<AuthorizedProject, Response> {
-    let principal = crate::routes::workspace::authenticate(&state.access, headers)
-        .await
-        .map_err(access_error)?;
-    state
-        .access
-        .authorize_project(&principal, project_id)
-        .await
-        .map_err(access_error)
+    crate::routes::guard::authorize(&state.access, headers, project_id, intent).await
 }
 
 async fn read(
@@ -49,7 +43,7 @@ async fn read(
     Path(project_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    match authorize(&state, &project_id, &headers).await {
+    match authorize(&state, &project_id, &headers, Intent::Read).await {
         Ok(project) => Json(state.forwarder.status(&project.project_id)).into_response(),
         Err(response) => response,
     }
@@ -61,17 +55,14 @@ async fn update(
     headers: HeaderMap,
     body: Result<Json<ForwardingConfig>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let project = match authorize(&state, &project_id, &headers).await {
+    let project = match authorize(&state, &project_id, &headers, Intent::Write).await {
         Ok(project) => project,
         Err(response) => return response,
     };
-    if !project.principal.may_write() || !matches!(project.role, Role::Owner | Role::Admin) {
-        return error(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "Only owners and admins can change forwarding.",
-        );
-    }
+    let request_id = crate::routes::guard::request_id(&headers);
+    let error = |status, code: &str, message: &str| {
+        crate::routes::guard::error(status, code, message, &request_id)
+    };
     let Ok(Json(config)) = body else {
         return error(StatusCode::BAD_REQUEST, "invalid_request", "Expected {enabled, host, posthog_token}.");
     };
@@ -91,26 +82,6 @@ async fn update(
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
             "Forwarding settings could not be saved.",
-        ),
-    }
-}
-
-fn error(status: StatusCode, code: &str, message: &str) -> Response {
-    (status, Json(json!({"error": {"code": code, "message": message}}))).into_response()
-}
-
-fn access_error(failure: AccessError) -> Response {
-    match failure {
-        AccessError::Unauthorized | AccessError::InvalidToken => {
-            error(StatusCode::UNAUTHORIZED, "unauthorized", "Log in to continue.")
-        }
-        AccessError::Forbidden | AccessError::NotFound => {
-            error(StatusCode::NOT_FOUND, "not_found", "No such project.")
-        }
-        _ => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "Project access is unavailable.",
         ),
     }
 }

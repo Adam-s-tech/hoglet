@@ -7,6 +7,7 @@ pub mod erasure;
 pub mod events;
 pub mod flags;
 pub mod forwarding;
+pub mod guard;
 pub mod health;
 pub mod metrics;
 pub mod persons;
