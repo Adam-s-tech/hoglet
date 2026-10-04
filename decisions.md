@@ -94,3 +94,31 @@ Lessons promoted here so they survive compaction. Do not repeat these mistakes.
 ## Enforcement
 
 Read this before acting. If a task would cross into the boss's column, stop and ask — even if the work seems obvious, even if it's small, even if the session is long. An unrequested "improvement" to something in the boss's column is a defect, not initiative.
+
+## Rebuild decisions (CTO, 2026-10-04; boss asked to "make it super great")
+
+Made inside the approved rebuild; listed so the boss can veto any of them.
+
+- **Legacy stack and offline migration deleted.** No installation runs the
+  pre-release v1 layout. Pre-release data directories must be recreated
+  (projections schema 2 fails loud on schema 1).
+- **Event lake = generation-tracked file catalog.** Files carry created/retired
+  generations; publication and compaction cost O(files touched). Replaced the
+  full-manifest-per-publish design that collapsed ingest to 684 events/s after
+  280k events. Compaction (DuckDB) sorts by (event, timestamp) and drops uuid
+  duplicates — eventual dedup, like PostHog's ReplacingMergeTree.
+- **Publication left the ack path.** Writer thread: group commit, one fsync per
+  group. Publisher thread: Parquet, projections, compaction, erasure.
+- **Parquet event schema 2** promotes web-analytics fields to columns;
+  readers always use `union_by_name`, so the schema may only grow.
+- **Person ids are the first distinct id.** Queries resolve persons through an
+  incrementally synced override table (`identity_state.seq/epoch`).
+- **Personal API keys gain a scope** (read default, write opt-in). Write keys
+  act like the owner's session, still bounded by the owner/admin role.
+- **`ureq` (rustls) added** for the PostHog importer, reconcile and shadow-mode
+  forwarding. Not on the ingest path; capture never waits on it.
+- **Shadow mode forwards after the durable ack** through a bounded, droppable
+  queue. Forwarding may drop under overload; Hoglet's own copy never does.
+- **posthog-js surveys loader stub** at `/static/surveys.js` — the SDK loads it
+  even with surveys off; a no-op extension avoids console errors.
+- **Demo data** (`HOGLET_DEMO=1`, `POST /demo`) goes through the real pipeline.
