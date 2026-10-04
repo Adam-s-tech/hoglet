@@ -14,7 +14,6 @@ pub mod demo;
 pub mod enrichment;
 pub mod event_lake;
 pub mod flags;
-pub mod identity;
 pub mod lake;
 pub mod metrics;
 pub mod persons;

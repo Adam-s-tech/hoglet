@@ -61,6 +61,7 @@ pub enum ApplicationError {
     Wal(crate::pipeline::wal::WalError),
     Pipeline(DurablePipelineError),
     LocalStore(String),
+    Flags(String),
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -87,6 +88,7 @@ impl fmt::Display for ApplicationError {
             Self::Wal(error) => write!(formatter, "durable capture WAL failed: {error}"),
             Self::Pipeline(error) => write!(formatter, "durable pipeline failed: {error}"),
             Self::LocalStore(error) => write!(formatter, "ephemeral wire state failed: {error}"),
+            Self::Flags(error) => write!(formatter, "feature flags failed: {error}"),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
         }
     }
@@ -196,10 +198,9 @@ impl Application {
         );
         let projection_catalog = Arc::new(ProjectionCatalog::open(&paths.projections())?);
 
-        let identity = Arc::new(
-            crate::identity::IdentityStore::in_memory().map_err(|error| {
-                ApplicationError::LocalStore(format!("identity initialization: {error:?}"))
-            })?,
+        let flag_store = Arc::new(
+            crate::flags::FlagStore::open(&paths.control())
+                .map_err(|error| ApplicationError::Flags(error.to_string()))?,
         );
         let metrics = Arc::new(crate::metrics::Metrics::new(
             chrono::Utc::now().timestamp().max(0) as u64,
@@ -220,9 +221,9 @@ impl Application {
         let readiness = Readiness::new();
         let wire = crate::capture::router(capture)
             .merge(crate::routes::config::wire_router(authorizer.clone()))
-            .merge(crate::routes::flags::control_wire_router(
-                resources.clone(),
-                identity,
+            .merge(crate::routes::flags::wire_router(
+                flag_store.clone(),
+                persons.clone(),
                 authorizer,
             ))
             .layer(CorsLayer::very_permissive());
@@ -245,6 +246,11 @@ impl Application {
             .merge(crate::routes::erasure::router(
                 access.clone(),
                 wal_runtime.eraser(),
+            ))
+            .merge(crate::routes::flags::api_router(
+                access.clone(),
+                flag_store,
+                persons.clone(),
             ))
             .merge(crate::routes::resources::router(access.clone(), resources));
 

@@ -35,6 +35,7 @@ woothee = "0.13"
 argon2 = "0.5"
 sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
+regex = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

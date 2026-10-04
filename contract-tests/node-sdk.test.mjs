@@ -76,7 +76,9 @@ const flagsRes = await fetch(`http://127.0.0.1:${PORT}/flags/?v=2`, {
 });
 if (!flagsRes.ok) fail(`flags returned ${flagsRes.status}`);
 const flags = await flagsRes.json();
-if (typeof flags.feature_flags !== "object") fail("flags v2 shape wrong");
+// @posthog/core reads `flags` (v2 details); snake_case `feature_flags` is
+// the shape that made every flag read as undefined.
+if (typeof flags.flags !== "object" || flags.flags === null) fail("flags v2 shape wrong");
 
 // 4. Storage-side assertion: events must actually be durable in the WAL or
 // Parquet — count records on disk after killing the server.

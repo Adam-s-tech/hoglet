@@ -1,9 +1,8 @@
 use hoglet::control::{ProjectAccess, SetupRequest};
 use hoglet::control_resources::{
-    ControlResourceError, ControlResources, DashboardDraft, DashboardTileInput, FeatureFlag,
-    ImportedInsight, InsightDraft, ShareTarget,
+    ControlResourceError, ControlResources, DashboardDraft, DashboardTileInput, ImportedInsight,
+    InsightDraft, ShareTarget,
 };
-use hoglet::flags::Variant;
 use hoglet::query::ir::{DateRange, EventMatch, Math, Query, QueryKind, Series};
 use hoglet::storage_bootstrap::bootstrap_storage;
 
@@ -71,19 +70,6 @@ fn insight(name: &str) -> InsightDraft {
     }
 }
 
-fn flag(key: &str) -> FeatureFlag {
-    FeatureFlag {
-        key: key.into(),
-        active: true,
-        rollout_percentage: 50.0,
-        variants: vec![Variant {
-            key: "control".into(),
-            rollout: 100.0,
-        }],
-        payload: Some("welcome".into()),
-    }
-}
-
 #[test]
 fn resources_refuse_unvalidated_or_wrong_role_databases() {
     let directory = tempfile::tempdir().unwrap();
@@ -109,27 +95,6 @@ async fn direct_keys_and_ids_cannot_cross_project_resource_scopes() {
     let store = &fixture.resources;
     let first = &fixture.first_project;
     let second = &fixture.second_project;
-
-    store.create_flag(first, &flag("checkout")).unwrap();
-    assert!(matches!(
-        store.create_flag(first, &flag("checkout")),
-        Err(ControlResourceError::Conflict)
-    ));
-    assert!(matches!(
-        store.get_flag(second, "checkout"),
-        Err(ControlResourceError::NotFound)
-    ));
-    assert!(matches!(
-        store.update_flag(second, "checkout", &flag("checkout")),
-        Err(ControlResourceError::NotFound)
-    ));
-    assert!(matches!(
-        store.delete_flag(second, "checkout"),
-        Err(ControlResourceError::NotFound)
-    ));
-    store.create_flag(second, &flag("checkout")).unwrap();
-    assert_eq!(store.list_flags(first).unwrap().len(), 1);
-    assert_eq!(store.list_flags(second).unwrap().len(), 1);
 
     let saved = store
         .create_insight(first, "user-1", &insight("Conversion"))
