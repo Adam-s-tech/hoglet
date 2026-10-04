@@ -1,0 +1,22 @@
+# Hoglet behind Caddy. Caddy obtains and renews the TLS certificate itself.
+# Replace the hostname, point DNS at the box, open 80 and 443.
+#
+# Hoglet listens on 127.0.0.1:8000 (deploy/systemd/hoglet.service).
+
+analytics.example.com {
+	encode zstd gzip
+
+	# SDK payloads are small, but /batch from server SDKs can be larger.
+	request_body {
+		max_size 20MB
+	}
+
+	reverse_proxy 127.0.0.1:8000 {
+		# Client IP: Caddy sets X-Forwarded-For to the peer address and
+		# discards any client-supplied value (no trusted_proxies configured),
+		# so the header Hoglet sees holds exactly one, trustworthy IP.
+		# Hoglet must only trust X-Forwarded-For when it is bound to loopback
+		# behind a proxy like this one.
+		header_up X-Real-IP {remote_host}
+	}
+}

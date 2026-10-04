@@ -1,0 +1,21 @@
+# Keep the build context small: sources, manifests, embedded web assets only.
+target/
+target-*/
+dist/*
+# Release CI stages prebuilt binaries here (Dockerfile BINARY_SOURCE=prebuilt).
+!dist/docker/
+hoglet-data/
+.git/
+.github/
+.claude/
+context/
+contract-tests/node_modules/
+web/node_modules/
+reference/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.wal
+**/*.parquet
+.env
+.env.*
