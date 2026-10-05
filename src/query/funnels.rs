@@ -420,13 +420,11 @@ impl std::hash::Hasher for FastHasher {
     fn write(&mut self, bytes: &[u8]) {
         const K: u64 = 0x517c_c1b7_2722_0a95;
         let mut state = self.0;
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            let mut word = [0_u8; 8];
-            word.copy_from_slice(chunk);
-            state = (state.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(K);
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            state = (state.rotate_left(5) ^ u64::from_le_bytes(*word)).wrapping_mul(K);
         }
-        for byte in chunks.remainder() {
+        for byte in rest {
             state = (state.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(K);
         }
         self.0 = state;

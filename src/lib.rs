@@ -4,6 +4,10 @@
 //! cites the section it implements. The supported PostHog wire subset stays
 //! stable at the edge; Hoglet-specific behavior remains behind it.
 
+// Handlers return `Result<T, Response>` so `?` short-circuits to the HTTP error
+// directly; the large `Err` is on the cold path.
+#![allow(clippy::result_large_err)]
+
 pub mod application;
 pub mod cache;
 pub mod capture;

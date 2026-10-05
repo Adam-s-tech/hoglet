@@ -44,6 +44,7 @@ pub enum CaptureAuthorizationError {
 }
 
 /// The only project-authentication dependency visible to capture handlers.
+#[allow(clippy::double_must_use)] // async_trait's boxed future is already must_use
 #[async_trait::async_trait]
 pub trait CaptureAuthorizer: Send + Sync {
     async fn authorize(&self, token: &str) -> Result<AuthorizedCapture, CaptureAuthorizationError>;

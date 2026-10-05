@@ -45,6 +45,7 @@ pub struct AuthorizedEventBatch {
     pub historical_migration: bool,
 }
 
+#[allow(clippy::double_must_use)] // async_trait's boxed future is already must_use
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
     async fn append(&self, batch: AuthorizedEventBatch) -> Result<(), SinkError>;

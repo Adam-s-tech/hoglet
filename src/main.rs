@@ -350,7 +350,7 @@ async fn seed_demo(application: &Application) -> Result<bool, Box<dyn Error>> {
         &project.token,
     )
     .await
-    .map_err(|()| "demo data could not be stored")?;
+    .map_err(|_| "demo data could not be stored")?;
     tracing::info!(events, "demo data stored");
     Ok(true)
 }

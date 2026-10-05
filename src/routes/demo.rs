@@ -52,7 +52,7 @@ async fn seed(
     };
     match seed_project(state.sink.as_ref(), &project.project_id, &project.capture_token).await {
         Ok(events) => Json(json!({"events": events})).into_response(),
-        Err(()) => crate::routes::guard::error(
+        Err(SeedError) => crate::routes::guard::error(
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
             "The demo data could not be stored; try again.",
@@ -61,16 +61,20 @@ async fn seed(
     }
 }
 
+/// The demo dataset could not be generated or stored.
+#[derive(Debug)]
+pub struct SeedError;
+
 /// Generate and durably append the demo dataset. Returns the event count.
 pub async fn seed_project(
     sink: &dyn EventSink,
     project_id: &str,
     token: &str,
-) -> Result<usize, ()> {
+) -> Result<usize, SeedError> {
     let config = crate::demo::DemoConfig::new(token, chrono::Utc::now());
     let events = tokio::task::spawn_blocking(move || crate::demo::generate(&config))
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| SeedError)?;
     let total = events.len();
     let mut bindings = BTreeMap::new();
     bindings.insert(token.to_owned(), project_id.to_owned());
@@ -89,7 +93,7 @@ pub async fn seed_project(
                     attempts += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                Err(_) => return Err(()),
+                Err(_) => return Err(SeedError),
             }
         }
     }
