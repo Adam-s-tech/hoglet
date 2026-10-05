@@ -1,0 +1,11 @@
+# Release targets. Linux release binaries are fully static musl builds, linked
+# with zig via cargo-zigbuild so DuckDB's C++ runtime (libc++) is linked in
+# too: `scripts/build-release.sh linux-amd64` (or linux-arm64).
+#
+# Plain `cargo build` / `cargo test` for development are unaffected.
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

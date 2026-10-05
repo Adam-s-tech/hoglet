@@ -25,8 +25,42 @@ jobs:
       - run: cargo test --all
       - run: cargo clippy -- -D warnings
 
-  sdk-contract:
+  claims-2-and-4:
+    # Evidence for claims.md claims 2 (no lost events) and 4 (honest person
+    # counts): kill-point matrix, WAL corruption fuzz, I/O error injection,
+    # concurrency, and person-graph properties. PRs run a modest iteration
+    # count; the nightly run raises it (HOGLET_FAULT_SEEDS = randomized runs
+    # per kill point, HOGLET_PROPTEST_CASES = proptest cases per property).
     runs-on: ubuntu-latest
+    env:
+      HOGLET_PROPTEST_CASES: ${{ github.event_name == 'schedule' && '5000' || '256' }}
+      HOGLET_FAULT_SEEDS: ${{ github.event_name == 'schedule' && '12' || '2' }}
+      HOGLET_CONC_CYCLES: ${{ github.event_name == 'schedule' && '12' || '4' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: person graph (claim 4) and WAL damage (claim 2), default build
+        run: cargo test --test claim4_person_graph --test claim2_wal_corruption --test claim2_wal_cursor_race --test claim2_erasure_atomicity
+      - name: fault hooks are compiled out of the shipped binary
+        run: |
+          cargo build
+          ! strings target/debug/hoglet | grep -q "fault injection: aborting at"
+      - name: kill-point matrix, I/O errors, concurrency, WAL damage end to end (fault-injection build)
+        run: cargo test --features fault-injection --test claim2_kill_matrix --test claim2_io_errors --test claim2_concurrency --test claim2_wal_corruption
+      - run: cargo clippy --all-targets --features fault-injection -- -D warnings
+
+  sdk-contract:
+    # Real PostHog SDKs at `latest` (never pinned) against a real Hoglet
+    # binary, asserting on SDK-observable behavior and stored outcomes.
+    name: sdk-contract (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [node, browser, python]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,17 +68,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: actions/setup-python@v5
+        if: matrix.suite == 'python'
+        with:
+          python-version: "3.12"
       - run: cargo build
-      - name: posthog-node latest vs hoglet
-        working-directory: contract-tests
-        run: |
-          npm install --no-audit --no-fund
-          npm run test:node
-      - name: posthog-js latest in Chromium vs hoglet
-        working-directory: contract-tests
-        run: |
-          npx playwright install --with-deps chromium
-          npm run test:browser
+      - name: posthog ${{ matrix.suite }} SDK latest vs hoglet
+        env:
+          HOGLET_BIN: ${{ github.workspace }}/target/debug/hoglet
+          CONTRACT_PLAYWRIGHT_DEPS: "1"
+        run: scripts/contract-test.sh ${{ matrix.suite }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contract-results-${{ matrix.suite }}
+          path: contract-tests/results/
+          if-no-files-found: ignore
 
   forbidden-deps:
     # Claim 3's dependency assertion: the deployment must never grow a
@@ -54,4 +93,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: no forbidden services
         run: |
-          ! grep -riE "kafka|clickhouse|redis|zookeeper" Cargo.toml src/
+          # Crates in the lock file, the manifest, and code. Comments may
+          # name them (a doc line citing ClickHouse's windowFunnel is not a
+          # dependency).
+          ! grep -iE '^name = "[^"]*(kafka|clickhouse|redis|zookeeper)' Cargo.lock
+          ! grep -iE "kafka|clickhouse|redis|zookeeper" Cargo.toml
+          ! grep -rniE "kafka|clickhouse|redis|zookeeper" src/ | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//'
+
+  audit:
+    # Known-vulnerable crates in Cargo.lock (RustSec). Runs nightly too: new
+    # advisories appear without any change to this repo.
+    # RUSTSEC-2026-0235 (rkyv) is a Cargo.lock entry that is not in the build
+    # graph (`cargo tree -i rkyv` is empty).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --ignore RUSTSEC-2026-0235
+      - name: web dependencies
+        working-directory: web
+        run: npm audit --omit=dev

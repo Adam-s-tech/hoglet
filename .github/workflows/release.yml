@@ -1,0 +1,210 @@
+name: Release
+
+# Two jobs of work in one file:
+#  - every push to main: build the static linux binary, prove it has no dynamic
+#    deps, boot it (setup -> capture -> query -> shutdown, nothing downloaded at
+#    runtime), and fail on size regression.
+#  - tags v*: build all four platforms, smoke-test, draft a GitHub Release with
+#    tarballs + checksums, and push a multi-arch image to GHCR.
+# Nothing here publishes on a branch push.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.17.0"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
+  # Size budget for the static linux-amd64 binary. Raise deliberately, in the
+  # same commit that explains why the binary grew.
+  # 2026-10: 51,109,512 bytes. Budget = ~10% headroom.
+  MAX_BINARY_BYTES: "58720256" # 56 MiB
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  static-linux:
+    # Runs on every push to main and on tags: the static-build guard.
+    name: build linux-amd64 (static guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-amd64
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+      - name: build + smoke test
+        run: scripts/build-release.sh linux-amd64 --smoke
+        env:
+          HOGLET_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+      - name: static linking + size guard
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/hoglet
+          file "$bin"
+          out="$(ldd "$bin" 2>&1 || true)"
+          echo "ldd: $out"
+          case "$out" in
+            *"not a dynamic executable"*|*"statically linked"*) ;;
+            *) echo "::error::$bin has dynamic dependencies"; exit 1 ;;
+          esac
+          size="$(stat -c %s "$bin")"
+          echo "size: $size bytes (budget $MAX_BINARY_BYTES)"
+          echo "linux-amd64 static binary: $size bytes (budget $MAX_BINARY_BYTES)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt "$MAX_BINARY_BYTES" ]; then
+            echo "::error::binary is $size bytes, over the $MAX_BINARY_BYTES budget"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: dist-linux-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  build:
+    name: build ${{ matrix.platform }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-arm64
+            os: ubuntu-latest
+            targets: aarch64-unknown-linux-musl
+            zig: true
+            smoke_runner: qemu-aarch64-static
+          - platform: darwin-arm64
+            os: macos-14
+            targets: aarch64-apple-darwin
+          - platform: darwin-amd64
+            os: macos-14
+            targets: x86_64-apple-darwin
+            smoke_runner: arch -x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+      - if: matrix.zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - if: matrix.zig
+        run: cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+      - if: matrix.smoke_runner == 'qemu-aarch64-static'
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - if: matrix.smoke_runner == 'arch -x86_64'
+        run: softwareupdate --install-rosetta --agree-to-license || true
+      - name: build + smoke test
+        run: scripts/build-release.sh "${{ matrix.platform }}" --smoke
+        env:
+          SMOKE_RUNNER: ${{ matrix.smoke_runner }}
+          HOGLET_VERSION: ${{ github.ref_name }}
+      - if: startsWith(matrix.platform, 'linux-')
+        run: |
+          bin="target/${{ matrix.targets }}/release/hoglet"
+          file "$bin"
+          ! readelf -d "$bin" | grep -q NEEDED
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: draft GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [static-linux, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/checkout@v4
+        with:
+          path: src
+      - name: tag matches Cargo.toml
+        run: |
+          want="$(sed -n 's/^version = "\(.*\)"/\1/p' src/Cargo.toml | head -n 1)"
+          [ "${GITHUB_REF_NAME#v}" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME != Cargo.toml $want"; exit 1; }
+      - name: checksums
+        working-directory: dist
+        run: |
+          sha256sum hoglet-*.tar.gz > SHA256SUMS
+          for f in *.sha256; do sha256sum -c "$f"; done
+          cat SHA256SUMS
+      - name: create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "Hoglet $GITHUB_REF_NAME" \
+            --generate-notes
+
+  image:
+    name: GHCR multi-arch image
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [static-linux, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-linux-*
+          path: dist
+          merge-multiple: true
+      - name: stage prebuilt binaries for the image
+        run: |
+          for arch in amd64 arm64; do
+            mkdir -p "dist/docker/$arch"
+            tar -xzf dist/hoglet-*-linux-$arch.tar.gz -C "dist/docker/$arch" --strip-components=1 --wildcards '*/hoglet'
+          done
+          ls -l dist/docker/*/hoglet
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          # Reuse the smoke-tested release binaries instead of recompiling.
+          build-args: BINARY_SOURCE=prebuilt
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

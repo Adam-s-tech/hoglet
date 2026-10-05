@@ -49,19 +49,13 @@ Read `decisions.md` before acting. Direction, scope, stack, licence, anything ou
 
 ## Scope discipline
 
-Milestone one is exactly this, nothing more:
+Milestone one (config, capture, decompression, WAL → Parquet, flags/decide, identity, SDK contract harness) is **done** (2026-10) and contract-tested against posthog-js, posthog-node and posthog-python `latest`.
 
-1. `GET /array/:token/config` — the endpoint posthog-js fetches *first*. Must return a parseable config with `sessionRecording: false`, `surveys: false`, `heatmaps: false`. Without this the SDK breaks; everything else degrades gracefully.
-2. Capture: one handler aliased across `/e`, `/capture`, `/batch`, `/track`, `/engage`, `/i/v0/e`. Browser SDK posts to `/e/`; server SDKs batch to `/batch/`.
-3. Decompression: sniff gzip magic bytes first, ignore the `compression` hint (clients lie about it). Then base64, then raw JSON. lz64 is legacy-only, low priority.
-4. WAL → Parquet storage path.
-5. `/flags` and `/decide` on one handler, `?v=` selects response shape.
-6. Identity: `$identify` / `$create_alias` / `$merge_dangerously` with PostHog's merge precedence, producing no duplicate persons.
-7. SDK contract-test harness running real PostHog SDKs against Hoglet in CI.
+Current milestone — **launch-ready v1**, exactly as listed under "Now" in `ROADMAP.md`. Nothing from "Next" starts before it is done.
 
 Response codes are load-bearing: 200 normally, 204 when `beacon=1`, 4xx for anything the client shouldn't retry, 5xx only for retryable failures. posthog-js retries 5xx and network errors, never 4xx.
 
-Done means: a real app sets `api_host` to Hoglet and works. Nothing else ships before that.
+Done means: a real app sets `api_host` to Hoglet and works, on the measured target box, installable in one command.
 
 Explicitly out of scope for now: session replay ingestion, surveys, experiments, data warehouse, CDP, distributed tracing, multi-node replication, native SDKs.
 

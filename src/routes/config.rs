@@ -46,20 +46,13 @@ pub fn remote_config_fields() -> serde_json::Map<String, serde_json::Value> {
 
 #[derive(Clone)]
 struct ConfigState {
-    authorizer: Option<Arc<dyn CaptureAuthorizer>>,
-}
-
-/// Compatibility constructor for the legacy monolithic application.
-pub fn router() -> Router {
-    routes(ConfigState { authorizer: None })
+    authorizer: Arc<dyn CaptureAuthorizer>,
 }
 
 /// Builds the public SDK config endpoint with fail-closed project-token
 /// authorization.
 pub fn wire_router(authorizer: Arc<dyn CaptureAuthorizer>) -> Router {
-    routes(ConfigState {
-        authorizer: Some(authorizer),
-    })
+    routes(ConfigState { authorizer })
 }
 
 fn routes(state: ConfigState) -> Router {
@@ -69,7 +62,42 @@ fn routes(state: ConfigState) -> Router {
         .route("/array/{token}/config", get(config))
         .route("/array/{token}/config/", get(config))
         .route("/array/{token}/config.js", get(config_js))
+        .route("/static/{file}", get(extension_asset))
+        .route("/static/{version}/{file}", get(versioned_extension_asset))
         .with_state(state)
+}
+
+/// posthog-js loads its surveys extension even when remote config says
+/// `surveys: false` (it decides later whether to show anything). This no-op
+/// extension satisfies that loader: no 404, no console error, no surveys.
+const SURVEYS_EXTENSION: &str = "(function(){var w=window,x=w.__PosthogExtensions__=w.__PosthogExtensions__||{};\
+if(x.generateSurveys)return;var off='Surveys are not enabled on this server';\
+x.generateSurveys=function(){return{\
+getActiveMatchingSurveys:function(cb){if(typeof cb==='function')cb([]);return[];},\
+checkSurveyEligibility:function(){return{eligible:false,reason:off};},\
+checkSurveyRenderability:function(){return{visible:false,disabledReason:off};},\
+renderSurvey:function(){},cancelSurvey:function(){},handlePopoverSurvey:function(){}};};})();\n";
+
+async fn extension_asset(Path(file): Path<String>) -> Response {
+    serve_extension(&file)
+}
+
+async fn versioned_extension_asset(Path((_version, file)): Path<(String, String)>) -> Response {
+    serve_extension(&file)
+}
+
+fn serve_extension(file: &str) -> Response {
+    match file {
+        "surveys.js" => (
+            [
+                (header::CONTENT_TYPE, "application/javascript"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            SURVEYS_EXTENSION,
+        )
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn authorize(state: &ConfigState, token: &str) -> Result<(), StatusCode> {
@@ -77,9 +105,7 @@ async fn authorize(state: &ConfigState, token: &str) -> Result<(), StatusCode> {
         // Invalid token shape → 401, which posthog-js never retries.
         return Err(StatusCode::UNAUTHORIZED);
     }
-    if let Some(authorizer) = &state.authorizer
-        && authorizer.authorize(token).await.is_err()
-    {
+    if state.authorizer.authorize(token).await.is_err() {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
@@ -121,7 +147,10 @@ mod tests {
     use tower::ServiceExt;
 
     async fn get(uri: &str) -> (StatusCode, serde_json::Value) {
-        let res = crate::app()
+        let authorizer = std::sync::Arc::new(crate::capture::StaticCaptureAuthorizer::new([
+            ("phc_test123", "project-1"),
+        ]));
+        let res = super::wire_router(authorizer)
             .oneshot(Request::get(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();

@@ -1,14 +1,11 @@
-#[path = "../src/storage_bootstrap.rs"]
-mod storage_bootstrap;
-
 use std::path::Path;
 
-use rusqlite::Connection;
-use storage_bootstrap::{
+use hoglet::storage_bootstrap::{
     CONTROL_APPLICATION_ID, CONTROL_SCHEMA_VERSION, DatabaseRole, PROJECTIONS_APPLICATION_ID,
     PROJECTIONS_SCHEMA_VERSION, StorageBootstrapError, StorageDisposition, StoragePaths,
-    bootstrap_storage, discover_legacy_tokens, inspect_storage,
+    bootstrap_storage, inspect_storage,
 };
+use rusqlite::Connection;
 
 fn pragma_i64(path: &Path, pragma: &str) -> i64 {
     let connection = Connection::open(path).unwrap();
@@ -67,19 +64,9 @@ fn fresh_bootstrap_creates_a_durable_paired_generation_zero() {
         projections_meta,
         (first.pair_id.clone(), "projections".into())
     );
-    assert_eq!(
-        projections_connection
-            .query_row(
-                "SELECT COUNT(*) FROM event_generations WHERE id = 0",
-                [],
-                |row| { row.get::<_, i64>(0) }
-            )
-            .unwrap(),
-        1
-    );
     let state: (i64, i64, i64) = projections_connection
         .query_row(
-            "SELECT current_generation_id, applied_wal_segment, applied_wal_offset
+            "SELECT generation, wal_segment, wal_offset
              FROM projection_state WHERE singleton = 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -117,29 +104,6 @@ fn inspection_of_a_missing_data_directory_is_fresh_and_creates_nothing() {
     assert_eq!(inspect_storage(&paths).unwrap(), StorageDisposition::Fresh);
     assert_eq!(paths.data_dir(), data_dir);
     assert!(!data_dir.exists(), "inspection must not create data_dir");
-}
-
-#[test]
-fn inspection_recognizes_each_kind_of_legacy_event_truth() {
-    for artifact in ["auth.db", "wal", "events"] {
-        let directory = tempfile::tempdir().unwrap();
-        let data_dir = directory.path().join("hoglet-data");
-        std::fs::create_dir(&data_dir).unwrap();
-        let artifact_path = data_dir.join(artifact);
-        if artifact.ends_with(".db") {
-            std::fs::File::create(&artifact_path).unwrap();
-        } else {
-            std::fs::create_dir(&artifact_path).unwrap();
-        }
-
-        assert_eq!(
-            inspect_storage(&StoragePaths::new(&data_dir)).unwrap(),
-            StorageDisposition::LegacyOnly,
-            "{artifact} is legacy state that requires explicit migration"
-        );
-        assert!(!data_dir.join("control.db").exists());
-        assert!(!data_dir.join("projections.db").exists());
-    }
 }
 
 #[test]
@@ -258,55 +222,6 @@ fn bootstrap_refuses_a_newer_schema_without_rewriting_it() {
         } if found == newer
     ));
     assert_eq!(pragma_i64(&control, "user_version"), newer);
-}
-
-#[test]
-fn legacy_token_discovery_reads_known_sqlite_token_columns_without_writing() {
-    let directory = tempfile::tempdir().unwrap();
-    let registry_path = directory.path().join("projects.db");
-    let identity_path = directory.path().join("identity.db");
-    let absent_path = directory.path().join("absent.db");
-
-    let registry = Connection::open(&registry_path).unwrap();
-    registry
-        .execute_batch(
-            "CREATE TABLE projects (token TEXT, name TEXT);
-             INSERT INTO projects VALUES ('phc_registry', 'Registry');
-             INSERT INTO projects VALUES ('', 'Blank');",
-        )
-        .unwrap();
-    drop(registry);
-
-    let identity = Connection::open(&identity_path).unwrap();
-    identity
-        .execute_batch(
-            "CREATE TABLE persons (token TEXT, id INTEGER);
-             CREATE TABLE event_names (token TEXT, name TEXT);
-             CREATE TABLE share_links (token TEXT, object_id TEXT);
-             CREATE TABLE unrelated (secret TEXT);
-             INSERT INTO persons VALUES ('phc_identity', 1);
-             INSERT INTO event_names VALUES ('phc_registry', '$pageview');
-             INSERT INTO share_links VALUES ('phc_share_credential', 'dashboard-id');
-             INSERT INTO unrelated VALUES ('phc_must_not_be_inventoried');",
-        )
-        .unwrap();
-    drop(identity);
-
-    let before_registry = std::fs::metadata(&registry_path).unwrap().len();
-    let tokens = discover_legacy_tokens([&registry_path, &identity_path, &absent_path]).unwrap();
-
-    assert_eq!(
-        tokens.into_iter().collect::<Vec<_>>(),
-        vec!["phc_identity".to_string(), "phc_registry".to_string()]
-    );
-    assert!(
-        !absent_path.exists(),
-        "read-only discovery must not create databases"
-    );
-    assert_eq!(
-        std::fs::metadata(&registry_path).unwrap().len(),
-        before_registry
-    );
 }
 
 fn directory_entries(path: &Path) -> Vec<std::ffi::OsString> {

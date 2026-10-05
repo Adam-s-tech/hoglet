@@ -1,5 +1,8 @@
 # Query Layer — Implementation Spec
 
+> **Historical design note.** Written before the 2026-10 rebuild; parts describe code that no longer exists. The shipped contract is `src/contract/` (exported to `web/src/types/`), the decisions are in `decisions.md` and `docs/adr/`, and user-facing behaviour is in `docs/user/`.
+
+
 P1. The load-bearing rebuild. Everything after this — insights, actors, cohorts,
 rollup equivalence — is expressed in this layer. Fixed per-endpoint SQL in
 `src/query/mod.rs` is replaced by a typed query IR compiled to DuckDB SQL.

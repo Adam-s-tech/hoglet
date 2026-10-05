@@ -40,6 +40,26 @@ pub fn decode(
     form_encoded: bool,
     compression_hint: Option<&str>,
 ) -> Result<String, DecodeError> {
+    decode_limited(body, form_encoded, compression_hint, MAX_DECOMPRESSED_BYTES)
+}
+
+/// Whether decoding `body` can produce much more than `body.len()` bytes, so
+/// the caller should bound how many such decodes run at once.
+pub fn may_expand(body: &[u8], form_encoded: bool, compression_hint: Option<&str>) -> bool {
+    body.len() > 64 * 1024
+        || form_encoded
+        || compression_hint.is_some()
+        || body.starts_with(&GZIP_MAGIC)
+        || looks_like_base64(body)
+}
+
+/// [`decode`] with an explicit ceiling on the decoded size.
+pub fn decode_limited(
+    body: &[u8],
+    form_encoded: bool,
+    compression_hint: Option<&str>,
+    max_bytes: usize,
+) -> Result<String, DecodeError> {
     let mut hint = compression_hint.map(str::to_owned);
     let mut payload: Vec<u8>;
 
@@ -79,13 +99,13 @@ pub fn decode(
     // Content sniffing beats the hint: gzip is gzip no matter what the client
     // claimed.
     if payload.starts_with(&GZIP_MAGIC) {
-        let decompressed = gunzip_bounded(&payload)?;
+        let decompressed = gunzip_bounded(&payload, max_bytes)?;
         return String::from_utf8(decompressed).map_err(|_| DecodeError::Undecodable);
     }
 
     if matches!(hint.as_deref(), Some("lz64") | Some("lz-string")) {
         if let Some(text) = lz_payload.as_deref() {
-            match decompress_lz64_bounded(text, MAX_DECOMPRESSED_BYTES) {
+            match decompress_lz64_bounded(text, max_bytes) {
                 Ok(decompressed) => return Ok(decompressed),
                 Err(DecodeError::TooLarge) => return Err(DecodeError::TooLarge),
                 Err(DecodeError::Undecodable) => {}
@@ -95,7 +115,7 @@ pub fn decode(
         if let Ok(text) = std::str::from_utf8(&payload)
             && lz_payload.as_deref() != Some(text)
         {
-            match decompress_lz64_bounded(text, MAX_DECOMPRESSED_BYTES) {
+            match decompress_lz64_bounded(text, max_bytes) {
                 Ok(decompressed) => return Ok(decompressed),
                 Err(DecodeError::TooLarge) => return Err(DecodeError::TooLarge),
                 Err(DecodeError::Undecodable) => {}
@@ -104,6 +124,9 @@ pub fn decode(
         // Fall through: hint lied; the payload may just be JSON.
     }
 
+    if payload.len() > max_bytes {
+        return Err(DecodeError::TooLarge);
+    }
     String::from_utf8(payload).map_err(|_| DecodeError::Undecodable)
 }
 
@@ -332,7 +355,7 @@ fn looks_like_base64(payload: &[u8]) -> bool {
 
 /// Gzip decompress with a hard output ceiling, reading in bounded chunks so a
 /// bomb fails early instead of allocating [`MAX_DECOMPRESSED_BYTES`] up front.
-fn gunzip_bounded(payload: &[u8]) -> Result<Vec<u8>, DecodeError> {
+fn gunzip_bounded(payload: &[u8], max_bytes: usize) -> Result<Vec<u8>, DecodeError> {
     let mut decoder = flate2::read::GzDecoder::new(payload);
     let mut out = Vec::new();
     let mut chunk = [0u8; GZIP_CHUNK_BYTES];
@@ -340,7 +363,7 @@ fn gunzip_bounded(payload: &[u8]) -> Result<Vec<u8>, DecodeError> {
         match decoder.read(&mut chunk) {
             Ok(0) => return Ok(out),
             Ok(n) => {
-                if out.len() + n > MAX_DECOMPRESSED_BYTES {
+                if out.len() + n > max_bytes {
                     return Err(DecodeError::TooLarge);
                 }
                 out.extend_from_slice(&chunk[..n]);

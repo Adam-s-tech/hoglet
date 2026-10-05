@@ -1,5 +1,8 @@
 # Scale — Implementation Spec
 
+> **Historical design note.** Written before the 2026-10 rebuild; parts describe code that no longer exists. The shipped contract is `src/contract/` (exported to `web/src/types/`), the decisions are in `decisions.md` and `docs/adr/`, and user-facing behaviour is in `docs/user/`.
+
+
 P7. Scale the engine from thousands to tens of millions of events. Every
 optimization is structural — layout, rollups, caching — not just faster SQL.
 

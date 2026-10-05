@@ -13,6 +13,10 @@ pub mod control {
     pub use hoglet::control::*;
 }
 
+pub mod security {
+    pub use hoglet::security::*;
+}
+
 #[path = "../src/routes/workspace.rs"]
 mod workspace;
 

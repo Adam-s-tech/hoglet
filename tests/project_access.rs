@@ -68,7 +68,7 @@ async fn setup_creates_the_requested_capture_token_without_open_mode() {
     let project = &setup.workspace.organizations[0].projects[0];
     assert_eq!(project.token, "phc_existing");
     let capture = access.authorize_capture("phc_existing").await.unwrap();
-    assert_eq!(capture.project_id.as_deref(), Some(project.id.as_str()));
+    assert_eq!(capture.project_id, project.id);
 
     let principal = access.validate_session(&setup.session_id).await.unwrap();
     let authorized = access
@@ -171,7 +171,7 @@ async fn personal_keys_authenticate_the_same_principal_and_are_user_scoped() {
     let owner = access.validate_session(&setup.session_id).await.unwrap();
 
     let created = access
-        .create_personal_key(&owner, "automation")
+        .create_personal_key(&owner, "automation", hoglet::control::KeyScope::Read)
         .await
         .unwrap();
     assert!(created.secret.starts_with("phx_"));

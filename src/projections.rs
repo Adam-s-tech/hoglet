@@ -12,16 +12,6 @@ use crate::capture::event::CapturedEvent;
 use crate::pipeline::wal::WalCursor;
 
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS projected_events (
-    project_id TEXT NOT NULL,
-    uuid TEXT NOT NULL,
-    wal_segment INTEGER NOT NULL CHECK(wal_segment >= 0),
-    wal_offset INTEGER NOT NULL CHECK(wal_offset >= 0),
-    PRIMARY KEY (project_id, uuid)
-);
-CREATE INDEX IF NOT EXISTS projected_events_wal_order
-    ON projected_events(wal_segment, wal_offset);
-
 CREATE TABLE IF NOT EXISTS persons (
     project_id TEXT NOT NULL,
     id TEXT NOT NULL,
@@ -29,19 +19,65 @@ CREATE TABLE IF NOT EXISTS persons (
     is_identified INTEGER NOT NULL DEFAULT 0 CHECK(is_identified IN (0, 1)),
     properties TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(properties)),
     first_seen_key TEXT NOT NULL,
+    -- Newest event time of any of the person's distinct ids (RFC 3339 UTC).
+    last_seen TEXT,
     PRIMARY KEY (project_id, id)
 );
+
+-- Persons list: newest first, keyset-paged.
+CREATE INDEX IF NOT EXISTS persons_created
+    ON persons(project_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS distinct_ids (
     project_id TEXT NOT NULL,
     distinct_id TEXT NOT NULL,
     person_id TEXT NOT NULL,
+    -- Change sequence for identity overrides (see `identity_state`). Rows
+    -- whose person id equals their distinct id and were never repointed keep
+    -- seq 0 and never need syncing.
+    seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, distinct_id),
     FOREIGN KEY (project_id, person_id)
         REFERENCES persons(project_id, id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS distinct_ids_person
     ON distinct_ids(project_id, person_id);
+CREATE INDEX IF NOT EXISTS distinct_ids_seq
+    ON distinct_ids(project_id, seq) WHERE seq > 0;
+
+-- Identity override feed. A person id is the first distinct id ever seen for
+-- that person, so `distinct_id -> person_id` is the identity for every id
+-- that was never merged. Readers therefore only need the rows where
+-- `person_id != distinct_id` ("overrides"). Every write that creates or
+-- changes such a row stamps it with `seq = identity_state.seq + 1`; a reader
+-- that remembers the highest seq it applied can sync incrementally. A
+-- change of `epoch` (erasure, rebuild) means: discard and reload everything.
+CREATE TABLE IF NOT EXISTS identity_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    seq INTEGER NOT NULL DEFAULT 0,
+    epoch INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO identity_state (singleton, seq, epoch) VALUES (1, 0, 0);
+
+-- Erasure is two steps that cannot share one transaction: identity (SQLite)
+-- and event files (Parquet). The distinct ids of a person being erased are
+-- recorded here in the same transaction that deletes the person, and removed
+-- only after their events are gone from every file. A crash in between leaves
+-- the rows here; startup finishes the job before anything else is published.
+CREATE TABLE IF NOT EXISTS pending_erasures (
+    project_id TEXT NOT NULL,
+    distinct_id TEXT NOT NULL,
+    PRIMARY KEY (project_id, distinct_id)
+);
+
+CREATE TABLE IF NOT EXISTS groups (
+    project_id TEXT NOT NULL,
+    group_type TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    properties TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(properties)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, group_type, group_key)
+);
 
 CREATE TABLE IF NOT EXISTS event_names (
     project_id TEXT NOT NULL,
@@ -121,43 +157,52 @@ impl From<serde_json::Error> for ProjectionError {
 /// owner evolve those tables independently.
 pub fn initialize_schema(connection: &Connection) -> Result<(), ProjectionError> {
     connection.execute_batch(SCHEMA)?;
+    let has_last_seen = connection
+        .prepare("SELECT 1 FROM pragma_table_info('persons') WHERE name = 'last_seen'")?
+        .exists([])?;
+    if !has_last_seen {
+        connection.execute_batch("ALTER TABLE persons ADD COLUMN last_seen TEXT")?;
+    }
     Ok(())
+}
+
+/// Sortable UTC text form used for `persons.last_seen`.
+fn sortable_time(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 /// Apply one event's rebuildable effects inside the caller's publication
 /// transaction.
 ///
-/// The `(project_id, uuid)` guard is inserted first.  A duplicate therefore
-/// returns before identity or catalog state can be counted twice.  Callers
-/// must invoke this function in WAL order; `$set`, `$set_once`, and identify
-/// merges consequently have deterministic last-writer behavior.
+/// Callers must invoke this in WAL order; `$set`, `$set_once`, and identify
+/// merges consequently have deterministic last-writer behavior. Every effect
+/// is idempotent for a repeated event except catalog counts, which are
+/// approximate by design. `_cursor` is accepted for call-site compatibility.
 pub fn apply_captured_event(
     transaction: &Transaction<'_>,
     project_id: &str,
     event: &CapturedEvent,
-    cursor: WalCursor,
+    _cursor: WalCursor,
 ) -> Result<ApplyOutcome, ProjectionError> {
     if project_id.trim().is_empty() {
         return Err(ProjectionError::InvalidProjectId);
     }
-    let segment =
-        i64::try_from(cursor.segment).map_err(|_| ProjectionError::CursorOutOfRange(cursor))?;
-    let offset =
-        i64::try_from(cursor.byte_offset).map_err(|_| ProjectionError::CursorOutOfRange(cursor))?;
-
-    let inserted = transaction.execute(
-        "INSERT OR IGNORE INTO projected_events(
-             project_id, uuid, wal_segment, wal_offset
-         ) VALUES (?1, ?2, ?3, ?4)",
-        params![project_id, event.uuid.to_string(), segment, offset],
-    )?;
-    if inserted == 0 {
-        return Ok(ApplyOutcome::Duplicate);
-    }
-
     apply_identity(transaction, project_id, event)?;
     apply_catalog(transaction, project_id, event)?;
     Ok(ApplyOutcome::Applied)
+}
+
+/// Identity effects only, in WAL order; the caller aggregates catalog effects
+/// in a [`CatalogBatch`] and flushes it once per window.
+pub fn apply_identity_effects(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    event: &CapturedEvent,
+) -> Result<(), ProjectionError> {
+    if project_id.trim().is_empty() {
+        return Err(ProjectionError::InvalidProjectId);
+    }
+    apply_identity(transaction, project_id, event)
 }
 
 fn apply_identity(
@@ -165,31 +210,93 @@ fn apply_identity(
     project_id: &str,
     event: &CapturedEvent,
 ) -> Result<(), ProjectionError> {
-    let winner = ensure_person(transaction, project_id, &event.distinct_id, event)?;
-
-    if event.event == "$identify" {
-        transaction.execute(
-            "UPDATE persons SET is_identified=1 WHERE project_id=?1 AND id=?2",
-            params![project_id, winner],
-        )?;
-
-        if let Some(anonymous_id) = event
+    let person_id = ensure_person(transaction, project_id, &event.distinct_id, event)?;
+    transaction.execute(
+        "UPDATE persons SET last_seen = ?3
+         WHERE project_id = ?1 AND id = ?2 AND (last_seen IS NULL OR last_seen < ?3)",
+        params![project_id, person_id, sortable_time(event.timestamp)],
+    )?;
+    let other_id = |key: &str| {
+        event
             .properties
-            .get("$anon_distinct_id")
+            .get(key)
             .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
-            merge_persons(
-                transaction,
-                project_id,
-                anonymous_id,
-                &event.distinct_id,
-                event,
-            )?;
+            .filter(|value| !value.is_empty() && *value != event.distinct_id)
+            .map(str::to_owned)
+    };
+
+    match event.event.as_str() {
+        "$identify" => {
+            if let Some(anonymous_id) = other_id("$anon_distinct_id") {
+                merge_persons(
+                    transaction,
+                    project_id,
+                    &anonymous_id,
+                    &event.distinct_id,
+                    event,
+                    MergeGuard::RefuseIdentifiedSource,
+                )?;
+            }
+            mark_identified(transaction, project_id, &event.distinct_id)?;
         }
+        "$create_alias" => {
+            if let Some(alias) = other_id("alias") {
+                merge_persons(
+                    transaction,
+                    project_id,
+                    &alias,
+                    &event.distinct_id,
+                    event,
+                    MergeGuard::RefuseBothIdentified,
+                )?;
+            }
+            mark_identified(transaction, project_id, &event.distinct_id)?;
+        }
+        "$merge_dangerously" => {
+            if let Some(alias) = other_id("alias") {
+                merge_persons(
+                    transaction,
+                    project_id,
+                    &alias,
+                    &event.distinct_id,
+                    event,
+                    MergeGuard::Always,
+                )?;
+            }
+        }
+        "$groupidentify" => apply_group(transaction, project_id, event)?,
+        _ => {}
     }
 
     apply_person_properties(transaction, project_id, &event.distinct_id, event)
+}
+
+fn mark_identified(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    distinct_id: &str,
+) -> Result<(), ProjectionError> {
+    transaction.execute(
+        "UPDATE persons SET is_identified = 1
+         WHERE project_id = ?1
+           AND id = (SELECT person_id FROM distinct_ids
+                     WHERE project_id = ?1 AND distinct_id = ?2)",
+        params![project_id, distinct_id],
+    )?;
+    Ok(())
+}
+
+/// Allocate the next identity override sequence number.
+fn next_identity_seq(transaction: &Transaction<'_>) -> Result<i64, ProjectionError> {
+    transaction.execute(
+        "UPDATE identity_state SET seq = seq + 1 WHERE singleton = 1",
+        [],
+    )?;
+    Ok(transaction.query_row(
+        "SELECT seq FROM identity_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn ensure_person(
@@ -220,35 +327,61 @@ fn ensure_person(
         params![project_id, person_id, event.timestamp.to_rfc3339()],
     )?;
     transaction.execute(
-        "INSERT INTO distinct_ids(project_id, distinct_id, person_id)
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO distinct_ids(project_id, distinct_id, person_id, seq)
+         VALUES (?1, ?2, ?3, 0)",
         params![project_id, distinct_id, person_id],
     )?;
     Ok(person_id)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeGuard {
+    /// `$identify` / `$create_alias`: never fold an already identified person
+    /// into another one — two logged-in users sharing a device stay apart.
+    RefuseIdentifiedSource,
+    /// `$create_alias`: SDKs disagree on which side is `alias` (posthog-node
+    /// aliases the anonymous id into the user, posthog-python the reverse).
+    /// Merge unless both people are identified; an identified person always
+    /// survives.
+    RefuseBothIdentified,
+    /// `$merge_dangerously`: the caller asserted these are one human.
+    Always,
+}
+
+/// Fold the person of `losing_distinct_id` into the person of
+/// `winning_distinct_id`. The winner's properties win conflicts; the earliest
+/// `created_at` survives; every distinct id of the loser is repointed.
 fn merge_persons(
     transaction: &Transaction<'_>,
     project_id: &str,
     losing_distinct_id: &str,
     winning_distinct_id: &str,
     event: &CapturedEvent,
+    guard: MergeGuard,
 ) -> Result<(), ProjectionError> {
-    let winner = ensure_person(transaction, project_id, winning_distinct_id, event)?;
-    let loser = ensure_person(transaction, project_id, losing_distinct_id, event)?;
+    let mut winner = ensure_person(transaction, project_id, winning_distinct_id, event)?;
+    let mut loser = ensure_person(transaction, project_id, losing_distinct_id, event)?;
     if winner == loser {
         return Ok(());
     }
 
-    // Match the safe PostHog identify behavior: a normal identify does not
-    // silently collapse two already identified people.
-    let loser_is_identified: bool = transaction.query_row(
-        "SELECT is_identified FROM persons WHERE project_id=?1 AND id=?2",
-        params![project_id, loser],
-        |row| row.get(0),
-    )?;
-    if loser_is_identified {
-        return Ok(());
+    let identified = |person: &str| -> Result<bool, ProjectionError> {
+        Ok(transaction.query_row(
+            "SELECT is_identified FROM persons WHERE project_id=?1 AND id=?2",
+            params![project_id, person],
+            |row| row.get(0),
+        )?)
+    };
+    let loser_is_identified = identified(&loser)?;
+    match guard {
+        MergeGuard::RefuseIdentifiedSource if loser_is_identified => return Ok(()),
+        MergeGuard::RefuseBothIdentified if loser_is_identified => {
+            if identified(&winner)? {
+                return Ok(());
+            }
+            std::mem::swap(&mut winner, &mut loser);
+        }
+        _ => {}
     }
 
     let (winner_json, winner_created, winner_first_seen): (String, String, String) = transaction
@@ -258,32 +391,47 @@ fn merge_persons(
             params![project_id, winner],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-    let (loser_json, loser_created): (String, String) = transaction.query_row(
-        "SELECT properties, created_at
-         FROM persons WHERE project_id=?1 AND id=?2",
-        params![project_id, loser],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let (loser_json, loser_created, loser_first_seen): (String, String, String) = transaction
+        .query_row(
+            "SELECT properties, created_at, first_seen_key
+             FROM persons WHERE project_id=?1 AND id=?2",
+            params![project_id, loser],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
 
     let mut merged = decode_properties(&loser_json)?;
     for (key, value) in decode_properties(&winner_json)? {
         merged.insert(key, value);
     }
-    let created_at = std::cmp::min(winner_created, loser_created);
+    // The older person keeps its flag bucketing key, so a flag value seen
+    // while anonymous survives login (experience continuity).
+    let (created_at, first_seen_key) = if loser_created < winner_created {
+        (loser_created, loser_first_seen)
+    } else {
+        (winner_created, winner_first_seen)
+    };
 
+    let seq = next_identity_seq(transaction)?;
     transaction.execute(
-        "UPDATE distinct_ids SET person_id=?1
-         WHERE project_id=?2 AND person_id=?3",
-        params![winner, project_id, loser],
+        "UPDATE distinct_ids SET person_id=?1, seq=?2
+         WHERE project_id=?3 AND person_id=?4",
+        params![winner, seq, project_id, loser],
     )?;
     transaction.execute(
         "UPDATE persons
-         SET properties=?1, created_at=?2, first_seen_key=?3
+         SET last_seen = (SELECT max(last_seen) FROM persons
+                          WHERE project_id = ?1 AND id IN (?2, ?3))
+         WHERE project_id = ?1 AND id = ?2",
+        params![project_id, winner, loser],
+    )?;
+    transaction.execute(
+        "UPDATE persons
+         SET properties=?1, created_at=?2, first_seen_key=?3, is_identified=1
          WHERE project_id=?4 AND id=?5",
         params![
             Value::Object(merged).to_string(),
             created_at,
-            winner_first_seen,
+            first_seen_key,
             project_id,
             winner,
         ],
@@ -291,6 +439,54 @@ fn merge_persons(
     transaction.execute(
         "DELETE FROM persons WHERE project_id=?1 AND id=?2",
         params![project_id, loser],
+    )?;
+    Ok(())
+}
+
+fn apply_group(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    event: &CapturedEvent,
+) -> Result<(), ProjectionError> {
+    let (Some(group_type), Some(group_key)) = (
+        event.properties.get("$group_type").and_then(Value::as_str),
+        event.properties.get("$group_key").and_then(|value| match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }),
+    ) else {
+        return Ok(());
+    };
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT properties FROM groups
+             WHERE project_id=?1 AND group_type=?2 AND group_key=?3",
+            params![project_id, group_type, group_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut properties = match &existing {
+        Some(encoded) => decode_properties(encoded)?,
+        None => Map::new(),
+    };
+    if let Some(set) = event.properties.get("$group_set").and_then(Value::as_object) {
+        for (key, value) in set {
+            properties.insert(key.clone(), value.clone());
+        }
+    }
+    transaction.execute(
+        "INSERT INTO groups(project_id, group_type, group_key, properties, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id, group_type, group_key)
+         DO UPDATE SET properties = excluded.properties",
+        params![
+            project_id,
+            group_type,
+            group_key,
+            Value::Object(properties).to_string(),
+            event.timestamp.to_rfc3339(),
+        ],
     )?;
     Ok(())
 }
@@ -303,7 +499,8 @@ fn apply_person_properties(
 ) -> Result<(), ProjectionError> {
     let set_once = event.properties.get("$set_once").and_then(Value::as_object);
     let set = event.properties.get("$set").and_then(Value::as_object);
-    if set_once.is_none() && set.is_none() {
+    let unset = event.properties.get("$unset").and_then(Value::as_array);
+    if set_once.is_none() && set.is_none() && unset.is_none() {
         return Ok(());
     }
 
@@ -327,11 +524,85 @@ fn apply_person_properties(
             properties.insert(key.clone(), value.clone());
         }
     }
+    if let Some(keys) = unset {
+        for key in keys.iter().filter_map(Value::as_str) {
+            properties.remove(key);
+        }
+    }
 
     transaction.execute(
         "UPDATE persons SET properties=?1 WHERE project_id=?2 AND id=?3",
         params![Value::Object(properties).to_string(), project_id, person_id],
     )?;
+    Ok(())
+}
+
+/// Remove a person and every distinct id that resolves to them (GDPR
+/// erasure). Returns the removed distinct ids. Bumps the identity epoch so
+/// every reader of identity overrides reloads from scratch.
+pub fn erase_person(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    person_id: &str,
+) -> Result<Vec<String>, ProjectionError> {
+    let distinct_ids: Vec<String> = transaction
+        .prepare("SELECT distinct_id FROM distinct_ids WHERE project_id = ?1 AND person_id = ?2")?
+        .query_map(params![project_id, person_id], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for distinct_id in &distinct_ids {
+        transaction.execute(
+            "INSERT OR IGNORE INTO pending_erasures(project_id, distinct_id) VALUES (?1, ?2)",
+            params![project_id, distinct_id],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM distinct_ids WHERE project_id = ?1 AND person_id = ?2",
+        params![project_id, person_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM persons WHERE project_id = ?1 AND id = ?2",
+        params![project_id, person_id],
+    )?;
+    transaction.execute(
+        "UPDATE identity_state SET epoch = epoch + 1, seq = seq + 1 WHERE singleton = 1",
+        [],
+    )?;
+    Ok(distinct_ids)
+}
+
+/// Most distinct ids resumed per project in one erasure-recovery step.
+pub const MAX_PENDING_ERASURES_PER_PROJECT: usize = 10_000;
+
+/// Distinct ids whose person is gone but whose events may still be stored,
+/// grouped by project (bounded per project).
+pub fn pending_erasures(
+    connection: &Connection,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, ProjectionError> {
+    let mut grouped: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut statement = connection
+        .prepare("SELECT project_id, distinct_id FROM pending_erasures ORDER BY project_id, distinct_id")?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (project_id, distinct_id) = row?;
+        let ids = grouped.entry(project_id).or_default();
+        if ids.len() < MAX_PENDING_ERASURES_PER_PROJECT {
+            ids.push(distinct_id);
+        }
+    }
+    Ok(grouped)
+}
+
+/// Mark erasures complete: their events are gone from every event file.
+pub fn clear_pending_erasures(
+    connection: &Connection,
+    project_id: &str,
+    distinct_ids: &[String],
+) -> Result<(), ProjectionError> {
+    let mut statement = connection
+        .prepare_cached("DELETE FROM pending_erasures WHERE project_id = ?1 AND distinct_id = ?2")?;
+    for distinct_id in distinct_ids {
+        statement.execute(params![project_id, distinct_id])?;
+    }
     Ok(())
 }
 
@@ -352,40 +623,152 @@ fn apply_catalog(
     project_id: &str,
     event: &CapturedEvent,
 ) -> Result<(), ProjectionError> {
-    let last_seen = event.timestamp.timestamp_millis();
-    transaction.execute(
-        "INSERT INTO event_names(project_id, name, last_seen, count)
-         VALUES (?1, ?2, ?3, 1)
-         ON CONFLICT(project_id, name) DO UPDATE SET
-             last_seen=max(event_names.last_seen, excluded.last_seen),
-             count=event_names.count + 1",
-        params![project_id, event.event, last_seen],
-    )?;
+    let mut batch = CatalogBatch::default();
+    batch.add(project_id, event);
+    batch.flush(transaction)
+}
 
-    for (key, value) in &event.properties {
-        transaction.execute(
-            "INSERT INTO property_keys(
-                 project_id, source, key, type_guess, last_seen, count
-             ) VALUES (?1, 'event', ?2, ?3, ?4, 1)
+/// Distinct values remembered per property key; values beyond this are not
+/// catalogued (they remain in the events). Bounds the catalog for
+/// high-cardinality keys like ids and URLs.
+pub const MAX_VALUES_PER_KEY: i64 = 500;
+/// Longer values are never catalogued.
+pub const MAX_CATALOG_VALUE_CHARS: usize = 200;
+/// Keys whose values are identifiers, not categories.
+const UNCATALOGUED_VALUE_KEYS: &[&str] = &[
+    "$session_id",
+    "$window_id",
+    "$insert_id",
+    "$pageview_id",
+    "$device_id",
+    "$anon_distinct_id",
+    "$ai_trace_id",
+    "$ai_span_id",
+    "$ai_generation_id",
+    "$time",
+    "$sent_at",
+    "token",
+    "distinct_id",
+    "$set",
+    "$set_once",
+    "$unset",
+    "$groups",
+    "$elements",
+    "$elements_chain",
+];
+
+#[derive(Default)]
+struct Seen {
+    count: i64,
+    last_seen: i64,
+}
+
+/// Catalog effects of a whole publication window, aggregated in memory and
+/// written once per distinct name/key/value instead of once per event.
+#[derive(Default)]
+pub struct CatalogBatch {
+    names: std::collections::HashMap<(String, String), Seen>,
+    keys: std::collections::HashMap<(String, String), (Seen, &'static str)>,
+    values: std::collections::HashMap<(String, String, String), Seen>,
+}
+
+impl CatalogBatch {
+    pub fn add(&mut self, project_id: &str, event: &CapturedEvent) {
+        let at = event.timestamp.timestamp_millis();
+        let bump = |seen: &mut Seen| {
+            seen.count += 1;
+            seen.last_seen = seen.last_seen.max(at);
+        };
+        bump(
+            self.names
+                .entry((project_id.to_owned(), event.event.clone()))
+                .or_default(),
+        );
+        for (key, value) in &event.properties {
+            let entry = self
+                .keys
+                .entry((project_id.to_owned(), key.clone()))
+                .or_insert_with(|| (Seen::default(), value_type(value)));
+            bump(&mut entry.0);
+            entry.1 = value_type(value);
+            if value.is_null()
+                || value.is_object()
+                || value.is_array()
+                || UNCATALOGUED_VALUE_KEYS.contains(&key.as_str())
+            {
+                continue;
+            }
+            let text = value_text(value);
+            if text.chars().count() > MAX_CATALOG_VALUE_CHARS {
+                continue;
+            }
+            bump(
+                self.values
+                    .entry((project_id.to_owned(), key.clone(), text))
+                    .or_default(),
+            );
+        }
+    }
+
+    pub fn flush(self, transaction: &Transaction<'_>) -> Result<(), ProjectionError> {
+        let mut names = transaction.prepare_cached(
+            "INSERT INTO event_names(project_id, name, last_seen, count)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id, name) DO UPDATE SET
+                 last_seen=max(event_names.last_seen, excluded.last_seen),
+                 count=event_names.count + excluded.count",
+        )?;
+        for ((project_id, name), seen) in &self.names {
+            names.execute(params![project_id, name, seen.last_seen, seen.count])?;
+        }
+        let mut keys = transaction.prepare_cached(
+            "INSERT INTO property_keys(project_id, source, key, type_guess, last_seen, count)
+             VALUES (?1, 'event', ?2, ?3, ?4, ?5)
              ON CONFLICT(project_id, source, key) DO UPDATE SET
                  type_guess=excluded.type_guess,
                  last_seen=max(property_keys.last_seen, excluded.last_seen),
-                 count=property_keys.count + 1",
-            params![project_id, key, value_type(value), last_seen],
+                 count=property_keys.count + excluded.count",
         )?;
-
-        if !value.is_null() {
-            transaction.execute(
-                "INSERT INTO property_values(project_id, key, value, last_seen, count)
-                 VALUES (?1, ?2, ?3, ?4, 1)
-                 ON CONFLICT(project_id, key, value) DO UPDATE SET
-                     last_seen=max(property_values.last_seen, excluded.last_seen),
-                     count=property_values.count + 1",
-                params![project_id, key, value_text(value), last_seen],
-            )?;
+        for ((project_id, key), (seen, kind)) in &self.keys {
+            keys.execute(params![project_id, key, kind, seen.last_seen, seen.count])?;
         }
+        let mut existing = transaction.prepare_cached(
+            "SELECT count FROM property_values WHERE project_id=?1 AND key=?2 AND value=?3",
+        )?;
+        let mut cardinality = transaction.prepare_cached(
+            "SELECT count(*) FROM property_values WHERE project_id=?1 AND key=?2",
+        )?;
+        let mut upsert = transaction.prepare_cached(
+            "INSERT INTO property_values(project_id, key, value, last_seen, count)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id, key, value) DO UPDATE SET
+                 last_seen=max(property_values.last_seen, excluded.last_seen),
+                 count=property_values.count + excluded.count",
+        )?;
+        let mut sizes: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        // Most frequent first, so the cap keeps the values that matter.
+        let mut values: Vec<_> = self.values.into_iter().collect();
+        values.sort_by_key(|(_, seen)| std::cmp::Reverse(seen.count));
+        for ((project_id, key, value), seen) in values {
+            let known = existing
+                .query_row(params![project_id, key, value], |row| row.get::<_, i64>(0))
+                .optional()?
+                .is_some();
+            if !known {
+                let size = match sizes.get(&(project_id.clone(), key.clone())) {
+                    Some(size) => *size,
+                    None => cardinality.query_row(params![project_id, key], |row| row.get(0))?,
+                };
+                if size >= MAX_VALUES_PER_KEY {
+                    continue;
+                }
+                sizes.insert((project_id.clone(), key.clone()), size + 1);
+            }
+            upsert.execute(params![project_id, key, value, seen.last_seen, seen.count])?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn value_type(value: &Value) -> &'static str {

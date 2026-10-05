@@ -1,88 +1,122 @@
-//! Result cache — LRU cache of query responses keyed by (token, IR hash,
-//! data version). Avoids re-running DuckDB queries when the data hasn't
-//! changed. In-memory only, rebuilt on restart.
+//! Result cache — LRU of serialized query results keyed by (project,
+//! canonical query hash, files data version, identity epoch and seq).
+//!
+//! A key changes whenever anything the result was computed from changes:
+//! new files (data version), merges (identity seq), or the resolved date
+//! range (folded into the query hash). Results that depend on person
+//! properties carry a TTL instead, because `$set` moves none of those.
+//! In-memory only, bounded in entries and (serialized) bytes, rebuilt on
+//! restart. Values are kept as-is, so a cached result is bit-identical to
+//! the computed one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
-pub struct ResultCache {
-    state: Mutex<CacheState>,
-    max_entries: usize,
-    max_bytes: usize,
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CacheKey {
-    pub token: String,
-    pub ir_hash: u64,
+    pub project_id: String,
+    pub query_hash: [u8; 32],
     pub data_version: u64,
+    pub identity_epoch: u64,
+    pub identity_seq: u64,
 }
 
-struct CacheEntry {
-    response_json: Vec<u8>,
+struct CacheEntry<V> {
+    value: V,
+    bytes: usize,
     last_access: u64,
+    expires: Option<Instant>,
 }
 
-#[derive(Default)]
-struct CacheState {
-    entries: HashMap<CacheKey, CacheEntry>,
+struct CacheState<V> {
+    entries: HashMap<CacheKey, CacheEntry<V>>,
     response_bytes: usize,
     access_clock: u64,
 }
 
-impl CacheState {
+impl<V> CacheState<V> {
     fn tick(&mut self) -> u64 {
         self.access_clock = self.access_clock.saturating_add(1);
         self.access_clock
     }
+
+    fn remove(&mut self, key: &CacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.response_bytes = self.response_bytes.saturating_sub(entry.bytes);
+        }
+    }
 }
 
-impl ResultCache {
+pub struct ResultCache<V = Vec<u8>> {
+    state: Mutex<CacheState<V>>,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl<V: Clone> ResultCache<V> {
     pub fn new(max_entries: usize) -> Self {
         Self::with_limits(max_entries, MAX_CACHE_BYTES)
     }
 
-    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+    pub fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         ResultCache {
-            state: Mutex::new(CacheState::default()),
+            state: Mutex::new(CacheState {
+                entries: HashMap::new(),
+                response_bytes: 0,
+                access_clock: 0,
+            }),
             max_entries,
             max_bytes,
         }
     }
 
-    pub fn get(&self, key: &CacheKey) -> Option<Vec<u8>> {
-        let mut state = self.state.lock().unwrap();
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState<V>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn get(&self, key: &CacheKey) -> Option<V> {
+        let mut state = self.lock();
         let access = state.tick();
+        let expired = state
+            .entries
+            .get(key)
+            .and_then(|entry| entry.expires)
+            .is_some_and(|expires| Instant::now() >= expires);
+        if expired {
+            state.remove(key);
+            return None;
+        }
         state.entries.get_mut(key).map(|entry| {
             entry.last_access = access;
-            entry.response_json.clone()
+            entry.value.clone()
         })
     }
 
-    pub fn put(&self, key: CacheKey, response_json: Vec<u8>) {
-        let mut state = self.state.lock().unwrap();
-
-        if let Some(replaced) = state.entries.remove(&key) {
-            state.response_bytes = state
-                .response_bytes
-                .saturating_sub(replaced.response_json.len());
-        }
+    /// Insert `value`, accounted as `bytes` (its serialized size).
+    pub fn put(&self, key: CacheKey, value: V, bytes: usize, ttl: Option<Duration>) {
+        let mut state = self.lock();
+        state.remove(&key);
 
         // One response that cannot fit must not evict the useful cache or leave
         // a stale value for the same key behind.
-        if self.max_entries == 0 || response_json.len() > self.max_bytes {
+        if self.max_entries == 0 || bytes > self.max_bytes {
             return;
         }
 
-        let response_len = response_json.len();
+        let response_len = bytes;
         let access = state.tick();
         state.entries.insert(
             key,
             CacheEntry {
-                response_json,
+                value,
+                bytes,
                 last_access: access,
+                expires: ttl.map(|ttl| Instant::now() + ttl),
             },
         );
         state.response_bytes += response_len;
@@ -96,49 +130,39 @@ impl ResultCache {
             else {
                 break;
             };
-            if let Some(evicted) = state.entries.remove(&oldest) {
-                state.response_bytes = state
-                    .response_bytes
-                    .saturating_sub(evicted.response_json.len());
-            }
+            state.remove(&oldest);
         }
     }
 
     pub fn clear(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         state.entries.clear();
         state.response_bytes = 0;
     }
-}
-
-/// Hash the IR JSON for cache key generation.
-pub fn hash_ir(ir: &serde_json::Value) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    ir.to_string().hash(&mut hasher);
-    hasher.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn key(id: u64) -> CacheKey {
+    fn key(id: u8) -> CacheKey {
         CacheKey {
-            token: "phc_test".into(),
-            ir_hash: id,
+            project_id: "p".into(),
+            query_hash: [id; 32],
             data_version: 1,
+            identity_epoch: 0,
+            identity_seq: 0,
         }
     }
 
     #[test]
     fn entry_limit_evicts_the_least_recently_used_value() {
         let cache = ResultCache::with_limits(2, 1024);
-        cache.put(key(1), vec![1]);
-        cache.put(key(2), vec![2]);
+        cache.put(key(1), vec![1], vec![1].len(), None);
+        cache.put(key(2), vec![2], vec![2].len(), None);
         assert_eq!(cache.get(&key(1)), Some(vec![1]));
 
-        cache.put(key(3), vec![3]);
+        cache.put(key(3), vec![3], vec![3].len(), None);
 
         assert_eq!(cache.get(&key(1)), Some(vec![1]));
         assert_eq!(cache.get(&key(2)), None);
@@ -148,8 +172,8 @@ mod tests {
     #[test]
     fn response_bytes_are_bounded_independently_of_entry_count() {
         let cache = ResultCache::with_limits(10, 5);
-        cache.put(key(1), vec![1; 3]);
-        cache.put(key(2), vec![2; 3]);
+        cache.put(key(1), vec![1; 3], vec![1; 3].len(), None);
+        cache.put(key(2), vec![2; 3], vec![2; 3].len(), None);
 
         assert_eq!(cache.get(&key(1)), None);
         assert_eq!(cache.get(&key(2)), Some(vec![2; 3]));
@@ -158,25 +182,37 @@ mod tests {
     #[test]
     fn replacement_updates_byte_accounting_and_oversize_values_are_not_cached() {
         let cache = ResultCache::with_limits(10, 5);
-        cache.put(key(1), vec![1; 4]);
-        cache.put(key(1), vec![1; 2]);
-        cache.put(key(2), vec![2; 3]);
+        cache.put(key(1), vec![1; 4], vec![1; 4].len(), None);
+        cache.put(key(1), vec![1; 2], vec![1; 2].len(), None);
+        cache.put(key(2), vec![2; 3], vec![2; 3].len(), None);
 
         assert_eq!(cache.get(&key(1)), Some(vec![1; 2]));
         assert_eq!(cache.get(&key(2)), Some(vec![2; 3]));
 
-        cache.put(key(2), vec![9; 6]);
+        cache.put(key(2), vec![9; 6], vec![9; 6].len(), None);
         assert_eq!(cache.get(&key(2)), None);
     }
 
     #[test]
-    fn clear_resets_entries_and_byte_budget() {
-        let cache = ResultCache::with_limits(10, 5);
-        cache.put(key(1), vec![1; 5]);
-        cache.clear();
-        cache.put(key(2), vec![2; 5]);
-
+    fn expired_entries_are_not_served() {
+        let cache = ResultCache::with_limits(10, 1024);
+        cache.put(key(1), vec![1], vec![1].len(), Some(Duration::ZERO));
+        cache.put(key(2), vec![2], 1, Some(Duration::from_secs(60)));
         assert_eq!(cache.get(&key(1)), None);
-        assert_eq!(cache.get(&key(2)), Some(vec![2; 5]));
+        assert_eq!(cache.get(&key(2)), Some(vec![2]));
+    }
+
+    #[test]
+    fn identity_and_data_versions_separate_entries() {
+        let cache = ResultCache::with_limits(10, 1024);
+        cache.put(key(1), vec![1], vec![1].len(), None);
+        let mut merged = key(1);
+        merged.identity_seq = 1;
+        assert_eq!(cache.get(&merged), None);
+        let mut newer = key(1);
+        newer.data_version = 2;
+        assert_eq!(cache.get(&newer), None);
+        cache.clear();
+        assert_eq!(cache.get(&key(1)), None);
     }
 }

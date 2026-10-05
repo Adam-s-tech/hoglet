@@ -16,6 +16,9 @@ use uuid::Uuid;
 use crate::control::{
     AccessError, LoginRequest, PersonalApiKey, Principal, ProjectAccess, SetupRequest,
 };
+use crate::security::{
+    LoginThrottle, PeerAddr, SecurityConfig, constant_time_eq, forwarded_https, source_key,
+};
 
 const SESSION_COOKIE: &str = "hoglet_sid";
 const SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -23,10 +26,17 @@ const SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 #[derive(Clone)]
 struct WorkspaceState {
     access: Arc<ProjectAccess>,
+    security: Arc<SecurityConfig>,
+    throttle: Arc<LoginThrottle>,
 }
 
 #[derive(Clone)]
 struct RequestId(String);
+
+/// Where a request came from, for the login throttle (`None` when the peer is
+/// the reverse proxy itself and no trusted forwarding header names the client).
+#[derive(Clone)]
+struct Source(Option<String>);
 
 #[derive(Debug, Deserialize)]
 struct SetupBody {
@@ -37,6 +47,8 @@ struct SetupBody {
     project_name: Option<String>,
     #[serde(default)]
     existing_project_token: Option<String>,
+    #[serde(default)]
+    setup_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +60,13 @@ struct LoginBody {
 #[derive(Debug, Deserialize)]
 struct NameBody {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateKeyBody {
+    name: String,
+    #[serde(default)]
+    scope: crate::control::KeyScope,
 }
 
 #[derive(Serialize)]
@@ -82,6 +101,27 @@ struct ErrorBody {
 
 /// Builds the dashboard workspace surface over one authoritative access service.
 pub fn router(access: Arc<ProjectAccess>) -> Router {
+    router_with(access, SecurityConfig::default())
+}
+
+/// [`router`] with operator security settings (setup token, proxy trust,
+/// cookie policy).
+pub fn router_with(access: Arc<ProjectAccess>, security: SecurityConfig) -> Router {
+    router_with_throttle(access, security, Arc::new(LoginThrottle::default()))
+}
+
+/// [`router_with`] sharing a sign-in throttle with other routes that check
+/// passwords (accepting an invite signs an existing account in).
+pub fn router_with_throttle(
+    access: Arc<ProjectAccess>,
+    security: SecurityConfig,
+    throttle: Arc<LoginThrottle>,
+) -> Router {
+    let state = WorkspaceState {
+        access,
+        security: Arc::new(security),
+        throttle,
+    };
     Router::new()
         .route("/api/auth/bootstrap", get(bootstrap))
         .route("/api/auth/setup", post(setup))
@@ -98,13 +138,20 @@ pub fn router(access: Arc<ProjectAccess>) -> Router {
             "/api/organizations/{organization_id}/projects",
             post(create_project),
         )
-        .with_state(WorkspaceState { access })
-        .layer(middleware::from_fn(assign_request_id))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state, assign_request_id))
 }
 
-async fn assign_request_id(mut request: Request, next: Next) -> Response {
+async fn assign_request_id(
+    State(state): State<WorkspaceState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let request_id = RequestId(Uuid::now_v7().to_string());
     request.extensions_mut().insert(request_id.clone());
+    let peer = request.extensions().get::<PeerAddr>().map(|peer| peer.0);
+    let source = source_key(peer, request.headers(), state.security.trust_proxy);
+    request.extensions_mut().insert(Source(source));
     let mut response = next.run(request).await;
     if let Ok(value) = HeaderValue::from_str(&request_id.0) {
         response.headers_mut().insert("x-request-id", value);
@@ -125,12 +172,29 @@ async fn bootstrap(
 async fn setup(
     State(state): State<WorkspaceState>,
     Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
     body: Result<Json<SetupBody>, JsonRejection>,
 ) -> Response {
     let Json(body) = match body {
         Ok(body) => body,
         Err(_) => return invalid_request(&request_id, None),
     };
+    if let Some(expected) = state.security.setup_token.as_deref() {
+        let presented = headers
+            .get("x-hoglet-setup-token")
+            .and_then(|value| value.to_str().ok())
+            .or(body.setup_token.as_deref())
+            .unwrap_or_default();
+        if !constant_time_eq(expected, presented) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "The setup token is missing or wrong.",
+                Some("setup_token"),
+                &request_id,
+            );
+        }
+    }
     if body.email.trim().is_empty() {
         return invalid_request(&request_id, Some("email"));
     }
@@ -158,7 +222,11 @@ async fn setup(
     {
         Ok(result) => {
             let mut response = Json(result.workspace).into_response();
-            set_session_cookie(response.headers_mut(), &result.session_id);
+            set_session_cookie(
+                response.headers_mut(),
+                &result.session_id,
+                secure_cookie(&state, &headers),
+            );
             response
         }
         Err(error) => access_error(error, &request_id),
@@ -168,6 +236,8 @@ async fn setup(
 async fn login(
     State(state): State<WorkspaceState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(Source(source)): Extension<Source>,
+    headers: HeaderMap,
     body: Result<Json<LoginBody>, JsonRejection>,
 ) -> Response {
     let Json(body) = match body {
@@ -180,6 +250,22 @@ async fn login(
     if body.password.is_empty() {
         return invalid_request(&request_id, Some("password"));
     }
+    let now = std::time::Instant::now();
+    if let Err(wait) = state.throttle.check(&body.email, source.as_deref(), now) {
+        let mut response = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_attempts",
+            "Too many failed sign-in attempts. Wait and try again.",
+            None,
+            &request_id,
+        );
+        let seconds = wait.as_secs().max(1) + u64::from(wait.subsec_nanos() > 0);
+        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+    let email = body.email.clone();
     match state
         .access
         .login(LoginRequest {
@@ -189,11 +275,23 @@ async fn login(
         .await
     {
         Ok(result) => {
+            state.throttle.record_success(&email);
             let mut response = Json(result.workspace).into_response();
-            set_session_cookie(response.headers_mut(), &result.session_id);
+            set_session_cookie(
+                response.headers_mut(),
+                &result.session_id,
+                secure_cookie(&state, &headers),
+            );
             response
         }
-        Err(error) => access_error(error, &request_id),
+        Err(error) => {
+            if matches!(error, AccessError::InvalidCredentials) {
+                state
+                    .throttle
+                    .record_failure(&email, source.as_deref(), std::time::Instant::now());
+            }
+            access_error(error, &request_id)
+        }
     }
 }
 
@@ -211,7 +309,7 @@ async fn logout(
         return access_error(error, &request_id);
     }
     let mut response = Json(StatusResponse { status: "ok" }).into_response();
-    clear_session_cookie(response.headers_mut());
+    clear_session_cookie(response.headers_mut(), secure_cookie(&state, &headers));
     response
 }
 
@@ -249,7 +347,7 @@ async fn create_key(
     State(state): State<WorkspaceState>,
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
-    body: Result<Json<NameBody>, JsonRejection>,
+    body: Result<Json<CreateKeyBody>, JsonRejection>,
 ) -> Response {
     let principal = match authenticate(&state.access, &headers).await {
         Ok(principal) => principal,
@@ -264,7 +362,7 @@ async fn create_key(
     }
     match state
         .access
-        .create_personal_key(&principal, &body.name)
+        .create_personal_key(&principal, &body.name, body.scope)
         .await
     {
         Ok(created) => (
@@ -401,17 +499,24 @@ fn bearer_key(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| value.starts_with("phx_"))
 }
 
-fn set_session_cookie(headers: &mut HeaderMap, session_id: &str) {
+/// `Secure` when the operator forces it or the proxy says the request was TLS.
+fn secure_cookie(state: &WorkspaceState, headers: &HeaderMap) -> bool {
+    state.security.secure_cookies || forwarded_https(headers)
+}
+
+pub fn set_session_cookie(headers: &mut HeaderMap, session_id: &str, secure: bool) {
+    let secure = if secure { "; Secure" } else { "" };
     let cookie = format!(
-        "{SESSION_COOKIE}={session_id}; Max-Age={SESSION_MAX_AGE_SECONDS}; Path=/; HttpOnly; SameSite=Lax"
+        "{SESSION_COOKIE}={session_id}; Max-Age={SESSION_MAX_AGE_SECONDS}; Path=/; HttpOnly; SameSite=Lax{secure}"
     );
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         headers.insert(header::SET_COOKIE, value);
     }
 }
 
-fn clear_session_cookie(headers: &mut HeaderMap) {
-    let cookie = format!("{SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
+fn clear_session_cookie(headers: &mut HeaderMap, secure: bool) {
+    let secure = if secure { "; Secure" } else { "" };
+    let cookie = format!("{SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax{secure}");
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         headers.insert(header::SET_COOKIE, value);
     }

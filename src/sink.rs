@@ -1,21 +1,31 @@
 //! Event sink — where accepted events go after the wire edge.
 //!
-//! The production implementation is [`DurableWalSink`]: `append`
-//! returning `Ok` is the durability promise that justifies a 2xx to the
-//! client, so no implementation may ack before its write is durable.
-//! [`MemorySink`] exists for tests and [`LogSink`] for running without
-//! persistence.
+//! The production implementation is [`DurableWalSink`]: `append` returning
+//! `Ok` is the durability promise that justifies a 2xx to the client, so no
+//! implementation may ack before its write is durable. [`MemorySink`] exists
+//! for tests.
+//!
+//! Two threads, two jobs:
+//! - the **writer** drains the bounded request queue, writes every waiting
+//!   batch, pays for one fsync per group, then acks the whole group. It seals
+//!   the active WAL segment once a second so the publisher can read it.
+//! - the **publisher** turns sealed segments into queryable files, compacts
+//!   partitions, and reclaims WAL. It never sits in the ack path: a slow
+//!   publication delays freshness, never an acknowledgement.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as sync_mpsc};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::capture::event::CapturedEvent;
-use crate::pipeline::publication::{PublicationCoordinator, PublicationError};
+use crate::lake::Lake;
+use crate::lake::compactor::Compactor;
+use crate::lake::publisher::{PublishError, Publisher};
 use crate::pipeline::wal::{CapturedBatch, Recovery, WalConfig, WalError, WriteAheadLog};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +45,7 @@ pub struct AuthorizedEventBatch {
     pub historical_migration: bool,
 }
 
+#[allow(clippy::double_must_use)] // async_trait's boxed future is already must_use
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
     async fn append(&self, batch: AuthorizedEventBatch) -> Result<(), SinkError>;
@@ -50,14 +61,20 @@ pub struct MemorySink {
 
 impl MemorySink {
     pub fn snapshot(&self) -> Vec<CapturedEvent> {
-        self.events.lock().unwrap().clone()
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
 #[async_trait::async_trait]
 impl EventSink for MemorySink {
     async fn append(&self, mut batch: AuthorizedEventBatch) -> Result<(), SinkError> {
-        let mut events = self.events.lock().unwrap();
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if events.len() + batch.events.len() > MEMORY_SINK_MAX_EVENTS {
             return Err(SinkError::Retryable);
         }
@@ -66,38 +83,32 @@ impl EventSink for MemorySink {
     }
 }
 
-/// Logs and drops. Only for running without persistence.
-pub struct LogSink;
-
-#[async_trait::async_trait]
-impl EventSink for LogSink {
-    async fn append(&self, batch: AuthorizedEventBatch) -> Result<(), SinkError> {
-        for e in &batch.events {
-            tracing::info!(event = %e.event, distinct_id = %e.distinct_id, "event (log sink, not persisted)");
-        }
-        Ok(())
-    }
-}
-
-const DURABLE_QUEUE_BATCHES: usize = 64;
-const DURABLE_QUEUE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_UNRECLAIMED_WAL_BYTES: u64 = 1024 * 1024 * 1024;
-const GROUP_COMMIT_BYTES: u64 = 8 * 1024 * 1024;
-const GROUP_COMMIT_LATENCY: Duration = Duration::from_millis(2);
-const PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(100);
-const MAX_PUBLICATION_WAL_BYTES: u64 = 32 * 1024 * 1024;
+/// Batches waiting for the writer. Full → 503, which SDKs retry.
+pub const QUEUE_BATCHES: usize = 4096;
+/// Bytes of batches waiting for the writer.
+pub const QUEUE_BYTES: usize = 128 * 1024 * 1024;
+/// One group commit takes at most this many batches…
+pub const GROUP_MAX_BATCHES: usize = 1024;
+/// …or this many encoded bytes.
+pub const GROUP_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Sealed + active WAL may not exceed this; beyond it publication is too far
+/// behind and capture sheds load (503).
+pub const MAX_UNPUBLISHED_WAL_BYTES: u64 = 1024 * 1024 * 1024;
+/// How often the writer seals the active segment for the publisher.
+pub const SEAL_INTERVAL: Duration = Duration::from_millis(1000);
+/// How often the publisher wakes without a seal notification (compaction,
+/// graveyard sweeps, retries).
+pub const PUBLISHER_TICK: Duration = Duration::from_millis(1000);
+/// Longest one steady-state publication call runs before the publisher
+/// thread checks for erasure and shutdown requests.
+pub const PUBLISH_BUDGET: Duration = Duration::from_millis(1500);
 
 #[derive(Debug)]
 pub enum DurablePipelineError {
     Wal(WalError),
-    Publication(PublicationError),
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    MissingProjectBinding {
-        event: uuid::Uuid,
-    },
+    Publish(PublishError),
+    Lake(crate::lake::LakeError),
+    Io { path: PathBuf, source: std::io::Error },
     WorkerPanicked,
 }
 
@@ -105,11 +116,9 @@ impl fmt::Display for DurablePipelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Wal(error) => error.fmt(formatter),
-            Self::Publication(error) => error.fmt(formatter),
+            Self::Publish(error) => error.fmt(formatter),
+            Self::Lake(error) => error.fmt(formatter),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
-            Self::MissingProjectBinding { event } => {
-                write!(formatter, "event {event} has no authorized project binding")
-            }
             Self::WorkerPanicked => formatter.write_str("durable pipeline worker panicked"),
         }
     }
@@ -123,64 +132,225 @@ impl From<WalError> for DurablePipelineError {
     }
 }
 
-impl From<PublicationError> for DurablePipelineError {
-    fn from(error: PublicationError) -> Self {
-        Self::Publication(error)
+impl From<PublishError> for DurablePipelineError {
+    fn from(error: PublishError) -> Self {
+        Self::Publish(error)
     }
 }
 
-enum DurableRequest {
+impl From<crate::lake::LakeError> for DurablePipelineError {
+    fn from(error: crate::lake::LakeError) -> Self {
+        Self::Lake(error)
+    }
+}
+
+/// Freshness and backlog, shared by both threads and read by `/status`.
+#[derive(Debug, Default)]
+pub struct PipelineStats {
+    /// Bytes in sealed, unreclaimed WAL segments (publisher-owned).
+    sealed_bytes: AtomicU64,
+    /// Bytes in the active segment (writer-owned).
+    active_bytes: AtomicU64,
+    /// Receive time (ms) of the first batch in the active segment; 0 if empty.
+    active_oldest_ms: AtomicI64,
+    /// `(segment, receive time of its first batch)` for sealed segments the
+    /// publisher has not fully published yet, oldest first.
+    sealed_oldest: Mutex<std::collections::VecDeque<(u64, i64)>>,
+    acked_events: AtomicU64,
+    published_events: AtomicU64,
+}
+
+impl PipelineStats {
+    /// Seconds between the oldest acknowledged-but-unqueryable batch and now;
+    /// 0 when everything acknowledged is queryable.
+    pub fn lag_seconds(&self) -> f64 {
+        let sealed = self
+            .sealed_oldest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front()
+            .map(|(_, ms)| *ms);
+        let active = Some(self.active_oldest_ms.load(Ordering::Relaxed)).filter(|ms| *ms > 0);
+        let oldest = match (sealed, active) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return 0.0,
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        ((now - oldest).max(0) as f64) / 1000.0
+    }
+
+    pub fn acked_events(&self) -> u64 {
+        self.acked_events.load(Ordering::Relaxed)
+    }
+
+    pub fn published_events(&self) -> u64 {
+        self.published_events.load(Ordering::Relaxed)
+    }
+
+    pub fn unpublished_bytes(&self) -> u64 {
+        self.sealed_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.active_bytes.load(Ordering::Relaxed))
+    }
+
+    fn note_acked(&self, received_ms: i64, events: u64) {
+        self.acked_events.fetch_add(events, Ordering::Relaxed);
+        let _ = self.active_oldest_ms.compare_exchange(
+            0,
+            received_ms.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn note_sealed(&self, segment: u64) {
+        let oldest = self.active_oldest_ms.swap(0, Ordering::Relaxed);
+        if oldest > 0 {
+            self.sealed_oldest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back((segment, oldest));
+        }
+    }
+
+    /// Everything before `checkpoint_segment` is published.
+    fn note_published(&self, events: u64, checkpoint_segment: u64) {
+        self.published_events.fetch_add(events, Ordering::Relaxed);
+        let mut sealed = self
+            .sealed_oldest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while sealed
+            .front()
+            .is_some_and(|(segment, _)| *segment < checkpoint_segment)
+        {
+            sealed.pop_front();
+        }
+    }
+}
+
+enum WriterRequest {
     Append {
         batch: CapturedBatch,
         encoded_bytes: u64,
         _queue_bytes: OwnedSemaphorePermit,
         ack: oneshot::Sender<Result<(), SinkError>>,
     },
+    /// Seal, then hand the erasure to the publisher so it covers every
+    /// event acknowledged before it.
+    Erase {
+        project_id: String,
+        person_id: String,
+        ack: oneshot::Sender<Result<ErasureReport, DurablePipelineError>>,
+    },
     Shutdown {
         ack: oneshot::Sender<Result<(), DurablePipelineError>>,
     },
 }
 
-/// The production capture adapter. A bounded queue feeds one blocking WAL
-/// writer; an append is acknowledged only after the v2 WAL record is fsynced.
+enum PublisherSignal {
+    Sealed,
+    Erase {
+        project_id: String,
+        person_id: String,
+        /// Every segment up to this one was sealed when the request arrived.
+        through_segment: u64,
+        ack: oneshot::Sender<Result<ErasureReport, DurablePipelineError>>,
+    },
+    Shutdown {
+        ack: std::sync::mpsc::SyncSender<Result<(), DurablePipelineError>>,
+    },
+}
+
+/// What a person erasure removed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ErasureReport {
+    pub distinct_ids: usize,
+    pub events: u64,
+}
+
+/// The production capture adapter.
 pub struct DurableWalSink {
-    sender: sync_mpsc::SyncSender<DurableRequest>,
+    sender: sync_mpsc::SyncSender<WriterRequest>,
     queue_bytes: Arc<Semaphore>,
 }
 
 pub struct DurableWalRuntime {
-    sender: sync_mpsc::SyncSender<DurableRequest>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    sender: sync_mpsc::SyncSender<WriterRequest>,
+    writer: Option<std::thread::JoinHandle<()>>,
+    publisher: Option<std::thread::JoinHandle<()>>,
+    stats: Arc<PipelineStats>,
+}
+
+/// Configuration of the durable pipeline.
+pub struct PipelineConfig {
+    pub wal_dir: PathBuf,
+    pub tmp_dir: PathBuf,
+    pub retention_days: Option<u32>,
 }
 
 impl DurableWalSink {
+    /// Recover the WAL, publish everything it holds (so acknowledged events
+    /// are queryable before the server reports ready), then start both
+    /// threads.
     pub fn open(
-        directory: impl AsRef<Path>,
-        coordinator: PublicationCoordinator,
+        config: PipelineConfig,
+        lake: Arc<Lake>,
     ) -> Result<(Arc<Self>, DurableWalRuntime, Recovery), DurablePipelineError> {
-        let directory = directory.as_ref().to_path_buf();
-        let (mut wal, recovery) = WriteAheadLog::open(&directory, WalConfig::default())?;
-        let publisher = PipelinePublisher { coordinator };
-        // Recovery is part of startup, not a detached best-effort task. Any
-        // sealed or recovered active prefix is queryable before readiness.
-        publisher.publish_all(&mut wal)?;
-        let (sender, receiver) = sync_mpsc::sync_channel(DURABLE_QUEUE_BATCHES);
-        let worker = std::thread::Builder::new()
-            .name("hoglet-v2-wal".to_owned())
-            .spawn(move || durable_writer_loop(wal, directory, publisher, receiver))
+        let mut wal_config = WalConfig::default();
+        wal_config.segment_target_bytes = crate::fault::wal_segment_bytes(wal_config.segment_target_bytes);
+        let (mut wal, recovery) = WriteAheadLog::open(&config.wal_dir, wal_config)?;
+        wal.seal()?;
+        let publisher = Publisher::new(lake.clone(), wal.reader());
+        let compactor = Compactor::new(lake, &config.tmp_dir, config.retention_days)?;
+        // Finish an erasure a crash interrupted *before* publishing anything:
+        // the lake then holds only events acknowledged before the erasure.
+        resume_pending_erasures(&publisher, &compactor)?;
+        let recovered = publisher.publish_all()?;
+        if !recovered.is_empty() {
+            tracing::info!(
+                windows = recovered.len(),
+                events = recovered.iter().map(|p| p.events).sum::<usize>(),
+                "published recovered WAL records"
+            );
+        }
+        let stats = Arc::new(PipelineStats::default());
+        stats.sealed_bytes.store(
+            wal.reader().sealed_bytes().unwrap_or(0),
+            Ordering::Relaxed,
+        );
+
+        let (signal_tx, signal_rx) = sync_mpsc::sync_channel(64);
+        let publisher_stats = stats.clone();
+        let publisher_thread = std::thread::Builder::new()
+            .name("hoglet-publisher".to_owned())
+            .spawn(move || publisher_loop(publisher, compactor, signal_rx, publisher_stats))
             .map_err(|source| DurablePipelineError::Io {
-                path: PathBuf::from("<hoglet-v2-wal-thread>"),
+                path: PathBuf::from("<hoglet-publisher-thread>"),
                 source,
             })?;
-        let queue_bytes = Arc::new(Semaphore::new(DURABLE_QUEUE_BYTES));
+
+        let (sender, receiver) = sync_mpsc::sync_channel(QUEUE_BATCHES);
+        let writer_stats = stats.clone();
+        let writer_thread = std::thread::Builder::new()
+            .name("hoglet-wal-writer".to_owned())
+            .spawn(move || writer_loop(wal, receiver, signal_tx, writer_stats))
+            .map_err(|source| DurablePipelineError::Io {
+                path: PathBuf::from("<hoglet-wal-writer-thread>"),
+                source,
+            })?;
+
         Ok((
             Arc::new(Self {
                 sender: sender.clone(),
-                queue_bytes,
+                queue_bytes: Arc::new(Semaphore::new(QUEUE_BYTES)),
             }),
             DurableWalRuntime {
                 sender,
-                worker: Some(worker),
+                writer: Some(writer_thread),
+                publisher: Some(publisher_thread),
+                stats,
             },
             recovery,
         ))
@@ -196,10 +366,17 @@ impl EventSink for DurableWalSink {
             batch.historical_migration,
         )
         .map_err(|_| SinkError::Fatal)?;
-        let encoded_bytes = serde_json::to_vec(&batch)
-            .map_err(|_| SinkError::Fatal)?
-            .len();
-        let permits = u32::try_from(encoded_bytes).map_err(|_| SinkError::Fatal)?;
+        // Cheap upper bound for queue accounting; the WAL encodes for real.
+        let encoded_bytes: usize = batch
+            .events
+            .iter()
+            .map(|event| {
+                256 + event.event.len()
+                    + event.distinct_id.len()
+                    + event.properties.len() * 64
+            })
+            .sum();
+        let permits = u32::try_from(encoded_bytes.min(QUEUE_BYTES)).map_err(|_| SinkError::Fatal)?;
         let queue_bytes = self
             .queue_bytes
             .clone()
@@ -207,7 +384,7 @@ impl EventSink for DurableWalSink {
             .map_err(|_| SinkError::Retryable)?;
         let (ack, receive) = oneshot::channel();
         self.sender
-            .try_send(DurableRequest::Append {
+            .try_send(WriterRequest::Append {
                 batch,
                 encoded_bytes: encoded_bytes as u64,
                 _queue_bytes: queue_bytes,
@@ -219,12 +396,23 @@ impl EventSink for DurableWalSink {
 }
 
 impl DurableWalRuntime {
+    pub fn stats(&self) -> Arc<PipelineStats> {
+        self.stats.clone()
+    }
+
+    /// A cloneable handle for erasure requests.
+    pub fn eraser(&self) -> Eraser {
+        Eraser {
+            writer: self.sender.clone(),
+        }
+    }
+
+    /// Stop accepting, flush and fsync, publish everything, then stop.
     pub async fn shutdown(mut self) -> Result<(), DurablePipelineError> {
         let (ack, receive) = oneshot::channel();
         let sender = self.sender.clone();
         let sent =
-            tokio::task::spawn_blocking(move || sender.send(DurableRequest::Shutdown { ack }))
-                .await;
+            tokio::task::spawn_blocking(move || sender.send(WriterRequest::Shutdown { ack })).await;
         let result = if matches!(sent, Ok(Ok(()))) {
             receive
                 .await
@@ -232,182 +420,387 @@ impl DurableWalRuntime {
         } else {
             Err(DurablePipelineError::WorkerPanicked)
         };
-        if let Some(worker) = self.worker.take()
-            && !matches!(
-                tokio::task::spawn_blocking(move || worker.join()).await,
+        for handle in [self.writer.take(), self.publisher.take()].into_iter().flatten() {
+            if !matches!(
+                tokio::task::spawn_blocking(move || handle.join()).await,
                 Ok(Ok(()))
-            )
-        {
-            return Err(DurablePipelineError::WorkerPanicked);
+            ) {
+                return Err(DurablePipelineError::WorkerPanicked);
+            }
         }
         result
     }
 }
 
-fn durable_writer_loop(
+/// Requests physical erasure of a person, serialized with publication and
+/// compaction on the publisher thread.
+#[derive(Clone)]
+pub struct Eraser {
+    writer: sync_mpsc::SyncSender<WriterRequest>,
+}
+
+impl Eraser {
+    /// Publish everything acknowledged so far, then remove the person, their
+    /// distinct ids, and every stored event of those distinct ids.
+    pub async fn erase_person(
+        &self,
+        project_id: &str,
+        person_id: &str,
+    ) -> Result<ErasureReport, DurablePipelineError> {
+        let (ack, receive) = oneshot::channel();
+        self.writer
+            .try_send(WriterRequest::Erase {
+                project_id: project_id.to_owned(),
+                person_id: person_id.to_owned(),
+                ack,
+            })
+            .map_err(|_| DurablePipelineError::WorkerPanicked)?;
+        receive
+            .await
+            .unwrap_or(Err(DurablePipelineError::WorkerPanicked))
+    }
+}
+
+struct Pending {
+    ack: oneshot::Sender<Result<(), SinkError>>,
+    result: Result<(), SinkError>,
+    events: u64,
+    received_ms: i64,
+    _queue_bytes: OwnedSemaphorePermit,
+}
+
+fn writer_loop(
     mut wal: WriteAheadLog,
-    directory: PathBuf,
-    publisher: PipelinePublisher,
-    receiver: sync_mpsc::Receiver<DurableRequest>,
+    receiver: sync_mpsc::Receiver<WriterRequest>,
+    publisher: sync_mpsc::SyncSender<PublisherSignal>,
+    stats: Arc<PipelineStats>,
 ) {
-    let mut unpublished_bytes = 0_u64;
-    let mut publish_deadline: Option<Instant> = None;
-    let mut retrying_publication = false;
+    let mut last_seal = Instant::now();
+    let mut shutdown_ack = None;
     loop {
-        let request = match publish_deadline {
-            Some(deadline) => {
-                receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            }
-            None => receiver
-                .recv()
-                .map_err(|_| sync_mpsc::RecvTimeoutError::Disconnected),
+        let wait = SEAL_INTERVAL.saturating_sub(last_seal.elapsed());
+        let first = match receiver.recv_timeout(wait) {
+            Ok(request) => Some(request),
+            Err(sync_mpsc::RecvTimeoutError::Timeout) => None,
+            Err(sync_mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        match request {
-            Ok(DurableRequest::Append {
-                batch,
-                encoded_bytes,
-                _queue_bytes,
+
+        let mut group: Vec<Pending> = Vec::new();
+        let mut erasures = Vec::new();
+        let mut group_bytes = 0_u64;
+        let mut next = first;
+        while let Some(request) = next.take() {
+            match request {
+                WriterRequest::Append {
+                    batch,
+                    encoded_bytes,
+                    _queue_bytes,
+                    ack,
+                } => {
+                    let unpublished = stats
+                        .sealed_bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_add(wal.active_bytes());
+                    let result = if unpublished.saturating_add(encoded_bytes)
+                        > MAX_UNPUBLISHED_WAL_BYTES
+                    {
+                        Err(SinkError::Retryable)
+                    } else {
+                        wal.write(&batch).map(|_| ()).map_err(map_wal_error)
+                    };
+                    group_bytes = group_bytes.saturating_add(encoded_bytes);
+                    group.push(Pending {
+                        ack,
+                        result,
+                        events: batch.events.len() as u64,
+                        received_ms: batch.received_at_ms,
+                        _queue_bytes,
+                    });
+                }
+                WriterRequest::Erase {
+                    project_id,
+                    person_id,
+                    ack,
+                } => {
+                    erasures.push((project_id, person_id, ack));
+                }
+                WriterRequest::Shutdown { ack } => {
+                    shutdown_ack = Some(ack);
+                    break;
+                }
+            }
+            if group.len() >= GROUP_MAX_BATCHES || group_bytes >= GROUP_MAX_BYTES {
+                break;
+            }
+            next = receiver.try_recv().ok();
+        }
+
+        if !group.is_empty() {
+            // One fsync makes the whole group durable; nobody is acked before.
+            let synced = wal.sync().map_err(map_wal_error);
+            crate::fault::hit("sink.after_fsync_before_ack");
+            for pending in group {
+                let result = pending.result.and(synced);
+                if result.is_ok() {
+                    stats.note_acked(pending.received_ms, pending.events);
+                }
+                let _ = pending.ack.send(result);
+            }
+            stats
+                .active_bytes
+                .store(wal.active_bytes(), Ordering::Relaxed);
+        }
+
+        if shutdown_ack.is_some() {
+            break;
+        }
+        if !erasures.is_empty() || last_seal.elapsed() >= SEAL_INTERVAL {
+            last_seal = Instant::now();
+            if wal.active_bytes() > 0 {
+                let before = wal.active_bytes();
+                match wal.seal() {
+                    Ok(next) => {
+                        stats.sealed_bytes.fetch_add(before, Ordering::Relaxed);
+                        stats.active_bytes.store(0, Ordering::Relaxed);
+                        stats.note_sealed(next.segment.saturating_sub(1));
+                        let _ = publisher.try_send(PublisherSignal::Sealed);
+                    }
+                    Err(error) => tracing::error!(%error, "sealing the WAL segment failed"),
+                }
+            }
+        }
+        let through_segment = wal.active_segment().saturating_sub(1);
+        for (project_id, person_id, ack) in erasures {
+            if let Err(sync_mpsc::TrySendError::Full(PublisherSignal::Erase { ack, .. })
+            | sync_mpsc::TrySendError::Disconnected(PublisherSignal::Erase { ack, .. })) =
+                publisher.try_send(PublisherSignal::Erase {
+                    project_id,
+                    person_id,
+                    through_segment,
+                    ack,
+                })
+            {
+                let _ = ack.send(Err(DurablePipelineError::WorkerPanicked));
+            }
+        }
+    }
+
+    // Drain: seal what was written, then let the publisher finish.
+    let sealed = wal
+        .seal()
+        .map(|next| stats.note_sealed(next.segment.saturating_sub(1)))
+        .map_err(DurablePipelineError::from);
+    let (done_tx, done_rx) = sync_mpsc::sync_channel(1);
+    let published = if publisher
+        .send(PublisherSignal::Shutdown { ack: done_tx })
+        .is_ok()
+    {
+        done_rx
+            .recv()
+            .unwrap_or(Err(DurablePipelineError::WorkerPanicked))
+    } else {
+        Err(DurablePipelineError::WorkerPanicked)
+    };
+    if let Some(ack) = shutdown_ack {
+        let _ = ack.send(sealed.and(published));
+    }
+}
+
+fn publisher_loop(
+    publisher: Publisher,
+    compactor: Compactor,
+    signals: sync_mpsc::Receiver<PublisherSignal>,
+    stats: Arc<PipelineStats>,
+) {
+    let mut last_maintenance = Instant::now();
+    // Sealed WAL is still waiting after a budgeted publication: come back
+    // immediately (after checking for requests) instead of sleeping a tick.
+    let mut backlog = false;
+    loop {
+        let wait = if backlog { Duration::ZERO } else { PUBLISHER_TICK };
+        let shutdown = match signals.recv_timeout(wait) {
+            Ok(PublisherSignal::Sealed) | Err(sync_mpsc::RecvTimeoutError::Timeout) => None,
+            Ok(PublisherSignal::Erase {
+                project_id,
+                person_id,
+                through_segment,
                 ack,
             }) => {
-                let result = wal_directory_bytes(&directory)
-                    .and_then(|bytes| {
-                        if bytes.saturating_add(encoded_bytes) > MAX_UNRECLAIMED_WAL_BYTES {
-                            Err(std::io::Error::other("unreclaimed WAL limit reached"))
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .map_err(|_| SinkError::Retryable)
-                    .and_then(|()| wal.append(batch).map(|_| ()).map_err(map_wal_error));
-                drop(_queue_bytes);
-                let appended = result.is_ok();
+                // An earlier erasure that failed part-way is finished first,
+                // before anything newer is published.
+                let result = resume_pending_erasures(&publisher, &compactor)
+                    .and_then(|()| publish_and_account(&publisher, &stats, Publish::Through(through_segment)).map(|_| ()))
+                    .and_then(|()| erase(&publisher, &compactor, &project_id, &person_id));
                 let _ = ack.send(result);
-                if appended {
-                    unpublished_bytes = unpublished_bytes.saturating_add(encoded_bytes);
-                    publish_deadline.get_or_insert_with(|| Instant::now() + GROUP_COMMIT_LATENCY);
-                }
-                let publication_due =
-                    publish_deadline.is_some_and(|deadline| Instant::now() >= deadline);
-                if (!retrying_publication && unpublished_bytes >= GROUP_COMMIT_BYTES)
-                    || publication_due
-                {
-                    if publish_or_log(&publisher, &mut wal) {
-                        unpublished_bytes = 0;
-                        publish_deadline = None;
-                        retrying_publication = false;
-                    } else {
-                        unpublished_bytes = 0;
-                        publish_deadline = Some(Instant::now() + PUBLICATION_RETRY_DELAY);
-                        retrying_publication = true;
+                continue;
+            }
+            Ok(PublisherSignal::Shutdown { ack }) => Some(ack),
+            Err(sync_mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+
+        let published = if shutdown.is_some() {
+            publish_and_account(&publisher, &stats, Publish::All)
+        } else {
+            publish_and_account(&publisher, &stats, Publish::Budget(PUBLISH_BUDGET))
+        };
+        if let Some(ack) = shutdown {
+            let _ = ack.send(published.map(|_| ()));
+            return;
+        }
+        backlog = matches!(published, Ok(true));
+        if let Err(error) = published {
+            tracing::error!(%error, "event publication failed; the WAL keeps the events and will retry");
+            continue;
+        }
+
+        // Maintenance between publications: bounded steps, freshness first.
+        if last_maintenance.elapsed() >= PUBLISHER_TICK {
+            last_maintenance = Instant::now();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                match compactor.step() {
+                    Ok(Some(done)) => tracing::debug!(
+                        project = %done.project_id,
+                        day = %done.day,
+                        files = done.input_files,
+                        rows = done.output_rows,
+                        "compacted partition"
+                    ),
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::error!(%error, "compaction failed; it will be retried");
+                        break;
                     }
                 }
             }
-            Ok(DurableRequest::Shutdown { ack }) => {
-                let result = publisher.publish_all(&mut wal);
-                let _ = ack.send(result);
-                break;
-            }
-            Err(sync_mpsc::RecvTimeoutError::Timeout) => {
-                if publish_or_log(&publisher, &mut wal) {
-                    unpublished_bytes = 0;
-                    publish_deadline = None;
-                    retrying_publication = false;
-                } else {
-                    unpublished_bytes = 0;
-                    publish_deadline = Some(Instant::now() + PUBLICATION_RETRY_DELAY);
-                    retrying_publication = true;
-                }
-            }
-            Err(sync_mpsc::RecvTimeoutError::Disconnected) => {
-                if let Err(error) = publisher.publish_all(&mut wal) {
-                    tracing::error!(%error, "durable pipeline shutdown publication failed");
-                }
-                break;
-            }
+            publisher.lake().sweep_graveyard();
         }
     }
 }
 
-struct PipelinePublisher {
-    coordinator: PublicationCoordinator,
+/// Remove the events of every person whose identity was erased but whose
+/// event files were not rewritten yet (a crash, or a failure, in between).
+fn resume_pending_erasures(
+    publisher: &Publisher,
+    compactor: &Compactor,
+) -> Result<(), DurablePipelineError> {
+    let pending = {
+        let connection = publisher.lake().lock_connection()?;
+        crate::projections::pending_erasures(&connection)
+            .map_err(|error| DurablePipelineError::Publish(error.into()))?
+    };
+    for (project_id, distinct_ids) in pending {
+        let events = compactor.erase(&project_id, &distinct_ids)?;
+        clear_pending(publisher, &project_id, &distinct_ids)?;
+        tracing::warn!(
+            distinct_ids = distinct_ids.len(),
+            events,
+            "completed an erasure that was interrupted"
+        );
+    }
+    Ok(())
 }
 
-impl PipelinePublisher {
-    fn publish_all(&self, wal: &mut WriteAheadLog) -> Result<(), DurablePipelineError> {
-        loop {
-            if self.publish_one(wal)? == 0 {
-                return Ok(());
-            }
-        }
-    }
-
-    fn publish_one(&self, wal: &mut WriteAheadLog) -> Result<usize, DurablePipelineError> {
-        wal.seal()?;
-        // Retry any cleanup that failed after an earlier committed generation
-        // before deciding whether new records are pending.
-        wal.reclaim_through(self.coordinator.checkpoint()?)?;
-        match self
-            .coordinator
-            .publish_pending(wal, MAX_PUBLICATION_WAL_BYTES)
-        {
-            Ok(Some(result)) => {
-                tracing::debug!(
-                    generation_id = result.generation_id.get(),
-                    events = result.applied_events,
-                    duplicates = result.duplicate_events,
-                    "published v2 event generation"
-                );
-                Ok(result.published_records)
-            }
-            Ok(None) => Ok(0),
-            Err(PublicationError::ReclamationAfterCommit {
-                generation_id,
-                checkpoint,
-                source,
-            }) => {
-                // The generation and checkpoint are already authoritative.
-                // Retaining extra WAL is safe and the next pass can reclaim it.
-                tracing::warn!(
-                    generation_id = generation_id.get(),
-                    segment = checkpoint.segment,
-                    byte_offset = checkpoint.byte_offset,
-                    %source,
-                    "generation committed but WAL reclamation will be retried"
-                );
-                wal.reclaim_through(checkpoint)?;
-                Ok(1)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
+fn clear_pending(
+    publisher: &Publisher,
+    project_id: &str,
+    distinct_ids: &[String],
+) -> Result<(), DurablePipelineError> {
+    let connection = publisher.lake().lock_connection()?;
+    crate::projections::clear_pending_erasures(&connection, project_id, distinct_ids)
+        .map_err(|error| DurablePipelineError::Publish(error.into()))
 }
 
-fn publish_or_log(publisher: &PipelinePublisher, wal: &mut WriteAheadLog) -> bool {
-    match publisher.publish_all(wal) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::error!(%error, "event generation publication failed; durable WAL will be retried");
-            false
-        }
-    }
+fn erase(
+    publisher: &Publisher,
+    compactor: &Compactor,
+    project_id: &str,
+    person_id: &str,
+) -> Result<ErasureReport, DurablePipelineError> {
+    let distinct_ids = {
+        let mut connection = publisher.lake().lock_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| DurablePipelineError::Lake(error.into()))?;
+        let ids = crate::projections::erase_person(&transaction, project_id, person_id)
+            .map_err(|error| DurablePipelineError::Publish(error.into()))?;
+        crate::fault::hit("erase.before_sqlite_commit");
+        transaction
+            .commit()
+            .map_err(|error| DurablePipelineError::Lake(error.into()))?;
+        ids
+    };
+    crate::fault::hit("erase.after_sqlite_commit");
+    let events = compactor.erase(project_id, &distinct_ids)?;
+    clear_pending(publisher, project_id, &distinct_ids)?;
+    tracing::info!(
+        distinct_ids = distinct_ids.len(),
+        events,
+        "erased a person and their events"
+    );
+    Ok(ErasureReport {
+        distinct_ids: distinct_ids.len(),
+        events,
+    })
 }
 
-fn wal_directory_bytes(directory: &Path) -> std::io::Result<u64> {
-    let mut bytes = 0_u64;
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            bytes = bytes.saturating_add(entry.metadata()?.len());
+/// Publish what is sealed (everything, or only through `through_segment`) and
+/// update the freshness counters.
+enum Publish {
+    /// Everything sealed (startup, shutdown).
+    All,
+    /// Everything sealed when an erasure was requested.
+    Through(u64),
+    /// Steady state: bounded work per call.
+    Budget(Duration),
+}
+
+/// Returns whether sealed WAL is still waiting (only `Budget` can leave some).
+fn publish_and_account(
+    publisher: &Publisher,
+    stats: &PipelineStats,
+    mode: Publish,
+) -> Result<bool, DurablePipelineError> {
+    let started = Instant::now();
+    let mut more = false;
+    let published = match mode {
+        Publish::Through(segment) => publisher.publish_through(segment)?,
+        Publish::All => publisher.publish_all()?,
+        Publish::Budget(budget) => {
+            let (published, pending) = publisher.publish_for(budget)?;
+            more = pending;
+            published
+        }
+    };
+    let events: usize = published.iter().map(|p| p.events).sum();
+    if events > 0 {
+        let elapsed = started.elapsed();
+        let files: usize = published.iter().map(|p| p.files).sum();
+        if elapsed > Duration::from_secs(1) {
+            tracing::info!(events, files, elapsed_ms = elapsed.as_millis() as u64, "slow publication");
+        } else {
+            tracing::debug!(events, files, elapsed_ms = elapsed.as_millis() as u64, "published");
         }
     }
-    Ok(bytes)
+    let checkpoint = publisher.checkpoint()?;
+    stats.sealed_bytes.store(
+        publisher.wal_reader().sealed_bytes().unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    stats.note_published(events as u64, checkpoint.segment);
+    Ok(more)
 }
 
 fn map_wal_error(error: WalError) -> SinkError {
     match error {
-        WalError::EmptyBatch
-        | WalError::InvalidProjectBinding
-        | WalError::RecordTooLarge { .. } => SinkError::Fatal,
+        WalError::EmptyBatch | WalError::InvalidProjectBinding | WalError::RecordTooLarge { .. } => {
+            SinkError::Fatal
+        }
         _ => SinkError::Retryable,
     }
+}
+
+/// For callers that only need the WAL directory path rules.
+pub fn wal_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("wal")
 }

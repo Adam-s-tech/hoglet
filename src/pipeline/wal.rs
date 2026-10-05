@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,10 @@ pub struct CapturedBatch {
     project_ids_by_token: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "is_false")]
     historical_migration: bool,
+    /// When capture accepted the batch (ms since epoch). Publication uses it
+    /// to report how far behind queryable data is.
+    #[serde(default)]
+    pub received_at_ms: i64,
 }
 
 impl CapturedBatch {
@@ -43,6 +47,7 @@ impl CapturedBatch {
             events,
             project_ids_by_token: BTreeMap::new(),
             historical_migration: false,
+            received_at_ms: 0,
         })
     }
 
@@ -69,11 +74,20 @@ impl CapturedBatch {
             events,
             project_ids_by_token,
             historical_migration,
+            received_at_ms: chrono::Utc::now().timestamp_millis(),
         })
     }
 
     pub fn event_count(&self) -> usize {
         self.events.len()
+    }
+
+    /// Project of every event, in order; `None` if any event is unbound.
+    pub fn project_ids(&self) -> Option<Vec<String>> {
+        self.events
+            .iter()
+            .map(|event| self.project_id_for(event).map(str::to_owned))
+            .collect()
     }
 
     pub fn project_id_for(&self, event: &CapturedEvent) -> Option<&str> {
@@ -264,6 +278,7 @@ impl WriteAheadLog {
                 let scan = scan_segment(path, *sequence, config.max_record_bytes, true)?;
                 let mut file = OpenOptions::new().read(true).write(true).open(path)?;
                 file.seek(SeekFrom::Start(scan.valid_bytes))?;
+                crate::fault::wal_synced(scan.valid_bytes);
                 (
                     ActiveSegment {
                         sequence: *sequence,
@@ -297,6 +312,15 @@ impl WriteAheadLog {
     /// Serialize, frame, write, and fsync one batch before returning its
     /// durable byte span.
     pub fn append(&mut self, batch: CapturedBatch) -> Result<WalReceipt, WalError> {
+        let receipt = self.write(&batch)?;
+        self.sync()?;
+        Ok(receipt)
+    }
+
+    /// Frame and write one batch without fsync. The receipt is not a
+    /// durability promise until a later [`Self::sync`] returns `Ok`; group
+    /// commit writes many records and pays for one fsync.
+    pub fn write(&mut self, batch: &CapturedBatch) -> Result<WalReceipt, WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
@@ -304,7 +328,7 @@ impl WriteAheadLog {
             return Err(WalError::EmptyBatch);
         }
         let event_count = batch.event_count();
-        let payload = serde_json::to_vec(&batch)?;
+        let payload = serde_json::to_vec(batch)?;
         if payload.len() > self.config.max_record_bytes {
             return Err(WalError::RecordTooLarge {
                 actual: payload.len(),
@@ -320,11 +344,7 @@ impl WriteAheadLog {
 
         let start = WalCursor::new(self.active.sequence, self.active.bytes);
         let frame = encode_frame(&payload);
-        if let Err(error) = self.active.file.write_all(&frame) {
-            self.poisoned = true;
-            return Err(error.into());
-        }
-        if let Err(error) = self.active.file.sync_all() {
+        if let Err(error) = crate::fault::wal_write(&mut self.active.file, &frame) {
             self.poisoned = true;
             return Err(error.into());
         }
@@ -337,6 +357,44 @@ impl WriteAheadLog {
             },
             event_count,
         })
+    }
+
+    /// Make every written record durable. A failure poisons the log: the
+    /// kernel may have dropped dirty pages, so no later write can be trusted.
+    pub fn sync(&mut self) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        crate::fault::wal_before_sync(&self.active.file);
+        if crate::fault::mutant("skip_fsync") {
+            return Ok(());
+        }
+        if let Err(error) = crate::fault::io("wal.sync").and_then(|()| self.active.file.sync_data())
+        {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        crate::fault::wal_synced(self.active.bytes);
+        Ok(())
+    }
+
+    /// Bytes in the active (unsealed) segment.
+    pub fn active_bytes(&self) -> u64 {
+        self.active.bytes
+    }
+
+    /// Sequence number of the active segment; every earlier one is sealed.
+    pub fn active_segment(&self) -> u64 {
+        self.active.sequence
+    }
+
+    /// A read/reclaim handle for the publisher thread. It only ever touches
+    /// sealed segments, which the writer never modifies again.
+    pub fn reader(&self) -> WalReader {
+        WalReader {
+            directory: self.directory.clone(),
+            config: self.config,
+        }
     }
 
     /// Make the current non-empty segment immutable and start a new active
@@ -380,51 +438,33 @@ impl WriteAheadLog {
     /// exactly its validated EOF; a partial-segment checkpoint never removes
     /// that segment.
     pub fn reclaim_through(&self, checkpoint: WalCursor) -> Result<Vec<u64>, WalError> {
-        let layout = discover_segment_layout(&self.directory)?;
-        let validated = validate_cursor(&layout, checkpoint, self.config.max_record_bytes)?;
-        let mut reclaim = Vec::new();
-        for (sequence, path) in layout.sealed {
-            if sequence > checkpoint.segment {
-                break;
-            }
-            let covered = sequence < checkpoint.segment
-                || (sequence == checkpoint.segment
-                    && checkpoint.byte_offset == validated.valid_bytes);
-            if covered {
-                if sequence != checkpoint.segment {
-                    scan_segment(&path, sequence, self.config.max_record_bytes, false)?;
-                }
-                reclaim.push((sequence, path));
-            }
-        }
-        for (_, path) in &reclaim {
-            std::fs::remove_file(path)?;
-        }
-        if !reclaim.is_empty() {
-            sync_directory(&self.directory)?;
-        }
-        Ok(reclaim.into_iter().map(|(sequence, _)| sequence).collect())
+        reclaim_through(&self.directory, self.config, checkpoint)
     }
 
     fn seal_nonempty(&mut self) -> Result<(), WalError> {
-        if let Err(error) = self.active.file.sync_all() {
+        if let Err(error) = crate::fault::io("wal.seal.sync").and_then(|()| self.active.file.sync_all())
+        {
             self.poisoned = true;
             return Err(error.into());
         }
+        crate::fault::hit("wal.seal.before_rename");
         let sealed = sealed_path(&self.directory, self.active.sequence);
-        if let Err(error) = std::fs::rename(&self.active.path, sealed) {
+        if let Err(error) = std::fs::rename(&self.active.path, &sealed) {
             self.poisoned = true;
             return Err(error.into());
         }
+        crate::fault::after_rename("wal.seal.after_rename", &self.active.path, &sealed);
         if let Err(error) = sync_directory(&self.directory) {
             self.poisoned = true;
             return Err(error);
         }
+        crate::fault::hit("wal.seal.after_dirsync");
         let next = self
             .active
             .sequence
             .checked_add(1)
             .ok_or(WalError::InvalidConfig)?;
+        crate::fault::wal_synced(0);
         self.active = match open_new_active(&self.directory, next) {
             Ok(active) => active,
             Err(error) => {
@@ -433,6 +473,51 @@ impl WriteAheadLog {
             }
         };
         Ok(())
+    }
+}
+
+/// Read-only view of sealed WAL segments plus reclamation, owned by the
+/// publisher thread while the writer thread keeps appending.
+#[derive(Debug, Clone)]
+pub struct WalReader {
+    directory: PathBuf,
+    config: WalConfig,
+}
+
+impl WalReader {
+    /// Stream at most `max_bytes` of whole sealed records from `cursor`.
+    pub fn read_window(
+        &self,
+        cursor: WalCursor,
+        max_bytes: u64,
+    ) -> Result<PublicationWindow, WalError> {
+        if max_bytes == 0 {
+            return Err(WalError::InvalidConfig);
+        }
+        Ok(PublicationWindow {
+            records: SealedRecords::open(&self.directory, cursor, self.config.max_record_bytes)?,
+            checkpoint: cursor,
+            max_bytes,
+            framed_bytes: 0,
+            finished: false,
+        })
+    }
+
+    /// Remove sealed segments wholly covered by a committed checkpoint.
+    pub fn reclaim_through(&self, checkpoint: WalCursor) -> Result<Vec<u64>, WalError> {
+        reclaim_through(&self.directory, self.config, checkpoint)
+    }
+
+    /// Bytes held by sealed segments that are not yet reclaimed.
+    pub fn sealed_bytes(&self) -> Result<u64, WalError> {
+        retry_layout_race(|| {
+            let layout = discover_segment_layout(&self.directory)?;
+            let mut bytes = 0_u64;
+            for (_, path) in layout.sealed {
+                bytes = bytes.saturating_add(std::fs::metadata(&path)?.len());
+            }
+            Ok(bytes)
+        })
     }
 }
 
@@ -461,12 +546,24 @@ impl SealedRecords {
         cursor: WalCursor,
         max_record_bytes: usize,
     ) -> Result<Self, WalError> {
+        retry_layout_race(|| Self::open_once(directory, cursor, max_record_bytes))
+    }
+
+    fn open_once(
+        directory: &Path,
+        cursor: WalCursor,
+        max_record_bytes: usize,
+    ) -> Result<Self, WalError> {
         let layout = discover_segment_layout(directory)?;
         validate_cursor(&layout, cursor, max_record_bytes)?;
         let terminal_cursor = layout
             .active
             .as_ref()
-            .map(|(sequence, _)| WalCursor::new(*sequence, 0));
+            .map(|(sequence, _)| WalCursor::new(*sequence, 0))
+            // The writer is between renaming a full segment and creating the
+            // next one: the checkpoint must still name the segment that is
+            // about to exist, never the end of one reclamation will delete.
+            .or_else(|| layout.next_segment_cursor());
         let segments = layout
             .sealed
             .into_iter()
@@ -627,6 +724,43 @@ impl Iterator for PublicationWindow {
     }
 }
 
+fn reclaim_through(
+    directory: &Path,
+    config: WalConfig,
+    checkpoint: WalCursor,
+) -> Result<Vec<u64>, WalError> {
+    retry_layout_race(|| reclaim_through_once(directory, config, checkpoint))
+}
+
+fn reclaim_through_once(
+    directory: &Path,
+    config: WalConfig,
+    checkpoint: WalCursor,
+) -> Result<Vec<u64>, WalError> {
+    let layout = discover_segment_layout(directory)?;
+    let validated = validate_cursor(&layout, checkpoint, config.max_record_bytes)?;
+    let mut reclaim = Vec::new();
+    for (sequence, path) in layout.sealed {
+        if sequence > checkpoint.segment {
+            break;
+        }
+        let covered = sequence < checkpoint.segment
+            || (sequence == checkpoint.segment
+                && checkpoint.byte_offset == validated.valid_bytes);
+        if covered {
+            reclaim.push((sequence, path));
+        }
+    }
+    for (_, path) in &reclaim {
+        std::fs::remove_file(path)?;
+        crate::fault::hit("wal.reclaim.after_remove");
+    }
+    if !reclaim.is_empty() {
+        sync_directory(directory)?;
+    }
+    Ok(reclaim.into_iter().map(|(sequence, _)| sequence).collect())
+}
+
 fn encode_frame(payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(RECORD_HEADER_BYTES + payload.len());
     frame.extend_from_slice(&RECORD_MAGIC);
@@ -731,7 +865,16 @@ fn scan_segment(
         file.seek(SeekFrom::Start(offset))?;
         let mut header = [0_u8; RECORD_HEADER_BYTES];
         file.read_exact(&mut header)?;
-        validate_header(&header, sequence, offset)?;
+        if let Err(error) = validate_header(&header, sequence, offset) {
+            // After power loss a file can end in zero-filled blocks whose
+            // size was persisted before their data: that is a torn tail, not
+            // damage to anything acknowledged.
+            if repair_final_tail && is_zero_tail(&mut file, offset, file_bytes)? {
+                truncated_tail = true;
+                break;
+            }
+            return Err(error);
+        }
         let length = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
         if length > max_record_bytes {
             return Err(corruption(sequence, offset, "record length exceeds limit"));
@@ -753,11 +896,24 @@ fn scan_segment(
         let expected_crc = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
         let mut payload = vec![0; length];
         file.read_exact(&mut payload)?;
+        // A bad final record is a torn write (its length landed, its payload
+        // did not); a bad record with valid data after it is real damage.
+        let final_record = frame_end == file_bytes;
         if crc32fast::hash(&payload) != expected_crc {
+            if repair_final_tail && final_record {
+                truncated_tail = true;
+                break;
+            }
             return Err(corruption(sequence, offset, "record checksum mismatch"));
         }
-        let batch: CapturedBatch = serde_json::from_slice(&payload)
-            .map_err(|_| corruption(sequence, offset, "invalid captured batch payload"))?;
+        let batch: CapturedBatch = match serde_json::from_slice(&payload) {
+            Ok(batch) => batch,
+            Err(_) if repair_final_tail && final_record => {
+                truncated_tail = true;
+                break;
+            }
+            Err(_) => return Err(corruption(sequence, offset, "invalid captured batch payload")),
+        };
         if batch.events.is_empty() {
             return Err(corruption(sequence, offset, "empty captured batch"));
         }
@@ -765,6 +921,7 @@ fn scan_segment(
     }
 
     if truncated_tail {
+        keep_torn_tail(&mut file, path, offset, file_bytes);
         file.set_len(offset)?;
         file.sync_all()?;
     }
@@ -772,6 +929,46 @@ fn scan_segment(
         valid_bytes: offset,
         truncated_tail,
     })
+}
+
+/// Whether every byte from `from` to `to` is zero.
+fn is_zero_tail(file: &mut File, from: u64, to: u64) -> Result<bool, WalError> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = to.saturating_sub(from);
+    while remaining > 0 {
+        let take = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..take])?;
+        if buffer[..take].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        remaining -= take as u64;
+    }
+    Ok(true)
+}
+
+/// Best effort: keep the bytes recovery is about to drop next to the
+/// segment, for forensics. Torn tails were never acknowledged, so failure
+/// to save them never blocks recovery.
+fn keep_torn_tail(file: &mut File, path: &Path, from: u64, to: u64) {
+    const MAX_KEPT_BYTES: u64 = 8 * 1024 * 1024;
+    if to <= from {
+        return;
+    }
+    let keep = (to - from).min(MAX_KEPT_BYTES) as usize;
+    let mut bytes = vec![0_u8; keep];
+    let saved = file
+        .seek(SeekFrom::Start(from))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .and_then(|()| std::fs::write(path.with_extension("torn"), &bytes));
+    if saved.is_err() {
+        return;
+    }
+    tracing::warn!(
+        segment = %path.display(),
+        dropped_bytes = to - from,
+        "dropped an unacknowledged torn tail while recovering the WAL"
+    );
 }
 
 fn validate_header(
@@ -812,13 +1009,60 @@ struct SegmentLayout {
     active: Option<(u64, PathBuf)>,
 }
 
+impl SegmentLayout {
+    /// Start of the segment the writer creates next, while it is mid-seal
+    /// (sealed segments exist, no active one yet).
+    fn next_segment_cursor(&self) -> Option<WalCursor> {
+        if self.active.is_some() {
+            return None;
+        }
+        let (last, _) = self.sealed.last()?;
+        Some(WalCursor::new(last.checked_add(1)?, 0))
+    }
+}
+
+/// How often a reader retries after losing a race with the writer.
+const LAYOUT_RACE_ATTEMPTS: usize = 50;
+
+/// The publisher reads the directory while the writer renames a full segment
+/// to `.wal` and creates the next `.open`. A listing, or a file opened from a
+/// listing, can then show a gap, two "newest" segments, or a vanished file —
+/// all gone a millisecond later. Such a result is a race, not corruption: try
+/// again, and only report it if it persists (a real gap or a real
+/// double-active segment never goes away).
+fn is_layout_race(error: &WalError) -> bool {
+    match error {
+        WalError::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+        WalError::Corruption { reason, .. } => matches!(
+            *reason,
+            "missing WAL segment before this sequence"
+                | "active segment is not newest"
+                | "duplicate segment sequence"
+                | "multiple active segments"
+                | "cursor segment does not exist"
+        ),
+        _ => false,
+    }
+}
+
+fn retry_layout_race<T>(mut attempt: impl FnMut() -> Result<T, WalError>) -> Result<T, WalError> {
+    for _ in 1..LAYOUT_RACE_ATTEMPTS {
+        match attempt() {
+            Err(error) if is_layout_race(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            other => return other,
+        }
+    }
+    attempt()
+}
+
 /// Discover the complete WAL layout and reject any ambiguity before a caller
 /// reads, repairs, or removes a segment. The first sequence may be greater
 /// than one after prefix reclamation; every sequence after it must be exactly
 /// contiguous.
 fn discover_segment_layout(directory: &Path) -> Result<SegmentLayout, WalError> {
-    let sealed = list_segments(directory, SEALED_SUFFIX)?;
-    let active_segments = list_segments(directory, OPEN_SUFFIX)?;
+    let (sealed, active_segments) = list_segments(directory)?;
     if active_segments.len() > 1 {
         return Err(corruption(0, 0, "multiple active segments"));
     }
@@ -889,14 +1133,18 @@ fn validate_cursor(
                 .as_ref()
                 .filter(|(sequence, _)| *sequence == cursor.segment)
                 .map(|(_, path)| path)
-        })
-        .ok_or_else(|| {
-            corruption(
-                cursor.segment,
-                cursor.byte_offset,
-                "cursor segment does not exist",
-            )
-        })?;
+        });
+    let Some(path) = path else {
+        // The start of the segment the writer is about to create.
+        if cursor.byte_offset == 0 && layout.next_segment_cursor() == Some(cursor) {
+            return Ok(ValidatedCursor { valid_bytes: 0 });
+        }
+        return Err(corruption(
+            cursor.segment,
+            cursor.byte_offset,
+            "cursor segment does not exist",
+        ));
+    };
     let scan = scan_segment(path, cursor.segment, max_record_bytes, false)?;
     if cursor.byte_offset > scan.valid_bytes {
         return Err(corruption(
@@ -1016,11 +1264,24 @@ fn sealed_path(directory: &Path, sequence: u64) -> PathBuf {
     directory.join(format!("{sequence:016}{SEALED_SUFFIX}"))
 }
 
-fn list_segments(directory: &Path, suffix: &str) -> Result<Vec<(u64, PathBuf)>, WalError> {
-    let mut segments = Vec::new();
+/// Sealed and active segments from ONE pass over the directory: two passes
+/// would let any number of seals happen between them.
+#[allow(clippy::type_complexity)]
+fn list_segments(
+    directory: &Path,
+) -> Result<(Vec<(u64, PathBuf)>, Vec<(u64, PathBuf)>), WalError> {
+    let mut sealed = Vec::new();
+    let mut open = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let (suffix, into) = if name.ends_with(SEALED_SUFFIX) {
+            (SEALED_SUFFIX, &mut sealed)
+        } else if name.ends_with(OPEN_SUFFIX) {
+            (OPEN_SUFFIX, &mut open)
+        } else {
             continue;
         };
         let Some(sequence) = name
@@ -1030,8 +1291,9 @@ fn list_segments(directory: &Path, suffix: &str) -> Result<Vec<(u64, PathBuf)>, 
         else {
             continue;
         };
-        segments.push((sequence, path));
+        into.push((sequence, path));
     }
-    segments.sort_by_key(|(sequence, _)| *sequence);
-    Ok(segments)
+    sealed.sort_by_key(|(sequence, _)| *sequence);
+    open.sort_by_key(|(sequence, _)| *sequence);
+    Ok((sealed, open))
 }

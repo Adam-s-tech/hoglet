@@ -14,15 +14,20 @@ use argon2::{
 };
 use chrono::Utc;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
+use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::contract::members::{CreatedInvite, Invite, Member};
+use crate::control_members::{self, MemberError};
 use crate::token;
 
 const COMMAND_CAPACITY: usize = 128;
 const SESSION_TTL_SECONDS: i64 = 7 * 24 * 3600;
+/// Concurrently valid sessions per user; a new login retires the oldest.
+const MAX_SESSIONS_PER_USER: i64 = 50;
 const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = r#"
@@ -67,6 +72,17 @@ CREATE TABLE IF NOT EXISTS personal_api_keys (
     key_prefix TEXT NOT NULL,
     last_used INTEGER,
     created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS organization_invites (
+    id TEXT PRIMARY KEY NOT NULL,
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member')),
+    token_hash TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    UNIQUE (organization_id, email)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON auth_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON auth_sessions(expires_at);
@@ -174,6 +190,7 @@ pub struct SetupResult {
 pub struct PersonalApiKey {
     pub id: String,
     pub name: String,
+    pub scope: KeyScope,
     pub key_prefix: String,
     pub last_used: Option<i64>,
     pub created_at: i64,
@@ -185,7 +202,9 @@ pub struct CreatedPersonalApiKey {
     pub secret: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// A person's standing in one organization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../web/src/types/")]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Owner,
@@ -202,7 +221,7 @@ impl Role {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, AccessError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, AccessError> {
         match value {
             "owner" => Ok(Self::Owner),
             "admin" => Ok(Self::Admin),
@@ -222,6 +241,36 @@ pub enum Authentication {
 pub struct Principal {
     pub user_id: String,
     pub authentication: Authentication,
+    /// Sessions always may write; personal keys only with `write` scope.
+    pub write_scope: bool,
+}
+
+impl Principal {
+    /// Whether this principal may mutate project resources, subject to the
+    /// user's project role.
+    pub fn may_write(&self) -> bool {
+        self.authentication == Authentication::Session || self.write_scope
+    }
+}
+
+/// What a personal API key may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyScope {
+    /// Read analytics and resources.
+    #[default]
+    Read,
+    /// Also create, change and delete resources, like the user's session.
+    Write,
+}
+
+impl KeyScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -235,11 +284,11 @@ pub struct AuthorizedProject {
 
 #[derive(Debug, Clone)]
 pub struct CaptureProject {
-    pub project_id: Option<String>,
+    pub project_id: String,
     pub token: String,
 }
 
-enum Command {
+pub(crate) enum Command {
     Shutdown {
         response: std::sync::mpsc::SyncSender<()>,
     },
@@ -248,10 +297,17 @@ enum Command {
     },
     Setup {
         request: SetupRequest,
+        password_hash: String,
         response: oneshot::Sender<Result<SetupResult, AccessError>>,
     },
-    Login {
-        request: LoginRequest,
+    /// Fetch the stored credentials for an email; hashing happens elsewhere.
+    LoginLookup {
+        email: String,
+        response: oneshot::Sender<Result<Option<(String, String)>, AccessError>>,
+    },
+    /// Open a session for a user whose password was already verified.
+    StartSession {
+        user_id: String,
         response: oneshot::Sender<Result<SetupResult, AccessError>>,
     },
     Logout {
@@ -261,6 +317,7 @@ enum Command {
     CreatePersonalKey {
         principal: Principal,
         name: String,
+        scope: KeyScope,
         response: oneshot::Sender<Result<CreatedPersonalApiKey, AccessError>>,
     },
     ValidatePersonalKey {
@@ -304,11 +361,64 @@ enum Command {
         token: String,
         response: oneshot::Sender<Result<CaptureProject, AccessError>>,
     },
+    ListMembers {
+        principal: Principal,
+        organization_id: String,
+        response: oneshot::Sender<Result<Vec<Member>, MemberError>>,
+    },
+    UpdateMemberRole {
+        principal: Principal,
+        organization_id: String,
+        user_id: String,
+        role: Role,
+        response: oneshot::Sender<Result<Member, MemberError>>,
+    },
+    RemoveMember {
+        principal: Principal,
+        organization_id: String,
+        user_id: String,
+        response: oneshot::Sender<Result<(), MemberError>>,
+    },
+    CreateInvite {
+        principal: Principal,
+        organization_id: String,
+        email: String,
+        role: Role,
+        response: oneshot::Sender<Result<CreatedInvite, MemberError>>,
+    },
+    ListInvites {
+        principal: Principal,
+        organization_id: String,
+        response: oneshot::Sender<Result<Vec<Invite>, MemberError>>,
+    },
+    RevokeInvite {
+        principal: Principal,
+        organization_id: String,
+        invite_id: String,
+        response: oneshot::Sender<Result<(), MemberError>>,
+    },
+    InviteLookup {
+        token_hash: String,
+        response: oneshot::Sender<Result<control_members::InviteLookup, MemberError>>,
+    },
+    AcceptInvite {
+        token_hash: String,
+        account: control_members::AcceptAccount,
+        response: oneshot::Sender<Result<SetupResult, MemberError>>,
+    },
 }
+
+/// Concurrent password hash/verify jobs. Argon2 is deliberately expensive in
+/// time and memory, so it runs on the blocking pool behind this gate rather
+/// than on the control thread (which every capture authorization shares).
+const MAX_CONCURRENT_HASHING: usize = 2;
+/// How long a login or setup waits for a hashing slot before giving up.
+const HASHING_QUEUE_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct ProjectAccess {
-    tx: mpsc::Sender<Command>,
+    pub(crate) tx: mpsc::Sender<Command>,
+    hashing: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 pub struct ProjectAccessRuntime {
@@ -325,7 +435,10 @@ impl ProjectAccess {
             .spawn(move || worker_loop(connection, rx))
             .map_err(|_| AccessError::Unavailable)?;
         Ok((
-            Self { tx: tx.clone() },
+            Self {
+                tx: tx.clone(),
+                hashing: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHING)),
+            },
             ProjectAccessRuntime {
                 tx,
                 worker: Some(worker),
@@ -334,12 +447,44 @@ impl ProjectAccess {
     }
 
     pub async fn setup(&self, request: SetupRequest) -> Result<SetupResult, AccessError> {
+        // Validate before spending a hashing slot; the worker validates again.
+        validate_email(&request.email)?;
+        validate_password(&request.password)?;
+        // Once an account exists, setup is closed: refuse before hashing so
+        // anonymous callers cannot spend CPU on a finished installation.
+        if !self.setup_required().await? {
+            return Err(AccessError::SetupComplete);
+        }
+        let password = request.password.clone();
+        let password_hash = self.run_hashing(move || hash_password(&password)).await??;
         let (response, receive) = oneshot::channel();
         self.tx
-            .send(Command::Setup { request, response })
+            .send(Command::Setup {
+                request,
+                password_hash,
+                response,
+            })
             .await
             .map_err(|_| AccessError::Unavailable)?;
         receive.await.map_err(|_| AccessError::Unavailable)?
+    }
+
+    /// Run a password hashing job on the blocking pool, at most
+    /// `MAX_CONCURRENT_HASHING` at a time.
+    pub(crate) async fn run_hashing<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, AccessError> {
+        let permit = tokio::time::timeout(HASHING_QUEUE_WAIT, self.hashing.clone().acquire_owned())
+            .await
+            .map_err(|_| AccessError::Unavailable)?
+            .map_err(|_| AccessError::Unavailable)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            job()
+        })
+        .await
+        .map_err(|_| AccessError::Unavailable)
     }
 
     pub async fn setup_required(&self) -> Result<bool, AccessError> {
@@ -352,9 +497,31 @@ impl ProjectAccess {
     }
 
     pub async fn login(&self, request: LoginRequest) -> Result<SetupResult, AccessError> {
+        validate_email(&request.email).map_err(|_| AccessError::InvalidCredentials)?;
+        validate_password(&request.password).map_err(|_| AccessError::InvalidCredentials)?;
+        let email = request.email.trim().to_ascii_lowercase();
         let (response, receive) = oneshot::channel();
         self.tx
-            .send(Command::Login { request, response })
+            .send(Command::LoginLookup { email, response })
+            .await
+            .map_err(|_| AccessError::Unavailable)?;
+        let credentials = receive.await.map_err(|_| AccessError::Unavailable)??;
+        // An unknown email verifies against a throwaway hash so the response
+        // time does not reveal which emails have accounts.
+        let known = credentials.is_some();
+        let (user_id, stored_hash) = credentials
+            .unwrap_or_else(|| (String::new(), dummy_password_hash().to_owned()));
+        let password = request.password;
+        let verified = self
+            .run_hashing(move || verify_password(&stored_hash, &password))
+            .await?;
+        if !known {
+            return Err(AccessError::InvalidCredentials);
+        }
+        verified?;
+        let (response, receive) = oneshot::channel();
+        self.tx
+            .send(Command::StartSession { user_id, response })
             .await
             .map_err(|_| AccessError::Unavailable)?;
         receive.await.map_err(|_| AccessError::Unavailable)?
@@ -376,12 +543,14 @@ impl ProjectAccess {
         &self,
         principal: &Principal,
         name: &str,
+        scope: KeyScope,
     ) -> Result<CreatedPersonalApiKey, AccessError> {
         let (response, receive) = oneshot::channel();
         self.tx
             .send(Command::CreatePersonalKey {
                 principal: principal.clone(),
                 name: name.into(),
+                scope,
                 response,
             })
             .await
@@ -587,6 +756,24 @@ fn open_connection(path: PathBuf) -> Result<Connection, AccessError> {
         });
     }
     connection.execute_batch(SCHEMA)?;
+    let has_scope: bool = connection
+        .prepare("SELECT 1 FROM pragma_table_info('personal_api_keys') WHERE name='scope'")?
+        .exists([])?;
+    if !has_scope {
+        connection.execute_batch(
+            "ALTER TABLE personal_api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'read'
+             CHECK (scope IN ('read', 'write'))",
+        )?;
+    }
+    let has_joined: bool = connection
+        .prepare("SELECT 1 FROM pragma_table_info('organization_members') WHERE name='joined_at'")?
+        .exists([])?;
+    if !has_joined {
+        // 0 = joined before membership dates were recorded.
+        connection.execute_batch(
+            "ALTER TABLE organization_members ADD COLUMN joined_at INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(connection)
 }
@@ -604,11 +791,26 @@ fn worker_loop(mut connection: Connection, mut rx: mpsc::Receiver<Command>) {
                     .map_err(AccessError::from);
                 let _ = response.send(result);
             }
-            Command::Setup { request, response } => {
-                let _ = response.send(setup(&mut connection, request));
+            Command::Setup {
+                request,
+                password_hash,
+                response,
+            } => {
+                let _ = response.send(setup(&mut connection, request, password_hash));
             }
-            Command::Login { request, response } => {
-                let _ = response.send(login(&mut connection, request));
+            Command::LoginLookup { email, response } => {
+                let result = connection
+                    .query_row(
+                        "SELECT id,password_hash FROM users WHERE email=?1",
+                        [&email],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(AccessError::from);
+                let _ = response.send(result);
+            }
+            Command::StartSession { user_id, response } => {
+                let _ = response.send(start_session(&mut connection, &user_id));
             }
             Command::Logout {
                 session_id,
@@ -623,9 +825,10 @@ fn worker_loop(mut connection: Connection, mut rx: mpsc::Receiver<Command>) {
             Command::CreatePersonalKey {
                 principal,
                 name,
+                scope,
                 response,
             } => {
-                let _ = response.send(create_personal_key(&connection, &principal, &name));
+                let _ = response.send(create_personal_key(&connection, &principal, &name, scope));
             }
             Command::ValidatePersonalKey { secret, response } => {
                 let _ = response.send(validate_personal_key(&connection, &secret));
@@ -695,11 +898,110 @@ fn worker_loop(mut connection: Connection, mut rx: mpsc::Receiver<Command>) {
             Command::AuthorizeCapture { token, response } => {
                 let _ = response.send(authorize_capture(&connection, &token));
             }
+            Command::ListMembers {
+                principal,
+                organization_id,
+                response,
+            } => {
+                let _ = response.send(control_members::list_members(
+                    &connection,
+                    &principal,
+                    &organization_id,
+                ));
+            }
+            Command::UpdateMemberRole {
+                principal,
+                organization_id,
+                user_id,
+                role,
+                response,
+            } => {
+                let _ = response.send(control_members::update_member_role(
+                    &mut connection,
+                    &principal,
+                    &organization_id,
+                    &user_id,
+                    role,
+                ));
+            }
+            Command::RemoveMember {
+                principal,
+                organization_id,
+                user_id,
+                response,
+            } => {
+                let _ = response.send(control_members::remove_member(
+                    &mut connection,
+                    &principal,
+                    &organization_id,
+                    &user_id,
+                ));
+            }
+            Command::CreateInvite {
+                principal,
+                organization_id,
+                email,
+                role,
+                response,
+            } => {
+                let _ = response.send(control_members::create_invite(
+                    &mut connection,
+                    &principal,
+                    &organization_id,
+                    &email,
+                    role,
+                ));
+            }
+            Command::ListInvites {
+                principal,
+                organization_id,
+                response,
+            } => {
+                let _ = response.send(control_members::list_invites(
+                    &connection,
+                    &principal,
+                    &organization_id,
+                ));
+            }
+            Command::RevokeInvite {
+                principal,
+                organization_id,
+                invite_id,
+                response,
+            } => {
+                let _ = response.send(control_members::revoke_invite(
+                    &connection,
+                    &principal,
+                    &organization_id,
+                    &invite_id,
+                ));
+            }
+            Command::InviteLookup {
+                token_hash,
+                response,
+            } => {
+                let _ = response.send(control_members::invite_lookup(&connection, &token_hash));
+            }
+            Command::AcceptInvite {
+                token_hash,
+                account,
+                response,
+            } => {
+                let _ = response.send(control_members::accept_invite(
+                    &mut connection,
+                    &token_hash,
+                    account,
+                ));
+            }
         }
     }
 }
 
-fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResult, AccessError> {
+fn setup(
+    connection: &mut Connection,
+    request: SetupRequest,
+    password_hash: String,
+) -> Result<SetupResult, AccessError> {
     if let Some(value) = request.existing_project_token.as_deref() {
         token::validate(value).map_err(|_| AccessError::InvalidToken)?;
     }
@@ -710,8 +1012,7 @@ fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResu
     let now = Utc::now().timestamp();
     let created_at = Utc::now().timestamp_millis();
     let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let password_hash = hash_password(&request.password)?;
+    let session_id = new_session_id();
     let email = request.email.trim().to_ascii_lowercase();
 
     // Hold the SQLite write lock while deciding whether setup is still
@@ -750,7 +1051,8 @@ fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResu
     )?;
     if let Some((_, organization_id)) = &claimed_project {
         transaction.execute(
-            "INSERT INTO organization_members(organization_id,user_id,role) VALUES (?1,?2,'owner')",
+            "INSERT INTO organization_members(organization_id,user_id,role,joined_at)
+             VALUES (?1,?2,'owner',CAST(strftime('%s','now') AS INTEGER))",
             rusqlite::params![organization_id, user_id],
         )?;
     } else {
@@ -766,7 +1068,8 @@ fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResu
             rusqlite::params![organization_id, request.organization_name, created_at],
         )?;
         transaction.execute(
-            "INSERT INTO organization_members(organization_id,user_id,role) VALUES (?1,?2,'owner')",
+            "INSERT INTO organization_members(organization_id,user_id,role,joined_at)
+             VALUES (?1,?2,'owner',CAST(strftime('%s','now') AS INTEGER))",
             rusqlite::params![organization_id, user_id],
         )?;
         transaction.execute(
@@ -781,8 +1084,8 @@ fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResu
         )?;
     }
     transaction.execute(
-        "INSERT OR IGNORE INTO organization_members(organization_id,user_id,role)
-         SELECT id,?1,'owner' FROM organizations WHERE imported=1",
+        "INSERT OR IGNORE INTO organization_members(organization_id,user_id,role,joined_at)
+         SELECT id,?1,'owner',CAST(strftime('%s','now') AS INTEGER) FROM organizations WHERE imported=1",
         [&user_id],
     )?;
     transaction.execute(
@@ -798,32 +1101,26 @@ fn setup(connection: &mut Connection, request: SetupRequest) -> Result<SetupResu
     })
 }
 
-fn login(connection: &mut Connection, request: LoginRequest) -> Result<SetupResult, AccessError> {
-    validate_email(&request.email).map_err(|_| AccessError::InvalidCredentials)?;
-    validate_password(&request.password).map_err(|_| AccessError::InvalidCredentials)?;
-    let email = request.email.trim().to_ascii_lowercase();
-    let credentials: Option<(String, String)> = connection
-        .query_row(
-            "SELECT id,password_hash FROM users WHERE email=?1",
-            [&email],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let (user_id, password_hash) = credentials.ok_or(AccessError::InvalidCredentials)?;
-    verify_password(&password_hash, &request.password)?;
-
+pub(crate) fn start_session(connection: &mut Connection, user_id: &str) -> Result<SetupResult, AccessError> {
     let now = Utc::now().timestamp();
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = new_session_id();
     let transaction = connection.transaction()?;
     transaction.execute("DELETE FROM auth_sessions WHERE expires_at<=?1", [now])?;
     transaction.execute(
         "INSERT INTO auth_sessions(id,user_id,created_at,expires_at) VALUES (?1,?2,?3,?4)",
         rusqlite::params![session_id, user_id, now, now + SESSION_TTL_SECONDS],
     )?;
+    // Bounded: only the newest sessions of a user stay valid.
+    transaction.execute(
+        "DELETE FROM auth_sessions WHERE user_id=?1 AND rowid NOT IN (
+             SELECT rowid FROM auth_sessions WHERE user_id=?1
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2)",
+        rusqlite::params![user_id, MAX_SESSIONS_PER_USER],
+    )?;
     transaction.commit()?;
 
     Ok(SetupResult {
-        workspace: workspace_for(connection, &user_id)?,
+        workspace: workspace_for(connection, user_id)?,
         session_id,
     })
 }
@@ -847,6 +1144,7 @@ fn validate_session(connection: &Connection, session_id: &str) -> Result<Princip
         .map(|user_id| Principal {
             user_id,
             authentication: Authentication::Session,
+            write_scope: true,
         })
         .ok_or(AccessError::Unauthorized)
 }
@@ -855,6 +1153,7 @@ fn create_personal_key(
     connection: &Connection,
     principal: &Principal,
     name: &str,
+    scope: KeyScope,
 ) -> Result<CreatedPersonalApiKey, AccessError> {
     require_session(principal)?;
     let name = name.trim();
@@ -864,20 +1163,22 @@ fn create_personal_key(
     let key = PersonalApiKey {
         id: Uuid::new_v4().to_string(),
         name: name.into(),
+        scope,
         key_prefix: secret.chars().take(12).collect(),
         last_used: None,
         created_at: Utc::now().timestamp(),
     };
     connection.execute(
-        "INSERT INTO personal_api_keys(id,user_id,name,key_hash,key_prefix,last_used,created_at)
-         VALUES (?1,?2,?3,?4,?5,NULL,?6)",
+        "INSERT INTO personal_api_keys(id,user_id,name,key_hash,key_prefix,last_used,created_at,scope)
+         VALUES (?1,?2,?3,?4,?5,NULL,?6,?7)",
         rusqlite::params![
             key.id,
             principal.user_id,
             key.name,
             key_hash,
             key.key_prefix,
-            key.created_at
+            key.created_at,
+            scope.as_str()
         ],
     )?;
     Ok(CreatedPersonalApiKey { key, secret })
@@ -888,14 +1189,14 @@ fn validate_personal_key(connection: &Connection, secret: &str) -> Result<Princi
         return Err(AccessError::Unauthorized);
     }
     let key_hash = hex::encode(Sha256::digest(secret.as_bytes()));
-    let user_id: Option<String> = connection
+    let found: Option<(String, String)> = connection
         .query_row(
-            "SELECT user_id FROM personal_api_keys WHERE key_hash=?1",
+            "SELECT user_id, scope FROM personal_api_keys WHERE key_hash=?1",
             [&key_hash],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let user_id = user_id.ok_or(AccessError::Unauthorized)?;
+    let (user_id, scope) = found.ok_or(AccessError::Unauthorized)?;
     connection.execute(
         "UPDATE personal_api_keys SET last_used=?1 WHERE key_hash=?2",
         rusqlite::params![Utc::now().timestamp(), key_hash],
@@ -903,6 +1204,7 @@ fn validate_personal_key(connection: &Connection, secret: &str) -> Result<Princi
     Ok(Principal {
         user_id,
         authentication: Authentication::PersonalKey,
+        write_scope: scope == "write",
     })
 }
 
@@ -912,14 +1214,20 @@ fn list_personal_keys(
 ) -> Result<Vec<PersonalApiKey>, AccessError> {
     require_session(principal)?;
     let mut statement = connection.prepare(
-        "SELECT id,name,key_prefix,last_used,created_at FROM personal_api_keys
+        "SELECT id,name,key_prefix,last_used,created_at,scope FROM personal_api_keys
          WHERE user_id=?1 ORDER BY created_at DESC,id",
     )?;
     statement
         .query_map([&principal.user_id], |row| {
+            let scope: String = row.get(5)?;
             Ok(PersonalApiKey {
                 id: row.get(0)?,
                 name: row.get(1)?,
+                scope: if scope == "write" {
+                    KeyScope::Write
+                } else {
+                    KeyScope::Read
+                },
                 key_prefix: row.get(2)?,
                 last_used: row.get(3)?,
                 created_at: row.get(4)?,
@@ -952,7 +1260,8 @@ fn create_organization(
         rusqlite::params![id, name, created_at],
     )?;
     transaction.execute(
-        "INSERT INTO organization_members(organization_id,user_id,role) VALUES (?1,?2,'owner')",
+        "INSERT INTO organization_members(organization_id,user_id,role,joined_at)
+             VALUES (?1,?2,'owner',CAST(strftime('%s','now') AS INTEGER))",
         rusqlite::params![id, principal.user_id],
     )?;
     transaction.commit()?;
@@ -1023,7 +1332,7 @@ fn authorize_capture(connection: &Connection, value: &str) -> Result<CaptureProj
         .optional()?;
     project_id
         .map(|project_id| CaptureProject {
-            project_id: Some(project_id),
+            project_id,
             token: value.into(),
         })
         .ok_or(AccessError::Unauthorized)
@@ -1054,7 +1363,7 @@ fn authorize_project(
     })
 }
 
-fn workspace_for(connection: &Connection, user_id: &str) -> Result<Workspace, AccessError> {
+pub(crate) fn workspace_for(connection: &Connection, user_id: &str) -> Result<Workspace, AccessError> {
     let user: User = connection
         .query_row(
             "SELECT id,email,name FROM users WHERE id=?1",
@@ -1111,7 +1420,27 @@ fn workspace_for(connection: &Connection, user_id: &str) -> Result<Workspace, Ac
     })
 }
 
-fn hash_password(password: &str) -> Result<String, AccessError> {
+/// 256 bits from the OS generator, hex encoded. Session ids and API keys are
+/// credentials: they get a full-width random value, not a UUID's 122 bits
+/// with fixed version bits.
+pub(crate) fn random_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+pub(crate) fn new_session_id() -> String {
+    random_secret()
+}
+
+/// A valid Argon2 hash of a password nobody has, for timing equalization.
+pub(crate) fn dummy_password_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| hash_password("hoglet-timing-equalizer").unwrap_or_default())
+}
+
+pub(crate) fn hash_password(password: &str) -> Result<String, AccessError> {
     let salt = SaltString::generate(&mut rand::rngs::OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -1119,7 +1448,7 @@ fn hash_password(password: &str) -> Result<String, AccessError> {
         .map_err(|_| AccessError::InvalidCredentials)
 }
 
-fn validate_email(email: &str) -> Result<(), AccessError> {
+pub(crate) fn validate_email(email: &str) -> Result<(), AccessError> {
     let email = email.trim();
     if email.is_empty() || email.len() > 254 || !email.contains('@') {
         return Err(AccessError::InvalidRequest);
@@ -1127,28 +1456,28 @@ fn validate_email(email: &str) -> Result<(), AccessError> {
     Ok(())
 }
 
-fn validate_password(password: &str) -> Result<(), AccessError> {
+pub(crate) fn validate_password(password: &str) -> Result<(), AccessError> {
     if !(12..=1024).contains(&password.len()) {
         return Err(AccessError::InvalidRequest);
     }
     Ok(())
 }
 
-fn validate_name(name: &str) -> Result<(), AccessError> {
+pub(crate) fn validate_name(name: &str) -> Result<(), AccessError> {
     if name.trim().is_empty() || name.len() > 128 {
         return Err(AccessError::InvalidRequest);
     }
     Ok(())
 }
 
-fn require_session(principal: &Principal) -> Result<(), AccessError> {
+pub(crate) fn require_session(principal: &Principal) -> Result<(), AccessError> {
     if principal.authentication != Authentication::Session {
         return Err(AccessError::Forbidden);
     }
     Ok(())
 }
 
-fn verify_password(hash: &str, password: &str) -> Result<(), AccessError> {
+pub(crate) fn verify_password(hash: &str, password: &str) -> Result<(), AccessError> {
     let parsed = PasswordHash::new(hash).map_err(|_| AccessError::InvalidCredentials)?;
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)

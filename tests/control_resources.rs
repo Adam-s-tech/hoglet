@@ -1,11 +1,10 @@
 use hoglet::control::{ProjectAccess, SetupRequest};
 use hoglet::control_resources::{
-    ControlResourceError, ControlResources, DashboardDraft, DashboardTileInput, FeatureFlag,
-    ImportedInsight, InsightDraft, ShareTarget,
+    ControlResourceError, ControlResources, DashboardDraft, DashboardTileInput, ImportedInsight,
+    InsightDraft, ShareTarget,
 };
-use hoglet::flags::Variant;
-use hoglet::query::ir::{DateRange, EventMatch, Math, Query, QueryKind, Series};
 use hoglet::storage_bootstrap::bootstrap_storage;
+use serde_json::{Value, json};
 
 struct Fixture {
     _directory: tempfile::TempDir,
@@ -49,38 +48,20 @@ async fn fixture() -> Fixture {
     }
 }
 
-fn valid_query() -> Query {
-    Query::trends(
-        vec![Series {
-            event: EventMatch::Name("$pageview".into()),
-            math: Math::Total,
-        }],
-        DateRange {
-            from: Some("2026-08-01T00:00:00Z".into()),
-            to: Some("2026-08-08T00:00:00Z".into()),
-            last_n: None,
-        },
-    )
+fn valid_query() -> Value {
+    json!({
+        "kind": "TrendsQuery",
+        "series": [{"event": "$pageview", "math": "total"}],
+        "date_range": {"date_from": "2026-08-01", "date_to": "2026-08-08"},
+        "interval": "day"
+    })
 }
 
 fn insight(name: &str) -> InsightDraft {
     InsightDraft {
         name: name.into(),
         description: String::new(),
-        query_ir: serde_json::to_value(valid_query()).unwrap(),
-    }
-}
-
-fn flag(key: &str) -> FeatureFlag {
-    FeatureFlag {
-        key: key.into(),
-        active: true,
-        rollout_percentage: 50.0,
-        variants: vec![Variant {
-            key: "control".into(),
-            rollout: 100.0,
-        }],
-        payload: Some("welcome".into()),
+        query_ir: valid_query(),
     }
 }
 
@@ -109,27 +90,6 @@ async fn direct_keys_and_ids_cannot_cross_project_resource_scopes() {
     let store = &fixture.resources;
     let first = &fixture.first_project;
     let second = &fixture.second_project;
-
-    store.create_flag(first, &flag("checkout")).unwrap();
-    assert!(matches!(
-        store.create_flag(first, &flag("checkout")),
-        Err(ControlResourceError::Conflict)
-    ));
-    assert!(matches!(
-        store.get_flag(second, "checkout"),
-        Err(ControlResourceError::NotFound)
-    ));
-    assert!(matches!(
-        store.update_flag(second, "checkout", &flag("checkout")),
-        Err(ControlResourceError::NotFound)
-    ));
-    assert!(matches!(
-        store.delete_flag(second, "checkout"),
-        Err(ControlResourceError::NotFound)
-    ));
-    store.create_flag(second, &flag("checkout")).unwrap();
-    assert_eq!(store.list_flags(first).unwrap().len(), 1);
-    assert_eq!(store.list_flags(second).unwrap().len(), 1);
 
     let saved = store
         .create_insight(first, "user-1", &insight("Conversion"))
@@ -255,7 +215,7 @@ async fn dashboard_tiles_only_accept_insights_from_the_same_project_transactiona
         h: 4,
     };
     store
-        .replace_dashboard_tiles(first, &dashboard.id, &[first_tile.clone()])
+        .replace_dashboard_tiles(first, &dashboard.id, std::slice::from_ref(&first_tile))
         .unwrap();
 
     let cross_project = DashboardTileInput {
@@ -289,9 +249,27 @@ async fn normal_insight_writes_reject_unsupported_ir_but_explicit_import_preserv
     let store = &fixture.resources;
     let project = &fixture.first_project;
 
-    let mut unsupported = valid_query();
-    unsupported.kind = QueryKind::Funnels;
-    let unsupported_ir = serde_json::to_value(unsupported).unwrap();
+    // The legacy IR shape is not an `InsightQuery`; neither is a query over
+    // the engine's limits.
+    let unsupported_ir = json!({
+        "kind": "Funnels",
+        "series": [{"event": {"type": "name", "value": "pageview"}, "math": {"type": "total"}}],
+        "range": {"from": "2026-08-01T00:00:00Z", "to": "2026-08-08T00:00:00Z"}
+    });
+    let mut over_limit = valid_query();
+    over_limit["series"] = Value::Array(vec![json!({"event": "$pageview"}); 21]);
+    assert!(matches!(
+        store.create_insight(
+            project,
+            "user-1",
+            &InsightDraft {
+                name: "Too many".into(),
+                description: String::new(),
+                query_ir: over_limit,
+            }
+        ),
+        Err(ControlResourceError::InvalidQuery { .. })
+    ));
     let draft = InsightDraft {
         name: "Legacy funnel".into(),
         description: "Imported for reference".into(),
