@@ -19,31 +19,38 @@ marks a call that needs a go-ahead.
 
 - **Wire edge:** every PostHog capture endpoint, config, flags/decide in all
   shapes, local evaluation, surveys loader stub. Contract-tested against
-  posthog-js, posthog-node and posthog-python `latest`.
-- **Durable pipeline:** group-commit WAL, publisher thread, generation-tracked
+  posthog-js, posthog-node and posthog-python `latest` (43 + 25 + 47 checks).
+- **Durable pipeline:** group-commit WAL, publisher thread, generation-stamped
   Parquet lake, compaction with uuid dedup, retention, physical erasure.
-  SIGKILL during concurrent ingest loses nothing acknowledged.
-- **Identity:** identify / alias / merge_dangerously / $set / $set_once /
-  $unset / groups, applied to every person count through identity overrides.
-- **Flags:** PostHog-exact bucketing (verified against PostHog's own
-  consistency vectors), conditions, variants, payloads, continuity, CRUD.
+  Crash evidence: 24 kill points × randomized runs, WAL corruption fuzzing, I/O
+  error injection (`claims.md` claim 2); it found and fixed three real bugs.
+- **Identity:** identify / alias (both SDK directions) / merge_dangerously /
+  $set / $set_once / $unset / groups, property-tested (`claims.md` claim 4).
+- **Flags:** PostHog-exact bucketing, conditions, variants, payloads,
+  continuity, CRUD, local evaluation.
 - **Analytics:** trends, funnels, retention, lifecycle, stickiness, paths,
-  SQL, actors drill-down; web analytics; persons; live activity; catalog.
+  SQL, actors drill-down for every kind; web analytics; persons; live
+  activity; catalog. Every kind has an independent oracle.
+- **Teams and security:** roles, invites, offline password reset; audited and
+  hardened (CSRF guard, login throttling, SSRF policy, amplification limits,
+  CSP); `SECURITY.md`.
 - **The switch:** `hoglet import posthog`, shadow-mode forwarding,
   `hoglet reconcile posthog`.
-- **Product:** rebuilt dashboard (all insight kinds, web analytics, persons,
-  flags editor, dashboards, sharing, onboarding, demo data), scoped API keys.
+- **Product:** dashboard on shadcn/ui + Base UI + TanStack (all insight kinds,
+  accessible, responsive), demo data, scoped API keys, user docs in
+  `docs/user/`, OpenAPI reference.
+- **Packaging:** fully static Linux binary (amd64/arm64), `FROM scratch` image
+  with built-in healthcheck, installer, systemd unit, proxy configs.
 
-## Now — launch-ready v1
+## Now — to launch
 
-1. Integrate and harden: one DuckDB memory budget for all readers, contract
-   suites green on all three SDKs, OpenAPI docs regenerated from the contract.
-2. Measure on a real 1 vCPU / 1 GB VPS: sustained ingest, concurrent funnel
-   over ≥10M events, cold start, recovery. Numbers into `claims.md`.
-   (Emulated with a cgroup cap: 18k events/s, 343 MB peak RSS.)
-3. Static release binaries, container image, install script, systemd unit.
-4. User docs: quickstart, SDK setup, migrate from PostHog, deploy, backup.
-5. **[boss]** 3–5 design partners on real traffic before Show HN.
+1. Measure on a real 1 vCPU / 1 GB VPS and put the numbers in `claims.md`.
+   (Emulated cap, 10M events: ingest ~22k events/s at ~194 MB RSS; DAU 0.7 s,
+   WAU 0.6 s, funnel 2.3 s, web overview 2.6 s. Misses are listed in claims.md.)
+2. First tag dry run of `release.yml` (macOS builds are unverified) and the
+   CI jobs on a real runner.
+3. **[boss]** merge `make-it-real` into `main`; container image name; launch
+   date; 3–5 design partners before Show HN.
 
 ## Next — after launch, in order
 
